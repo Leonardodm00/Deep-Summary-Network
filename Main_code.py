@@ -4,14 +4,29 @@ Created on Mon Aug  4 10:37:29 2025
 
 @author: Admin
 """
-
+import os
 import torch
 from torch import nn
 from pytorch_metric_learning import losses
 from pytorch_metric_learning import miners
 from pytorch_metric_learning import reducers
+from pytorch_metric_learning.distances import LpDistance
+from pytorch_metric_learning.reducers import MultipleReducers
+from pytorch_metric_learning.regularizers import LpRegularizer
+from pytorch_metric_learning import losses
+from pytorch_metric_learning.reducers import MultipleReducers, ThresholdReducer, MeanReducer
 
+directory = r"C:\Users\Admin\Desktop\Leonardo\Summary Networks"  # Replace with your desired path
+os.chdir(directory)
+from Data_Extraction_Augmentation import *
 '''
+Critical Points:
+    
+    1) Batch Normalization
+
+
+
+
 Some notes:
     1) X = input data (batch or minibatch) size: nxd where n = # of examples and d = # of features.
     
@@ -59,7 +74,7 @@ Some notes:
 
 class GRUNetwork(nn.Module):
     
-    def __init__(self, input_size, hidden_size, embedding_size, num_layers=1, dropout=0.2):
+    def __init__(self, input_size, hidden_size, embedding_size, num_layers=2, dropout=0.2):
         super(GRUNetwork, self).__init__()
         
         self.hidden_size = hidden_size
@@ -90,34 +105,135 @@ class GRUNetwork(nn.Module):
         )
 
 
-    def forward(self, x, h0=None):
-            if h0 is None:
-                h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+    def forward(self, data, h0=None,train=True,n_repl=10) :
+        
+        # n_repl = number of replica for the augmented data, given that the default generation type is 
+            # combination the number of batches is n_repl**2
+        
+        if train:
             
-            out, h_n = self.gru(x, h0)
+            if h0 is None:
+                h0 = torch.zeros(self.num_layers, n_repl**2, self.hidden_size).to(data.device)
+                
+            
+            # Augment the data 
+            
+            Pos_out =  torch.stack(Positives(data,n_versions=n_repl)).to(torch.float32)
+            Neg_out =  torch.stack(Negatives(data,n_versions=n_repl)).to(torch.float32)
+            
+            # Generate the labels
+            Pos_Lables = torch.zeros(len(Pos_out), dtype=torch.int8)
+            Neg_Lables = torch.arange(1, len(Neg_out) + 1)
+            
+            
+            # Positives
+            out_pos, _ = self.gru(Pos_out, h0)
+            
+            last_hidden_state_pos = out_pos[:, -1, :]
+            
+            final_embedding_pos = self.fc(last_hidden_state_pos)
+            
+            
+            
+            # Negatives
+            out_neg, _ = self.gru(Neg_out, h0)
+            
+            last_hidden_state_neg = out_neg[:, -1, :]
+            
+            final_embedding_neg = self.fc(last_hidden_state_neg)
+            
+            
+            # --- CONCATENATION STEP ---
+            # Concatenate the final embeddings along the batch dimension (dim=0)
+            final_embeddings = torch.cat((final_embedding_pos, final_embedding_neg), dim=0)
+        
+            # Concatenate the labels in the same order
+            final_labels = torch.cat((Pos_Lables, Neg_Lables), dim=0)
+            
+            
+            
+            return final_embeddings,final_labels
+        
+    
+    
+        
+        
+        else:
+          
+            if h0 is None:
+                h0 = torch.zeros(self.num_layers, data.shape[0], self.hidden_size).to(data.device)
+            
+            out, h_n = self.gru(data, h0)
             
             last_hidden_state = out[:, -1, :]
             
             final_embedding = self.fc(last_hidden_state)
             
             return final_embedding
-    
+        
+        
+        
+        
+def train_one_epoch(model,data_inputs,loss_fn,optimizer_fn,iterations):
+    running_loss = 0.
+    last_loss = 0.
+
+    # Here, we use enumerate(training_loader) instead of
+    # iter(training_loader) so that we can track the batch
+    # index and do some intra-epoch reporting
+    for i in range(iterations):
+        
+
+        # Zero your gradients for every batch!
+        optimizer_fn.zero_grad()
+
+        # Make predictions for this batch
+        final_embeddings,final_labels = model(data_inputs)
+
+        # Compute the loss and its gradients
+        loss = loss_fn(final_embeddings, final_labels)
+        loss.backward()
+
+        # Adjust learning weights
+        optimizer_fn.step()
+
+        # Gather data and report
+        running_loss += loss.item()
+        
+        
+        last_loss = running_loss / i # loss per batch
+        print('  batch {} loss: {}'.format(i + 1, last_loss))
+       
+    return last_loss    
 
 
+
+#%%
+# ------------- Load and compute data -------------
+# %matplotlib
+Char_folder = r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11'
+Char_base = 'ptrain_Control00_Well11_'
+
+
+# --- Dynamics ---
+Projected_trajectories,Variance_explained = Neuronal_traces(Visible=False,Char_folder=Char_folder,Char_base=Char_base)
+
+# --- Standardization ---
+Projected_trajectories = Standardization(Projected_trajectories[:,0:3])
+
+# Torch format
+Projected_trajectories_torch = torch.from_numpy(Projected_trajectories)
+
+
+#%
+# --- SET DEVICE ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+#%%
 # --------- TRAINING FUNCTIONS ---------
 
 model = GRUNetwork(3,128,16)
-
-
-# --- Design the loss function ---
-
-from pytorch_metric_learning.distances import LpDistance
-from pytorch_metric_learning.reducers import MultipleReducers
-from pytorch_metric_learning.regularizers import LpRegularizer
-from pytorch_metric_learning import losses
-from pytorch_metric_learning.reducers import MultipleReducers, ThresholdReducer, MeanReducer
-
-
 
 reducer_dict = {"pos_loss": ThresholdReducer(0.1), "neg_loss": MeanReducer()}
 reducer = MultipleReducers(reducer_dict)
@@ -132,40 +248,17 @@ loss_fn = losses.ContrastiveLoss(pos_margin=0, neg_margin=1,
 # --- Optimizer ---
 optimizer_fn = torch.optim.AdamW(model.parameters())
 
+# --- Move objects in the set device ---
+model = model.to(device)
+Projected_trajectories_torch = Projected_trajectories_torch.to(device)
+
+
 # --- Online miners ---  NOT USED FOR NOW!
 # miner_fn = miners.TripletMarginMiner(margin=0.2, type_of_triplets="all",)
 
+iterations = 10
+loss_final = train_one_epoch(model,Projected_trajectories_torch,loss_fn,optimizer_fn,iterations)
 
 
-def train_one_epoch(model,loss_fn,optimizer_fn,miner_fn,training_loader):
-    running_loss = 0.
-    last_loss = 0.
 
-    # Here, we use enumerate(training_loader) instead of
-    # iter(training_loader) so that we can track the batch
-    # index and do some intra-epoch reporting
-    for i, data in enumerate(training_loader):
-        # Every data instance is an input + label pair
-        inputs, labels = data
 
-        # Zero your gradients for every batch!
-        optimizer_fn.zero_grad()
-
-        # Make predictions for this batch
-        outputs = model(inputs)
-
-        # Compute the loss and its gradients
-        loss = loss_fn(outputs, labels)
-        loss.backward()
-
-        # Adjust learning weights
-        optimizer_fn.step()
-
-        # Gather data and report
-        running_loss += loss.item()
-        if i % 1000 == 999:
-            last_loss = running_loss / 1000 # loss per batch
-            print('  batch {} loss: {}'.format(i + 1, last_loss))
-            running_loss = 0
-
-    return last_loss
