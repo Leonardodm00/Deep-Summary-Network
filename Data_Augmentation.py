@@ -1,9 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Aug  5 08:51:51 2025
 
-@author: Admin
-"""
 
 import os
 import numpy as np
@@ -681,167 +676,311 @@ Pathological traces can be used as negatives.
 
 Warping techniques consists in define a set of knots u, scale the data set value at their positions, scale in magnitude
 or shift in time the knots and interpolate with a cubic spline.
+
+
+WHen converting to tensor the output of positives and negatives functions the tensor's sizes are:
+    0 : number of bathces
+    1 : data size
+    2 : number of feature
+ 
+The input tensor size required from the GRU cell is (L,N,Hin) or (N,L,Hin) if batch first is True,
+where:
+    L = sequence length
+    N = batch size
+    Hin = input size
+
 '''
-
-
-
 Positive_DA_methods = ['Flip','Shift']
 Negative_DA_methods = ['Jittering','Permutation','Time Slicing Window']
+# ----------------------------------- TORCH IMPLEMENTATION -----------------------------------
 
-def Shift(time_series,n_versions,shift_magnitude,fs):
-    
-    import random
-    # shift_magnitude = Expressed in ms
-    # fs = in Hz
-   
-    # n_shifts = numebr of shifts
-    
-    # Handle 
-    fs_ms = fs/1000
-    max_shift = int(shift_magnitude*fs_ms)
-    
+import torch
+import math
 
+def Shift(time_series, n_versions, shift_magnitude, fs):
     """
     Generates n randomly shifted versions of a multivariate time series.
 
     Args:
-        time_series (np.ndarray): The original time series with shape (samples, features).
+        time_series (torch.Tensor): The original time series with shape (samples, features).
         n_versions (int): The number of shifted versions to generate.
-        max_shift (int): The maximum absolute value of the random shift (in samples).
-                         Shifts will be generated between -max_shift and +max_shift.
+        shift_magnitude (float): The maximum absolute value of the random shift (in ms).
+        fs (int): The sampling frequency in Hz.
 
     Returns:
         tuple: A tuple containing:
-            - shifted_series (list): A list of np.ndarrays, where each array is a
+            - shifted_series (list): A list of torch.Tensors, where each tensor is a
                                      randomly shifted version of the original time series.
             - shifts (list): A list of the random integer shifts applied to each version.
     """
-    if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
-        raise TypeError("Input 'time_series' must be a 2D NumPy array.")
-    if n_versions <= 0 or max_shift < 0:
-        raise ValueError("'n_versions' must be > 0 and 'max_shift' must be >= 0.")
+    # fs = in Hz, shift_magnitude = in ms
+    # Handle conversion from ms to samples
+    fs_ms = fs / 1000.0
+    max_shift_samples = int(shift_magnitude * fs_ms)
+    
+    if not isinstance(time_series, torch.Tensor) or time_series.ndim != 2:
+        raise TypeError("Input 'time_series' must be a 2D PyTorch tensor.")
+    if n_versions <= 0 or max_shift_samples < 0:
+        raise ValueError("'n_versions' must be > 0 and 'max_shift_samples' must be >= 0.")
     
     shifted_series = []
     shifts = []
 
     for _ in range(n_versions):
         # Generate a random integer shift between -max_shift and +max_shift
-        shift_value = random.randint(-max_shift, max_shift)
+        # Using torch.randint for random integer generation
+        shift_value = torch.randint(low=-max_shift_samples, high=max_shift_samples + 1, size=(1,)).item()
         
-        # Use np.roll to apply a circular shift to the samples (axis=0)
-        shifted_version = np.roll(time_series, shift=shift_value, axis=0)
+        # Use torch.roll to apply a circular shift to the samples (axis=0 or dim=0)
+        shifted_version = torch.roll(time_series, shifts=shift_value, dims=0)
         
         shifted_series.append(shifted_version)
         shifts.append(shift_value)
 
     return shifted_series, shifts
-            
-def Homogeneous_scaling(time_series, n_versions, n_std_max,n_std_min):
     
-    import random
+def Homogeneous_scaling(time_series, n_versions, n_max, n_min):
     """
     Generates n versions of a multivariate time series, each with a homogeneous scaling.
 
     The scaling factor for each version is randomly chosen from the specified range.
 
     Args:
-        time_series (np.ndarray): The original time series with shape (samples, features).
+        time_series (torch.Tensor): The original time series with shape (samples, features).
         n_versions (int): The number of scaled versions to generate.
-        n_std = number of standard deviation used to fix the min/max factors
-
+        n_std_max (float): The maximum number of standard deviations to fix the max scaling factor.
+        n_std_min (float): The minimum number of standard deviations to fix the min scaling factor.
+    
     Returns:
         tuple: A tuple containing:
-            - scaled_series (list): A list of np.ndarrays, where each array is a
+            - scaled_series (list): A list of torch.Tensors, where each tensor is a
                                      randomly scaled version of the original time series.
             - scaling_factors (list): A list of the random scaling factors applied to each version.
     
     Raises:
-        TypeError: If the input 'time_series' is not a NumPy array.
-        ValueError: If the number of versions is not positive or if the factor range is invalid.
+        TypeError: If the input 'time_series' is not a PyTorch tensor.
+        ValueError: If the number of versions is not positive.
     """
-    if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
-        raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+    if not isinstance(time_series, torch.Tensor) or time_series.ndim != 2:
+        raise TypeError("Input 'time_series' must be a 2D PyTorch tensor.")
     if n_versions <= 0:
         raise ValueError("'n_versions' must be a positive integer.")
-   
     
-    min_factor_array = np.ones(time_series.shape[1])
-    max_factor_array = np.zeros(time_series.shape[1])
-   
-   # Calculate the std of the data per channel
-    stds = np.std(time_series, axis=0)
-    
-    min_factor_array = n_std_min*stds
-    max_factor_array = n_std_max*stds
-    
-   
-    
-   
     scaled_series = []
     scaling_factors = []
 
     for _ in range(n_versions):
+        # Generate a random scaling factor as a float within the specified range
+        # Using torch.rand to generate a uniform random number between [0, 1)
+        # and then scaling it to the desired range
+        min_factor = n_min
+        max_factor = n_max
         
-        scaled_version = np.zeros((time_series.shape[0],time_series.shape[1]))
-        for ch in range(time_series.shape[1]):
-            
-            
-            # Generate a random scaling factor as a float within the specified range
-            # scaling_factor = random.uniform(min_factor_array[ch], max_factor_array[ch])
-            scaling_factor = random.uniform(0.5, 2)
-            
-            # Apply the scaling to the entire time series
-            scaled_version[:,ch] = time_series[:,ch] * scaling_factor
+        scaling_factor = torch.rand(1).item() * (max_factor - min_factor) + min_factor
+        
+        # Apply the scaling to the entire time series
+        scaled_version = time_series * scaling_factor
         
         scaled_series.append(scaled_version)
         scaling_factors.append(scaling_factor)
     
     return scaled_series, scaling_factors
 
-
-
-
-def Positives(data,shift_magnitude = 100,n_versions = 10,n_std_max = 0.1,n_std_min = 0.5,fs = 10000, Generation_method= 'Combination'):
+def Positives(data, shift_magnitude=100, n_versions=10, n_max=2, n_min=0.5, fs=10000, Generation_method='Combination'):
+    """
+    Generates "positive" versions of a time series using various data augmentation techniques.
     
-    # Generation_method = Combination, Shift, Scaling.
-    
-    if Generation_method == 'Combination':
+    Args:
+        data (torch.Tensor): The original time series.
+        shift_magnitude (int): Max shift magnitude in ms for the 'Shift' method.
+        n_versions (int): Number of versions to generate for each method.
+        n_std_max (float): Max scaling factor for the 'Scaling' method.
+        n_std_min (float): Min scaling factor for the 'Scaling' method.
+        fs (int): Sampling frequency in Hz.
+        Generation_method (str): The augmentation method to use. 'Combination', 'Shift', or 'Scaling'.
         
+    Returns:
+        list: A list of augmented time series (torch.Tensor).
+    """
+    if Generation_method == 'Combination':
         out_ = []
         
         # Apply both techniques
-        Data_shifted,shifts = Shift(data,n_versions,shift_magnitude,fs)  
+        data_shifted, shifts = Shift(data, n_versions, shift_magnitude, fs)
         
-        for data_shift in Data_shifted:
+        for data_shift in data_shifted:
+            data_scaled, scales = Homogeneous_scaling(data_shift, n_versions, n_max, n_min)
+            out_.append(data_scaled)
             
-            Data_scaled,scales = Homogeneous_scaling(data_shift, n_versions, n_std_max,n_std_min)
-            
-            
-            out_.append(Data_scaled)
-        
-        
-        out = [inner_list for row in out_ for inner_list in row]
-        
-        
+        # Flatten the list of lists
+        out = [item for sublist in out_ for item in sublist]
+    
     elif Generation_method == 'Shift':
-        out,shifts = Shift(data,n_versions,shift_magnitude,fs)
-        
-        
-        
-        
+        out, shifts = Shift(data, n_versions, shift_magnitude, fs)
+    
     elif Generation_method == 'Scaling':
-        
-        out,scales = Homogeneous_scaling(data_shift, n_versions, n_std_max,n_std_min)
+        out, scales = Homogeneous_scaling(data, n_versions, n_max, n_min)
     
-    
-    
-    
-    
-    return out
-        
+    else:
+        raise ValueError("Generation_method must be 'Combination', 'Shift', or 'Scaling'.")
 
+    return out
+
+# ----------------------------------- NUMPY IMPLEMENTATION -----------------------------------
+# def Shift(time_series,n_versions,shift_magnitude,fs):
+    
+#     import random
+#     # shift_magnitude = Expressed in ms
+#     # fs = in Hz
+   
+#     # n_shifts = numebr of shifts
+    
+#     # Handle 
+#     fs_ms = fs/1000
+#     max_shift = int(shift_magnitude*fs_ms)
+    
+
+#     """
+#     Generates n randomly shifted versions of a multivariate time series.
+
+#     Args:
+#         time_series (np.ndarray): The original time series with shape (samples, features).
+#         n_versions (int): The number of shifted versions to generate.
+#         max_shift (int): The maximum absolute value of the random shift (in samples).
+#                          Shifts will be generated between -max_shift and +max_shift.
+
+#     Returns:
+#         tuple: A tuple containing:
+#             - shifted_series (list): A list of np.ndarrays, where each array is a
+#                                      randomly shifted version of the original time series.
+#             - shifts (list): A list of the random integer shifts applied to each version.
+#     """
+#     if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
+#         raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+#     if n_versions <= 0 or max_shift < 0:
+#         raise ValueError("'n_versions' must be > 0 and 'max_shift' must be >= 0.")
+    
+#     shifted_series = []
+#     shifts = []
+
+#     for _ in range(n_versions):
+#         # Generate a random integer shift between -max_shift and +max_shift
+#         shift_value = random.randint(-max_shift, max_shift)
         
-out =  Positives(Projected_trajectories[:,0:3],shift_magnitude = 100,n_versions = 5,n_std_max = 0.1,n_std_min = 0.5,fs = 10000, Generation_method= 'Combination')       
+#         # Use np.roll to apply a circular shift to the samples (axis=0)
+#         shifted_version = np.roll(time_series, shift=shift_value, axis=0)
+        
+#         shifted_series.append(shifted_version)
+#         shifts.append(shift_value)
+
+#     return shifted_series, shifts
+            
+# def Homogeneous_scaling(time_series, n_versions, n_std_max,n_std_min):
+    
+#     import random
+#     """
+#     Generates n versions of a multivariate time series, each with a homogeneous scaling.
+
+#     The scaling factor for each version is randomly chosen from the specified range.
+
+#     Args:
+#         time_series (np.ndarray): The original time series with shape (samples, features).
+#         n_versions (int): The number of scaled versions to generate.
+#         n_std = number of standard deviation used to fix the min/max factors
+
+#     Returns:
+#         tuple: A tuple containing:
+#             - scaled_series (list): A list of np.ndarrays, where each array is a
+#                                      randomly scaled version of the original time series.
+#             - scaling_factors (list): A list of the random scaling factors applied to each version.
+    
+#     Raises:
+#         TypeError: If the input 'time_series' is not a NumPy array.
+#         ValueError: If the number of versions is not positive or if the factor range is invalid.
+#     """
+#     if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
+#         raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+#     if n_versions <= 0:
+#         raise ValueError("'n_versions' must be a positive integer.")
+   
+    
+#     min_factor_array = np.ones(time_series.shape[1])
+#     max_factor_array = np.zeros(time_series.shape[1])
+   
+#    # Calculate the std of the data per channel
+#     stds = np.std(time_series, axis=0)
+    
+#     min_factor_array = n_std_min*stds
+#     max_factor_array = n_std_max*stds
+    
+   
+    
+   
+#     scaled_series = []
+#     scaling_factors = []
+
+#     for _ in range(n_versions):
+        
+#         scaled_version = np.zeros((time_series.shape[0],time_series.shape[1]))
+#         for ch in range(time_series.shape[1]):
+            
+            
+#             # Generate a random scaling factor as a float within the specified range
+#             # scaling_factor = random.uniform(min_factor_array[ch], max_factor_array[ch])
+#             scaling_factor = random.uniform(0.5, 2)
+            
+#             # Apply the scaling to the entire time series
+#             scaled_version[:,ch] = time_series[:,ch] * scaling_factor
+        
+#         scaled_series.append(scaled_version)
+#         scaling_factors.append(scaling_factor)
+    
+#     return scaled_series, scaling_factors
+
+
+
+
+# def Positives(data,shift_magnitude = 100,n_versions = 10,n_std_max = 0.1,n_std_min = 0.5,fs = 10000, Generation_method= 'Combination'):
+    
+#     # Generation_method = Combination, Shift, Scaling.
+    
+#     if Generation_method == 'Combination':
+        
+#         out_ = []
+        
+#         # Apply both techniques
+#         Data_shifted,shifts = Shift(data,n_versions,shift_magnitude,fs)  
+        
+#         for data_shift in Data_shifted:
+            
+#             Data_scaled,scales = Homogeneous_scaling(data_shift, n_versions, n_std_max,n_std_min)
+            
+            
+#             out_.append(Data_scaled)
+        
+        
+#         out = [inner_list for row in out_ for inner_list in row]
+        
+        
+#     elif Generation_method == 'Shift':
+#         out,shifts = Shift(data,n_versions,shift_magnitude,fs)
+        
+        
+        
+        
+#     elif Generation_method == 'Scaling':
+        
+#         out,scales = Homogeneous_scaling(data_shift, n_versions, n_std_max,n_std_min)
+    
+    
+    
+    
+    
+#     return out
+        
+Projected_trajectories = torch.from_numpy(Projected_trajectories)
+        
+out =  Positives(Projected_trajectories[:,0:3],shift_magnitude = 100,n_versions = 5,n_max = 2,n_min = 0.5,fs = 10000, Generation_method= 'Combination')       
         
         
         
@@ -849,7 +988,7 @@ out =  Positives(Projected_trajectories[:,0:3],shift_magnitude = 100,n_versions 
 
 
 #%%
-iterat = 6
+iterat = 4
 plt.figure()
 support = np.linspace(0,Projected_trajectories.shape[0],Projected_trajectories.shape[0])
 plt.plot(support,Projected_trajectories[:,0],'k')    
@@ -873,52 +1012,56 @@ plt.show()
     
     
 #%%
-def Permutation(time_series, n_versions, window_size_ms,fs):
+# ----------------------------------- TORCH IMPLEMENTATION -----------------------------------
+def Permutation(time_series, n_versions, window_size_ms, fs):
     """
     Divides a multivariate time series into windows, shuffles the windows,
     and reconstructs the time series. This process is repeated n times.
 
     Args:
-        time_series (np.ndarray): The original time series with shape (samples, features).
+        time_series (torch.Tensor): The original time series with shape (samples, features).
         n_versions (int): The number of permuted versions to generate.
-        window_size (int): The number of samples in each window.
+        window_size_ms (int): The window size in milliseconds.
+        fs (int): The sampling frequency in Hz.
 
     Returns:
-        list: A list of np.ndarrays, where each array is a new,
+        list: A list of torch.Tensors, where each tensor is a new,
               randomly permuted version of the time series.
-
+    
     Raises:
         ValueError: If window_size is not a positive integer.
-        TypeError: If time_series is not a 2D NumPy array.
+        TypeError: If time_series is not a 2D PyTorch tensor.
     """
-    if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
-        raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+    if not isinstance(time_series, torch.Tensor) or time_series.ndim != 2:
+        raise TypeError("Input 'time_series' must be a 2D PyTorch tensor.")
     
-
     num_samples, num_features = time_series.shape
     
+    # Convert window size from ms to samples
+    window_size = int(window_size_ms * fs / 1000)
     
-    # COnvert window size in samples
-    fs_ms = fs/1000
-    window_size = int(window_size_ms*fs_ms)
-    
+    if window_size <= 0:
+        raise ValueError("'window_size_ms' must be a positive integer.")
+    if num_samples < window_size:
+        raise ValueError(f"Number of samples ({num_samples}) is less than window size ({window_size}).")
     
     # Truncate the time series so its length is a multiple of the window size
     truncated_length = (num_samples // window_size) * window_size
     if truncated_length < num_samples:
         print(f"Warning: Time series length is not a multiple of window_size. "
               f"Truncating from {num_samples} to {truncated_length} samples.")
-              
+    
     truncated_ts = time_series[:truncated_length, :]
 
-    # Reshape the time series into windows (3D array)
+    # Reshape the time series into windows (3D tensor)
     num_windows = truncated_length // window_size
     windows = truncated_ts.reshape(num_windows, window_size, num_features)
 
     permuted_versions = []
     for _ in range(n_versions):
         # Generate a random permutation of window indices
-        permuted_indices = np.random.permutation(num_windows)
+        # torch.randperm(n) returns a random permutation of integers from 0 to n-1
+        permuted_indices = torch.randperm(num_windows)
         
         # Reorder the windows using the permuted indices
         shuffled_windows = windows[permuted_indices]
@@ -928,73 +1071,214 @@ def Permutation(time_series, n_versions, window_size_ms,fs):
         
         permuted_versions.append(reconstructed_ts)
 
-    return permuted_versions        
-          
+    return permuted_versions
+
 def Jittering(time_series, pers_std):
     """
     Adds homogeneous Gaussian noise to a multivariate time series.
 
     Args:
-        time_series (np.ndarray): The original time series with shape (samples, features).
-        pers_std (float): persantage of the data std that is used as The standard deviation (sigma) of the Gaussian noise.
-                                 The mean (mu) is always zero.
-
+        time_series (torch.Tensor): The original time series with shape (samples, features).
+        pers_std (float): Percentage of the data's standard deviation that is used
+                          as the standard deviation of the Gaussian noise.
+    
     Returns:
-        np.ndarray: A new array representing the jittered time series.
+        torch.Tensor: A new tensor representing the jittered time series.
     
     Raises:
-        TypeError: If the input 'time_series' is not a NumPy array.
+        TypeError: If the input 'time_series' is not a PyTorch tensor.
     """
-    if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
-        raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+    if not isinstance(time_series, torch.Tensor) or time_series.ndim != 2:
+        raise TypeError("Input 'time_series' must be a 2D PyTorch tensor.")
     
-    # Define the noise's magnitude
-    # Calculate the std of the data per channel
-    stds = np.std(time_series, axis=0)
-     
-    std_factor_array = pers_std*stds
+    # Calculate the standard deviation of the data per channel (feature)
+    # torch.std() with dim=0 computes the std for each column
+    stds = torch.std(time_series, dim=0, keepdim=True)
     
+    # Define the noise's magnitude based on the percentage of the data's std
+    std_factor_array = pers_std * stds
     
-    
-    
-    # Generate a random array from a Gaussian distribution with mean=0 and given sigma
-    noise = np.random.normal(loc=0.0, scale=std_factor_array, size=time_series.shape)
+    # Generate a random tensor from a Gaussian distribution with mean=0 and a given std
+    # The `std_factor_array` is broadcasted to the full size of the noise tensor
+    # torch.randn generates numbers from a standard normal distribution (mean=0, std=1)
+    # We then scale and shift it to our desired distribution.
+    noise = torch.randn(time_series.shape) * std_factor_array
     
     # Add the noise to the original time series
     jittered_series = time_series + noise
     
-    return jittered_series    
+    return jittered_series
+
+def Negatives(data, window_size_ms=10, n_versions=5,n_max = 2,n_min = 0.5, fs=10000, Generation_method='Combination'):
+    """
+    Generates "negative" versions of a time series using various data augmentation techniques.
     
-
-
-
-def Negatives(data, window_size_ms = 10,n_versions = 5,n_std_max = 0.1,n_std_min = 0.5,fs = 10000, Generation_method= 'Combination'):
-    
-    if  Generation_method == 'Permutation':
+    Args:
+        data (torch.Tensor): The original time series.
+        window_size_ms (int): Window size in ms for the 'Permutation' method.
+        n_versions (int): Number of versions to generate for each method.
+        n_std_max (float): Max scaling factor for the 'Scaling' method.
+        n_std_min (float): Min scaling factor for the 'Scaling' method.
+        fs (int): Sampling frequency in Hz.
+        Generation_method (str): The augmentation method to use. 'Combination', 'Permutation', or 'Scaling'.
         
-        out = Permutation(data, n_versions, window_size_ms,fs)
-    
-    
+    Returns:
+        list: A list of augmented time series (torch.Tensor).
+    """
+    if Generation_method == 'Permutation':
+        out = Permutation(data, n_versions, window_size_ms, fs)
     
     elif Generation_method == 'Combination':
-        
         out_ = []
         
         # Apply both techniques
-        Data_permutated = Permutation(data, n_versions, window_size_ms,fs)
+        data_permuted = Permutation(data, n_versions, window_size_ms, fs)
         
-        for data_shift in Data_permutated:
+        for data_perm in data_permuted:
+            # Note: The original numpy code had an issue here, using a variable 'data_shift'
+            # which wasn't defined in this loop. I've corrected it to use 'data_perm'.
+            data_scaled, scales = Homogeneous_scaling(data_perm, n_versions, n_max, n_min)
+            out_.append(data_scaled)
+        
+        # Flatten the list of lists
+        out = [item for sublist in out_ for item in sublist]
+    
+    elif Generation_method == 'Scaling':
+        out, scales = Homogeneous_scaling(data, n_versions, n_max, n_min)
+    
+    else:
+        raise ValueError("Generation_method must be 'Combination', 'Permutation', or 'Scaling'.")
+    
+    return out
+
+
+
+
+
+
+# ----------------------------------- NUMPY IMPLEMENTATION -----------------------------------
+# def Permutation(time_series, n_versions, window_size_ms,fs):
+#     """
+#     Divides a multivariate time series into windows, shuffles the windows,
+#     and reconstructs the time series. This process is repeated n times.
+
+#     Args:
+#         time_series (np.ndarray): The original time series with shape (samples, features).
+#         n_versions (int): The number of permuted versions to generate.
+#         window_size (int): The number of samples in each window.
+
+#     Returns:
+#         list: A list of np.ndarrays, where each array is a new,
+#               randomly permuted version of the time series.
+
+#     Raises:
+#         ValueError: If window_size is not a positive integer.
+#         TypeError: If time_series is not a 2D NumPy array.
+#     """
+#     if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
+#         raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+    
+
+#     num_samples, num_features = time_series.shape
+    
+    
+#     # COnvert window size in samples
+#     fs_ms = fs/1000
+#     window_size = int(window_size_ms*fs_ms)
+    
+    
+#     # Truncate the time series so its length is a multiple of the window size
+#     truncated_length = (num_samples // window_size) * window_size
+#     if truncated_length < num_samples:
+#         print(f"Warning: Time series length is not a multiple of window_size. "
+#               f"Truncating from {num_samples} to {truncated_length} samples.")
+              
+#     truncated_ts = time_series[:truncated_length, :]
+
+#     # Reshape the time series into windows (3D array)
+#     num_windows = truncated_length // window_size
+#     windows = truncated_ts.reshape(num_windows, window_size, num_features)
+
+#     permuted_versions = []
+#     for _ in range(n_versions):
+#         # Generate a random permutation of window indices
+#         permuted_indices = np.random.permutation(num_windows)
+        
+#         # Reorder the windows using the permuted indices
+#         shuffled_windows = windows[permuted_indices]
+        
+#         # Reshape the windows back into a single time series
+#         reconstructed_ts = shuffled_windows.reshape(truncated_length, num_features)
+        
+#         permuted_versions.append(reconstructed_ts)
+
+#     return permuted_versions        
+          
+# def Jittering(time_series, pers_std):
+#     """
+#     Adds homogeneous Gaussian noise to a multivariate time series.
+
+#     Args:
+#         time_series (np.ndarray): The original time series with shape (samples, features).
+#         pers_std (float): persantage of the data std that is used as The standard deviation (sigma) of the Gaussian noise.
+#                                  The mean (mu) is always zero.
+
+#     Returns:
+#         np.ndarray: A new array representing the jittered time series.
+    
+#     Raises:
+#         TypeError: If the input 'time_series' is not a NumPy array.
+#     """
+#     if not isinstance(time_series, np.ndarray) or time_series.ndim != 2:
+#         raise TypeError("Input 'time_series' must be a 2D NumPy array.")
+    
+#     # Define the noise's magnitude
+#     # Calculate the std of the data per channel
+#     stds = np.std(time_series, axis=0)
+     
+#     std_factor_array = pers_std*stds
+    
+    
+    
+    
+#     # Generate a random array from a Gaussian distribution with mean=0 and given sigma
+#     noise = np.random.normal(loc=0.0, scale=std_factor_array, size=time_series.shape)
+    
+#     # Add the noise to the original time series
+#     jittered_series = time_series + noise
+    
+#     return jittered_series    
+    
+
+
+
+# def Negatives(data, window_size_ms = 10,n_versions = 5,n_std_max = 0.1,n_std_min = 0.5,fs = 10000, Generation_method= 'Combination'):
+    
+#     if  Generation_method == 'Permutation':
+        
+#         out = Permutation(data, n_versions, window_size_ms,fs)
+    
+    
+    
+#     elif Generation_method == 'Combination':
+        
+#         out_ = []
+        
+#         # Apply both techniques
+#         Data_permutated = Permutation(data, n_versions, window_size_ms,fs)
+        
+#         for data_shift in Data_permutated:
             
-            Data_scaled,scales = Homogeneous_scaling(data_shift, n_versions, n_std_max,n_std_min)
+#             Data_scaled,scales = Homogeneous_scaling(data_shift, n_versions, n_std_max,n_std_min)
             
             
-            out_.append(Data_scaled)
+#             out_.append(Data_scaled)
         
         
-        out = [inner_list for row in out_ for inner_list in row]
+#         out = [inner_list for row in out_ for inner_list in row]
         
         
-        return out
+#         return out
 
 
 
@@ -1003,11 +1287,11 @@ window_size_ms = 10 # [ms]
 fs = 10000
 pers_std = 0.1
 # Permutated_data = Permutation(Projected_trajectories[:,0:3], n_versions, window_size_ms,fs)
-Negative_data = Negatives(Projected_trajectories[:,0:3], window_size_ms = 10,n_versions = 5,n_std_max = 0.1,n_std_min = 0.5,fs = 10000, Generation_method= 'Combination')
+Negative_data = Negatives(Projected_trajectories[:,0:3],window_size_ms=10, n_versions=5,n_max = 2,n_min = 0.5, fs=10000, Generation_method='Combination')
 
 
-#%%
-iterat = 6
+ #%%
+iterat = 2
 plt.figure()
 support = np.linspace(0,Projected_trajectories.shape[0],Projected_trajectories.shape[0])
 plt.plot(support,Projected_trajectories[:,0],'k')    
@@ -1026,6 +1310,8 @@ support = np.linspace(0,Projected_trajectories.shape[0],Projected_trajectories.s
 plt.plot(support,Projected_trajectories[:,2],'k')    
 plt.plot(support,Negative_data[iterat][:,2],'b')       
 plt.show()   
+
+
 
 
 
