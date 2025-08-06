@@ -14,6 +14,59 @@ from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 from sklearn.decomposition import PCA
 from mpl_toolkits.mplot3d import Axes3D
+import torch
+from torch.utils.data import Dataset
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, full_time_series, window_size_s=200,fs=10000 ):
+        """
+        Initializes the dataset with the full time series and window size.
+        
+        Args:
+            full_time_series (torch.Tensor): The entire time series data
+                                             with shape (total_samples, num_features).
+            window_size_s (int): The size of the sliding window in seconds
+        """
+        self.full_time_series = full_time_series
+        self.window_size = window_size_s*fs # in samples
+        
+        # Calculate the number of possible windows in the time series.
+        # This assumes non-overlapping windows for simplicity.
+        # If you want overlapping windows, the calculation would be different.
+        self.num_windows = int((len(self.full_time_series) // self.window_size))
+
+    def __len__(self):
+        """
+        Returns the total number of windows (samples) in the dataset.
+        """
+        return self.num_windows
+
+    def __getitem__(self, idx):
+        """
+        Returns a single window from the dataset.
+        
+        Args:
+            idx (int): The index of the window to retrieve.
+        
+        Returns:
+            torch.Tensor: A single time series window with shape (window_size, num_features).
+        """
+        start_idx = int(idx * self.window_size)
+        end_idx = int(start_idx + self.window_size)
+        window = self.full_time_series[start_idx:end_idx,:]
+        
+        return window
+
+
+
+
+
+
+
+
+
+
+
 
 def Standardization(data):
     """
@@ -684,7 +737,9 @@ def Neuronal_traces(t_rec = 600, fs = 10000, w_size = 0.12, overlap = 0.06,
     
     [Variance_explained, Projected_trajectories,Coefficients,NB_IFR_PCA_mean] = get_PCA(IFR_smoothed_concatenated,IFR_smoothed,Isolate_NB);
 
-    return Projected_trajectories,Variance_explained
+    fs_downsampled = 1/bin_size_s
+
+    return Projected_trajectories,Variance_explained,fs_downsampled
 
 
 
@@ -741,7 +796,7 @@ where:
 import torch
 import math
 
-def Shift(time_series, n_versions, shift_magnitude, fs):
+def Shift(time_series, n_versions, shift_magnitude_s, fs):
     """
     Generates n randomly shifted versions of a multivariate time series.
 
@@ -757,10 +812,9 @@ def Shift(time_series, n_versions, shift_magnitude, fs):
                                      randomly shifted version of the original time series.
             - shifts (list): A list of the random integer shifts applied to each version.
     """
-    # fs = in Hz, shift_magnitude = in ms
-    # Handle conversion from ms to samples
-    fs_ms = fs / 1000.0
-    max_shift_samples = int(shift_magnitude * fs_ms)
+    
+   
+    max_shift_samples = int(shift_magnitude_s * fs)
     
     if not isinstance(time_series, torch.Tensor) or time_series.ndim != 2:
         raise TypeError("Input 'time_series' must be a 2D PyTorch tensor.")
@@ -830,7 +884,7 @@ def Homogeneous_scaling(time_series, n_versions, n_max, n_min):
     
     return scaled_series, scaling_factors
 
-def Positives(data, shift_magnitude=100, n_versions=10, n_max=2, n_min=0.5, fs=10000, Generation_method='Combination'):
+def Positives(data, shift_magnitude_s=30, n_versions=10, n_max=2, n_min=0.5, fs=None, Generation_method='Combination'):
     """
     Generates "positive" versions of a time series using various data augmentation techniques.
     
@@ -850,7 +904,7 @@ def Positives(data, shift_magnitude=100, n_versions=10, n_max=2, n_min=0.5, fs=1
         out_ = []
         
         # Apply both techniques
-        data_shifted, shifts = Shift(data, n_versions, shift_magnitude, fs)
+        data_shifted, shifts = Shift(data, n_versions, shift_magnitude_s, fs)
         
         for data_shift in data_shifted:
             data_scaled, scales = Homogeneous_scaling(data_shift, n_versions, n_max, n_min)
@@ -860,7 +914,7 @@ def Positives(data, shift_magnitude=100, n_versions=10, n_max=2, n_min=0.5, fs=1
         out = [item for sublist in out_ for item in sublist]
     
     elif Generation_method == 'Shift':
-        out, shifts = Shift(data, n_versions, shift_magnitude, fs)
+        out, shifts = Shift(data, n_versions, shift_magnitude_s, fs)
     
     elif Generation_method == 'Scaling':
         out, scales = Homogeneous_scaling(data, n_versions, n_max, n_min)
@@ -870,7 +924,7 @@ def Positives(data, shift_magnitude=100, n_versions=10, n_max=2, n_min=0.5, fs=1
 
     return out
 
-def Permutation(time_series, n_versions, window_size_ms, fs):
+def Permutation(time_series, n_versions, window_size_s, fs):
     """
     Divides a multivariate time series into windows, shuffles the windows,
     and reconstructs the time series. This process is repeated n times.
@@ -895,7 +949,7 @@ def Permutation(time_series, n_versions, window_size_ms, fs):
     num_samples, num_features = time_series.shape
     
     # Convert window size from ms to samples
-    window_size = int(window_size_ms * fs / 1000)
+    window_size = int(window_size_s * fs )
     
     if window_size <= 0:
         raise ValueError("'window_size_ms' must be a positive integer.")
@@ -966,7 +1020,7 @@ def Jittering(time_series, pers_std):
     
     return jittered_series
 
-def Negatives(data, window_size_ms=10, n_versions=5,n_max = 2,n_min = 0.5, fs=10000, Generation_method='Combination'):
+def Negatives(data, window_size_s=5, n_versions=5 ,n_max = 4,n_min = 0.1, fs=None, Generation_method='Combination'):
     """
     Generates "negative" versions of a time series using various data augmentation techniques.
     
@@ -983,13 +1037,13 @@ def Negatives(data, window_size_ms=10, n_versions=5,n_max = 2,n_min = 0.5, fs=10
         list: A list of augmented time series (torch.Tensor).
     """
     if Generation_method == 'Permutation':
-        out = Permutation(data, n_versions, window_size_ms, fs)
+        out = Permutation(data, n_versions, window_size_s, fs)
     
     elif Generation_method == 'Combination':
         out_ = []
         
         # Apply both techniques
-        data_permuted = Permutation(data, n_versions, window_size_ms, fs)
+        data_permuted = Permutation(data, n_versions, window_size_s, fs)
         
         for data_perm in data_permuted:
             # Note: The original numpy code had an issue here, using a variable 'data_shift'
