@@ -64,7 +64,7 @@ Some notes:
 
     5) Tunable hyperparameters:
     
-        Model: Hidden size, embedding size, depth, dropout.
+        Model: Hidden size, embedding size, depth, dropout, if LeakyReLu is used: negative slope magnitude, 
         
         Optimizator: learning rate, weight decays (the two betas), etc...
         
@@ -100,7 +100,8 @@ Some notes:
 
 class GRUNetwork(nn.Module):
     
-    def __init__(self, input_size, hidden_size, embedding_size, num_layers=2, dropout=0.2):
+    def __init__(self, input_size, hidden_size, embedding_size, 
+                 num_layers=2, dropout=0.2, Act_fun = 'ReLU'):
         super(GRUNetwork, self).__init__()
         
         self.hidden_size = hidden_size
@@ -115,39 +116,80 @@ class GRUNetwork(nn.Module):
             dropout=dropout
         )
         
-       # Define a sequence of three fully connected layers
-        # with ReLU activation functions in between
         
-        self.fc = nn.Sequential(
-            # First fully connected layer
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            
-            # Second fully connected layer
-            nn.Linear(32, embedding_size),
-           
-            
-            
-        )
+        if Act_fun == 'ReLU':
         
-        # self.fc = nn.Sequential(
-        #     # First fully connected layer
-        #     nn.Linear(hidden_size, 128),
-        #     nn.ReLU(),
+        
+           # Define a sequence of three fully connected layers
+            # with ReLU activation functions in between
             
-        #     # Second fully connected layer
-        #     nn.Linear(128, 64),
-        #     nn.ReLU(),
+            self.fc = nn.Sequential(
+                # First fully connected layer
+                nn.Linear(hidden_size, 32),
+                nn.ReLU(),
+                
+                # Second fully connected layer
+                nn.Linear(32, embedding_size),
+               
+                
+                
+            )
             
-        #     # Third and final fully connected layer
-        #     nn.Linear(64, 32),
-        #     nn.ReLU(),
+            # self.fc = nn.Sequential(
+            #     # First fully connected layer
+            #     nn.Linear(hidden_size, 128),
+            #     nn.ReLU(),
+                
+            #     # Second fully connected layer
+            #     nn.Linear(128, 64),
+            #     nn.ReLU(),
+                
+            #     # Third and final fully connected layer
+            #     nn.Linear(64, 32),
+            #     nn.ReLU(),
+                
+            #     # Forth and final
+            #     nn.Linear(32, embedding_size)
+                
+                
+            # )
             
-        #     # Forth and final
-        #     nn.Linear(32, embedding_size)
+        elif Act_fun == 'LeakyReLU':
+        
+        
+           # Define a sequence of three fully connected layers
+            # with ReLU activation functions in between
             
+            self.fc = nn.Sequential(
+                # First fully connected layer
+                nn.Linear(hidden_size, 32),
+                nn.LeakyReLU(),
+                
+                # Second fully connected layer
+                nn.Linear(32, embedding_size),
+               
+                
+                
+            )
             
-        # )
+            # self.fc = nn.Sequential(
+            #     # First fully connected layer
+            #     nn.Linear(hidden_size, 128),
+            #     nn.LeakyReLU(),
+                
+            #     # Second fully connected layer
+            #     nn.Linear(128, 64),
+            #     nn.LeakyReLU(),
+                
+            #     # Third and final fully connected layer
+            #     nn.Linear(64, 32),
+            #     nn.LeakyReLU(),
+                
+            #     # Forth and final
+            #     nn.Linear(32, embedding_size)
+                
+                
+            # )
 
 
     def forward(self, data,fs=None, h0=None,State='Training',n_repl=10) :
@@ -300,7 +342,7 @@ def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,iterations,fs):
         
         
         avg_loss = running_loss / (i+1) # loss per batch
-        print('  batch {} loss: {}'.format(i + 1, last_loss))
+        print('  batch {} loss: {}'.format(i + 1, avg_loss))
        
     return avg_loss    
 
@@ -337,7 +379,7 @@ Training_data = torch.from_numpy(Projected_trajectories)
 
 
 # Create an instance of your custom dataset
-dataset_train = TimeSeriesDataset(Training_data,fs=fs_downsampled,window_size_s=150)
+dataset_train = TimeSeriesDataset(Training_data,fs=fs_downsampled,window_size_s=200)
 
 
 
@@ -392,7 +434,7 @@ dataloader_validation = DataLoader(dataset_validation,
 
 
 
-#%%
+
 # --- SET DEVICE ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -424,7 +466,10 @@ model = model.to(device)
 # miner_fn = miners.TripletMarginMiner(margin=0.2, type_of_triplets="all",)
 
 
+# iterations = 10
+# avg_loss = train_one_epoch(model,dataloader_train,loss_fn,optimizer_fn,iterations,fs_downsampled)
 
+#%%
 
 
 
@@ -460,7 +505,7 @@ for epoch in range(EPOCHS):
     with torch.no_grad():
         for i, vdata in enumerate(dataloader_validation):
             
-            final_embeddings,final_labels = model(torch.squeeze(vdata),fs,State='Validation')
+            final_embeddings,final_labels = model(torch.squeeze(vdata),fs_downsampled,State='Validation')
         
             
             vloss = loss_fn(final_embeddings, final_labels)
@@ -494,5 +539,4 @@ for epoch in range(EPOCHS):
 #%%
 del model
 del loss_fn
-
 
