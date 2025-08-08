@@ -90,265 +90,15 @@ Some notes:
                 
     9) In validation settings the Positive instances are not much variated from the referenc, just the shift is incremented to simulate the lag on an in-silico network. 
     We will take two instances of control traces (two different control networks traces concatenated) and evaluate the tendency of the summary network to produce similar embeddings for such traces
-            
+       
+
+        
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
  
+    10) The ADAMW algorithms and the embedding regularizer both have regularization mechanisms, it's not clear on what they act.
 '''
 
 
-
-
-
-class GRUNetwork(nn.Module):
-    
-    def __init__(self, input_size, hidden_size, embedding_size, 
-                 num_layers=2, dropout=0.2, Act_fun = 'ReLU'):
-        super(GRUNetwork, self).__init__()
-        
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # Define the GRU layer
-        self.gru = nn.GRU(
-            input_size=input_size, 
-            hidden_size=hidden_size, 
-            num_layers=num_layers, 
-            batch_first=True,
-            dropout=dropout
-        )
-        
-        
-        if Act_fun == 'ReLU':
-        
-        
-           # Define a sequence of three fully connected layers
-            # with ReLU activation functions in between
-            
-            self.fc = nn.Sequential(
-                # First fully connected layer
-                nn.Linear(hidden_size, 32),
-                nn.ReLU(),
-                
-                # Second fully connected layer
-                nn.Linear(32, embedding_size),
-               
-                
-                
-            )
-            
-            # self.fc = nn.Sequential(
-            #     # First fully connected layer
-            #     nn.Linear(hidden_size, 128),
-            #     nn.ReLU(),
-                
-            #     # Second fully connected layer
-            #     nn.Linear(128, 64),
-            #     nn.ReLU(),
-                
-            #     # Third and final fully connected layer
-            #     nn.Linear(64, 32),
-            #     nn.ReLU(),
-                
-            #     # Forth and final
-            #     nn.Linear(32, embedding_size)
-                
-                
-            # )
-            
-        elif Act_fun == 'LeakyReLU':
-        
-        
-           # Define a sequence of three fully connected layers
-            # with ReLU activation functions in between
-            
-            self.fc = nn.Sequential(
-                # First fully connected layer
-                nn.Linear(hidden_size, 32),
-                nn.LeakyReLU(),
-                
-                # Second fully connected layer
-                nn.Linear(32, embedding_size),
-               
-                
-                
-            )
-            
-            # self.fc = nn.Sequential(
-            #     # First fully connected layer
-            #     nn.Linear(hidden_size, 128),
-            #     nn.LeakyReLU(),
-                
-            #     # Second fully connected layer
-            #     nn.Linear(128, 64),
-            #     nn.LeakyReLU(),
-                
-            #     # Third and final fully connected layer
-            #     nn.Linear(64, 32),
-            #     nn.LeakyReLU(),
-                
-            #     # Forth and final
-            #     nn.Linear(32, embedding_size)
-                
-                
-            # )
-
-
-    def forward(self, data,fs=None, h0=None,State='Training',n_repl=10) :
-        
-        # n_repl = number of replica for the augmented data, given that the default generation type is 
-            # combination the number of batches is n_repl**2
-            
-        # State = Training, Validation, Embedding
-        
-        if State == 'Training':
-            
-            if h0 is None:
-                h0 = torch.zeros(self.num_layers, n_repl**2, self.hidden_size).to(data.device)
-                
-            
-            # ------- Augment the data -------
-            # --- Positives ---
-            Pos_out =  torch.stack(Positives(data,n_versions=n_repl,fs=fs)).to(torch.float32)
-            
-            # Generate the labels
-            Pos_Lables = torch.zeros(len(Pos_out), dtype=torch.int8)
-            
-            
-            # Train
-            out_pos, _ = self.gru(Pos_out, h0)
-            
-            last_hidden_state_pos = out_pos[:, -1, :]
-            
-            final_embedding_pos = self.fc(last_hidden_state_pos)
-            
-            
-            
-            # --- Negatives ---
-            # We do NOT need to get the same number of istances as the positives. However in this case they are.
-            # With the default Generation_method='Combination' we ge that for every n_repl permutated version
-            # n_repl scaled (similar) versiuons are generated. Thus the 
-            
-            Neg_out =  torch.stack(Negatives(data,n_versions=n_repl,fs=fs)).to(torch.float32)
-            
-            
-            # Generate the labels 
-            Base_Labels = torch.arange(1, n_repl + 1)
-            Neg_Lables = torch.repeat_interleave(Base_Labels, repeats=n_repl)
-            
-            
-
-            # Train
-            out_neg, _ = self.gru(Neg_out, h0)
-            
-            last_hidden_state_neg = out_neg[:, -1, :]
-            
-            final_embedding_neg = self.fc(last_hidden_state_neg)
-            
-            
-            
-            # --- CONCATENATION STEP ---
-            # Concatenate the final embeddings along the batch dimension (dim=0)
-            final_embeddings = torch.cat((final_embedding_pos, final_embedding_neg), dim=0)
-        
-            # Concatenate the labels in the same order
-            final_labels = torch.cat((Pos_Lables, Neg_Lables), dim=0)
-            
-            
-            
-            return final_embeddings,final_labels
-        
-        elif State == 'Validation':
-        
-            # In validation settings the Positive instances are not much variated from the reference 
-            
-            if h0 is None:
-                h0 = torch.zeros(self.num_layers, n_repl**2, self.hidden_size).to(data.device)
-                
-            
-            # ------- Augment the data -------
-            # --- Positives ---
-            Pos_out =  torch.stack(Positives(data, shift_magnitude_s=40, n_max=1.1, n_min=0.8,n_versions=n_repl,fs=fs)).to(torch.float32)
-            
-            # Generate the labels
-            Pos_Lables = torch.zeros(len(Pos_out), dtype=torch.int8)
-            
-            
-            # Train
-            out_pos, _ = self.gru(Pos_out, h0)
-            
-            last_hidden_state_pos = out_pos[:, -1, :]
-            
-            final_embedding_pos = self.fc(last_hidden_state_pos)
-            
-           
-            
-            
-            
-            
-            
-            return final_embedding_pos,Pos_Lables
-            
-            
-    
-        
-        
-        elif State == 'Embedding':
-          
-            if h0 is None:
-                h0 = torch.zeros(self.num_layers, data.shape[0], self.hidden_size).to(data.device)
-            
-            out, h_n = self.gru(data, h0)
-            
-            last_hidden_state = out[:, -1, :]
-            
-            final_embedding = self.fc(last_hidden_state)
-            
-            return final_embedding
-        
-        
-        
-        
-def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,iterations,fs):
-    running_loss = 0.
-    last_loss = 0.
-
-    # Here, we use enumerate(training_loader) instead of
-    # iter(training_loader) so that we can track the batch
-    # index and do some intra-epoch reporting
-    
-    # The training loop now iterates over the dataloader
-    for i, data_batch in enumerate(dataloader):
-        
-        # data_batch has shape (batch_size, window_size, features)
-        
-        # Move the mini-batch to the GPU
-        data_batch = data_batch.to(device)
-
-
-        # Zero your gradients for every batch!
-        optimizer_fn.zero_grad()
-
-        # Make predictions for this batch
-        final_embeddings,final_labels = model(torch.squeeze(data_batch),fs,State='Training')
-
-        # Compute the loss and its gradients
-        loss = loss_fn(final_embeddings, final_labels)
-        loss.backward()
-
-        # Adjust learning weights
-        optimizer_fn.step()
-
-        # Gather data and report
-        running_loss += loss.item()
-        
-        
-        avg_loss = running_loss / (i+1) # loss per batch
-        print('  batch {} loss: {}'.format(i + 1, avg_loss))
-       
-    return avg_loss    
-
-
-
-#%%
 
 
 # ------------- Free cuda -------------
@@ -439,7 +189,7 @@ dataloader_validation = DataLoader(dataset_validation,
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-#%%
+
 # --------- TRAINING FUNCTIONS ---------
 
 model = GRUNetwork(3,64,16)
@@ -469,7 +219,7 @@ model = model.to(device)
 # iterations = 10
 # avg_loss = train_one_epoch(model,dataloader_train,loss_fn,optimizer_fn,iterations,fs_downsampled)
 
-#%%
+
 
 
 
@@ -505,7 +255,9 @@ for epoch in range(EPOCHS):
     with torch.no_grad():
         for i, vdata in enumerate(dataloader_validation):
             
-            final_embeddings,final_labels = model(torch.squeeze(vdata),fs_downsampled,State='Validation')
+            vdata = torch.squeeze(vdata).to(device)
+            
+            final_embeddings,final_labels = model(vdata,fs_downsampled,State='Validation')
         
             
             vloss = loss_fn(final_embeddings, final_labels)
@@ -539,4 +291,3 @@ for epoch in range(EPOCHS):
 #%%
 del model
 del loss_fn
-
