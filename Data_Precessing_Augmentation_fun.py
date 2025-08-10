@@ -10,7 +10,7 @@ from sklearn.decomposition import PCA
 from mpl_toolkits.mplot3d import Axes3D
 import torch
 from torch.utils.data import Dataset
-
+from torch import nn
 
 # --------------........... CORE DEEP NN FUNCTIONS ...........--------------
 
@@ -252,11 +252,11 @@ class GRUNetwork(nn.Module):
         elif State == 'Embedding':
           
             if h0 is None:
-                h0 = torch.zeros(self.num_layers, data.shape[0], self.hidden_size).to(data.device)
+                h0 = torch.zeros(self.num_layers, self.hidden_size).to(data.device)
             
             out, h_n = self.gru(data, h0)
             
-            last_hidden_state = out[:, -1, :]
+            last_hidden_state = out[-1, :]
             
             final_embedding = self.fc(last_hidden_state)
             
@@ -265,7 +265,7 @@ class GRUNetwork(nn.Module):
         
         
         
-def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,iterations,fs):
+def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,iterations,fs,device):
     running_loss = 0.
     last_loss = 0.
 
