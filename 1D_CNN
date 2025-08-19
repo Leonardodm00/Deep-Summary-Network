@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Created on Mon Aug 18 20:59:29 2025
 
@@ -63,7 +64,8 @@ NOTES:
     2) The stem will do a first coarse graining of the timeseries.
     3) It is possible to add a droput layer in the single bloks. This allows to  implement it
         for the last block in a stage.
-
+    4) Dropout position is controvelsial, some suggest ot put it just after the linear projection (the conv. layer)
+        others after the non linear activation function.
 '''
 
 
@@ -133,7 +135,7 @@ class ResNet_Block(nn.Module):
         super().__init__()
     
         self.c1 = nn.Conv1d(in_channels_res, out_channels_res, kernel_size_res, stride=stride_res,padding=1)
-        self.c2 = nn.Conv1d(out_channels_res, out_channels_res, kernel_size_res, stride=stride_res,padding=1)
+        self.c2 = nn.Conv1d(out_channels_res, out_channels_res, kernel_size_res, stride=1)
         if use_1x1conv:
             # In this case strides MUST be grater than one
             self.c3 = nn.Conv1d(in_channels_res,out_channels_res, kernel_size=1,
@@ -182,7 +184,7 @@ class ResNeXt_Block(nn.Module):
                 
         
         self.c1 = nn.Conv1d(in_channels_res, out_channels_res, 1, stride=1)
-        self.c2 = nn.Conv1d(in_channels_res, out_channels_res, kernel_size_res, stride=stride_res,padding=1,
+        self.c2 = nn.Conv1d(out_channels_res, out_channels_res, kernel_size_res, stride=stride_res,padding=1,
                                    groups=out_channels_res//groups)
         self.c3 = nn.Conv1d(out_channels_res, out_channels_res, 1, stride=1)
         
@@ -212,10 +214,10 @@ class ResNeXt_Block(nn.Module):
     def forward(self,X):
         
         Y =  self.relu(self.bn1(self.c1(X)))
-        Y =  self.relu(self.bn2(self.c2(X)))
+        Y =  self.relu(self.bn2(self.c2(Y)))
         Y = self.bn3(self.c3(Y))
         if self.c4:
-            X = self.c4(X)
+            X = self.bn4(self.c4(X))
         Y += X
         if self.dropout:
             Y = self.dropout(Y)
@@ -243,27 +245,34 @@ class Head_Block(nn.Module):
         
     def forward(self,X):
         
+        # 1. Pass the input through the linear layer
+        Y = self.linear(X)
+        
+        # 2. Apply dropout if it exists
         if self.dropout:
-            
-            fc = nn.Sequential(
-              
-               self.linear,
-               self.dropout,
-               self.relu)
+            Y = self.dropout(Y)
+        
+        # 3. Apply the ReLU activation function
+        Y = self.relu(Y)
             
             
-        else:
-            fc = nn.Sequential(
-                
-               self.linear,
-               self.relu)
-            
-            
-        return fc
+        return Y
             
         
-
-
+class Stem_Block(nn.Module):
+    
+    def __init__(self, out_channels_stem, kernel_size_stem, stride_stem):
+        super().__init__()
+        
+        self.c1 = nn.Conv1d(1, out_channels_stem, kernel_size_stem, stride=stride_stem)
+        self.bn1 = nn.BatchNorm1d(out_channels_stem)
+        self.relu = nn.ReLU()  # Corrected spelling here
+        
+    def forward(self, X):
+        Y = self.bn1(self.c1(X))
+        Y = self.relu(Y)
+        
+        return Y
 
 
         
@@ -289,20 +298,6 @@ Params:
     padding (int, tuple or str, optional) – Padding added to both sides of the input. Default: 0
     
     '''
-    def stem(self,out_channels_stem,kernel_size_stem,stride_stem):
-        
-        out = nn.Sequential(
-            
-            nn.Conv1d(1, out_channels_stem, kernel_size_stem, stride=stride_stem),
-            nn.BatchNorm1d(out_channels_stem),
-            # Dropout?????
-            nn.ReLU()
-            
-      
-            )
-        
-        
-        return out
     
     
     
@@ -317,7 +312,7 @@ Params:
                     blk.append(ResNet_Block(in_channels_stage, out_channels_stage, kernel_size_stage, use_1x1conv=True, stride_res=self.downsampling_rate,use_dropout=False,dropout_pers=None))
                     
                     
-                if self.last_dropout == True and i == depth-1:
+                elif self.last_dropout == True and i == depth-1:
                     
                    
                     # Last has added a dropout layer for regularization
@@ -336,7 +331,7 @@ Params:
                     blk.append(ResNeXt_Block(in_channels_stage, out_channels_stage, kernel_size_stage, self.groups, use_1x1conv=True, stride_res=self.downsampling_rate,use_dropout=False,dropout_pers=None))
                     
                     
-                if self.last_dropout == True and i == depth-1:
+                elif self.last_dropout == True and i == depth-1:
                     # Last has added a dropout layer for regularization
                     blk.append(ResNeXt_Block(out_channels_stage, out_channels_stage, kernel_size_stage, self.groups, use_1x1conv=False, stride_res=1,use_dropout=True,dropout_pers=self.dropout_pers))
                     
@@ -349,45 +344,65 @@ Params:
         return nn.Sequential(*blk)
     
     
-        def head(self,in_channels_head):
+        def head(self):
             
             # Number of layers. 
-            n_layers = int(math.log(in_channels_head/self.embedding_size)/math.log(self.width_shrink))
+            n_layers = int(math.log(self.final_width/self.embedding_size)/math.log(self.width_shrink))
             
             blk = []
-            current_in_size = in_channels_head
+            current_in_size = self.final_width
             for i in range(n_layers):
               
                 current_out_size = current_in_size//self.width_shrink
                
-                blk.append(Head_Block(self,current_in_size,current_out_size,self.head_dropout,self.dropout_pers))
+                blk.append(Head_Block(current_in_size,current_out_size,self.head_dropout,self.dropout_pers))
                 
                 current_in_size = current_out_size
            
         
-        
+            if current_out_size != self.embedding_size:
+                raise ValueError("Incorrect embedding sizes")
             return nn.Sequential(*blk)
      
         
      
         def build_stages(self):
+            # It inherents the net module
              
              Stage_depth,Stage_width = stage_features(depth_max=self.Network_depth,w_in=self.Stem_augmentation,w_m=2)
              
              for i in range(len(Stage_depth)):
                  
                  # TODO: I must define the input and output channels in the iterative way
-                 
-                 self.net.add_module(f'stage{i+1}',self.stage(self, Stage_depth[i], in_channels_stage ,out_channels_stage,kernel_size_stage ))
+                 if i == 0:
+                     
+                     self.net.add_module(f'stage{i+1}',self.stage( Stage_depth[i], self.Stem_augmentation ,Stage_width[i],self.Stage_kernel))
+                     
+                 else:
+                     
+                     self.net.add_module(f'stage{i+1}',self.stage( Stage_depth[i], Stage_width[i-1] ,Stage_width[i],self.Stage_kernel))
+                     
+             return  Stage_width[-1] # The last number of channels
              
-         
-         
+        def build_stem(self):
+            
+            stem = Stem_Block(self.Stem_augmentation, self.Stem_kernel, self.Stem_stride)
+            self.net.add_module('stem', stem)
+            
+            
+        
+        def build_head(self):
+            # It inherents thefinal width
+            
+            self.net.add_module(r'head',self.head())
+        
+
          
      
     
         
         
-    def __init__(self,last_dropout = True,head_dropout = True, downsampling_rate=2,groups=8,dropout_pers=0.2,Block_Type = 'ResNet_Block',width_shrink = 4, Network_depth = 64, embedding_size = 16,Stem_augmentation = 32,Stem_kernel = None,Stem_stride = None):
+    def __init__(self,last_dropout = True,head_dropout = True, downsampling_rate=2,groups=8,dropout_pers=0.2,Block_Type = 'ResNet_Block',width_shrink = 4, Network_depth = 64, Stage_kernel = 3, embedding_size = 16,Stem_augmentation = 32,Stem_kernel = None,Stem_stride = None):
         super(OneD_CNN, self).__init__()  
         
         
@@ -414,6 +429,9 @@ Params:
         # Maximum depth of the network
         self.Network_depth = Network_depth
         
+        # Window size of the bloks in the stages
+        self.Stage_kernel = Stage_kernel
+        
         
         
         # ----- HEAD -----
@@ -438,8 +456,14 @@ Params:
         
         # -------------------- BUILDING THE ARCHITECTURE --------------------
         
-        self.stem_section =  stem(self.Stem_augmentation,self.Stem_kernel,self.Stem_stride)
+        # Initialize an empty sequential container to build the network
+        self.net = nn.Sequential()
+
+        self.build_stem()
         
+        self.final_width = self.build_stages()
+        
+        self.build_head()
         
         
         
