@@ -1,0 +1,769 @@
+
+import torch
+from torch.utils.data import Dataset
+from torch import nn
+import math
+from collections import Counter
+
+'''
+
+The following code is insired to the AnyNet architecure, whith some changes. The key idea is to 
+set up aa flexible network design space. Such space is defined as a distribution of networks 
+which is optimizes in a way to obtain good performance for the entire families of networks.
+
+
+Following the design principles suggested by Radosavovic:
+    1) Keep the bottleneck ratio equal to 1 for all stages.
+    2) All stages share the same group width.
+    3) Increase linearly the netwrok width ascross stages.
+    4) Increase the network depth across stages, the number of blocks per stage.
+
+As the resolution is reduced both depth and width of the stages increases.
+   
+Each stage is made up of 'd' # of blocks which share the same architecture. Whithin a single stage 
+the first block performs downsampling and increase in width (# of channels) while the following ones 
+keep both resolution and # of channels unchanged.
+
+
+--------- STAGES ---------
+In defining the number of stages and relative width and depth I rely on the pricniples given by
+Radosavovic et Al. (2020). The actual depth is the selected one minus 2 for math reasons.
+
+
+
+
+--------- HEAD ---------
+
+The head will be a Fully connected perceptron working on the pooled feature map of all the channels.
+Additionaly I can add shorcuts form the channels at various degree of resolution. The number of layers
+(and relative width) depends on the parameter width_shrink. It is a power of 2 and rules the
+the successive layer's width. The relation is the following:
+    
+        width_post_layer = width_pre_layer/width_shrink
+       
+The number of head Layers is retrived in the following way:
+    
+    (width_shrink)^n_layers = width_input/embedding_size
+    
+which leads to 
+
+    n_layers = log(width_input/embedding_size)/log(width_shrink)
+
+
+
+
+------------------------------------
+
+NOTES:
+    1) The architecture follows the one of RegNetX- where - is the number of layers.
+    2) The stem will do a first coarse graining of the timeseries.
+    3) It is possible to add a droput layer in the single bloks. This allows to  implement it
+    for the last block in a stage.
+    4) Dropout position is controvelsial, some suggest ot put it just after the linear projection (the conv. layer)
+    others after the non linear activation function.
+'''
+
+
+# ---------------------- UTILITY FUNCTIONS ----------------------
+
+def analyze_vector(data_vector):
+    """
+    Analyzes a vector of values to determine the number of unique elements
+    and the frequency of each element.
+
+    Args:
+        data_vector (list): A list of values.
+
+    Returns:
+        tuple: A tuple containing the number of unique elements and a dictionary
+               of element frequencies.
+    """
+    # Determine the number of unique elements by converting to a set and getting its length
+    # num_unique = list(dict.fromkeys(data_vector))
+   
+    # Use Counter to get the frequency of each element
+    Counter_obj = Counter(data_vector)
+   
+    return list(Counter_obj.keys()), list(Counter_obj.values())
+def stage_features(depth_max=None,w_in=None,w_m=2):
+    '''
+    The approach is inspired from the work of Radosavovic (2020)
+   
+    Hyperparameters are:
+        1) Depth_max (<64)
+        2) w_a which is taken equal to the stem's output
+        3) w_m taken equal to 2 (at each stage the depth is doubled)
+   
+    '''
+    list_depth = range(1,depth_max+1)
+   
+    list_out = []
+   
+    for j in list_depth:
+       
+        uj = w_in*(j+1)
+       
+        sj = int(math.log(j+1)/math.log(w_m))
+       
+        wj = w_in*(w_m**sj)
+       
+        list_out.append(wj)
+   
+   
+    num,freq = analyze_vector(list_out[:-2]  )
+    return num,freq 
+
+def calculate_padding(input_size, kernel_size, stride):
+    """
+    Calculates the required padding for a 1D convolution to ensure the output 
+    sequence length is the same as the input length.
+
+    Args:
+        input_size (int): The length of the input sequence.
+        kernel_size (int): The size of the convolution kernel.
+        stride (int): The stride of the convolution.
+
+    Returns:
+        int: The amount of padding required.
+    """
+    # Check for valid stride
+    if stride <= 0:
+        raise ValueError("Stride must be a positive integer.")
+   
+    # Calculate padding using the formula for same-padding
+    # This formula ensures that the output size is roughly equal to the input size
+    # for a given kernel size and stride.
+    output_size = math.ceil(input_size / stride)
+    padding = (output_size - 1) * stride + kernel_size - input_size
+   
+    # For same padding, the required padding must be an even number.
+    # The output size will be input_size / stride, but since padding must be an integer,
+    # we need to consider how the padding is split.
+    if padding % 2 != 0 and padding != 1:
+        # If padding is odd, it cannot be perfectly split, so we might need to adjust.
+        # This function returns the total padding needed.
+        # In practice, PyTorch handles asymmetric padding.
+        raise ValueError("Padding is odd.")
+
+    if padding == 1:
+        return padding
+   
+    else:
+        return padding // 2
+
+
+class ResNet_Block(nn.Module):
+   
+    '''
+    We also have the option to halve the output height and width while increasing the number of output channels. In this case we use 1x1
+    convolutions via use_1x1conv=True. This comes in handy at the beginning of each ResNet block to reduce the spatial dimensionality via strides=2 or more.
+   
+    torch.nn.Conv1d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', device=None, dtype=None)
+    '''
+   
+   
+    def __init__(self,input_size,in_channels_res, out_channels_res, kernel_size_res, use_1x1conv=False, stride_res=1,use_dropout=False,dropout_pers=0.2):
+        super().__init__()
+       
+        self.use_1x1conv = use_1x1conv
+       
+        padding_amount =  calculate_padding(input_size, kernel_size_res, stride_res)
+        self.c1 = nn.Conv1d(in_channels_res, out_channels_res, kernel_size_res, stride=stride_res,padding=padding_amount)
+       
+        padding_amount =  calculate_padding(input_size//stride_res, kernel_size_res, 1)
+        self.c2 = nn.Conv1d(out_channels_res, out_channels_res, kernel_size_res, stride=1,padding =padding_amount )
+        if use_1x1conv:
+            # In this case strides MUST be grater than one
+            self.c3 = nn.Conv1d(in_channels_res,out_channels_res, kernel_size=1,
+                                     stride=stride_res)
+        else:
+            self.c3 = None
+               
+        self.bn1 = nn.BatchNorm1d(out_channels_res)
+        self.bn2 = nn.BatchNorm1d(out_channels_res)     
+        self.relu = nn.ReLU()
+               
+        if use_dropout:
+           
+            self.dropout = nn.Dropout(p = dropout_pers)
+           
+        else:
+            self.dropout = None
+       
+       
+       
+    def forward(self,X):
+       
+        print(f'ResNet_Block input shape: {X.shape}')
+       
+        Y = self.c1(X)
+        print(f'  - c1 output shape: {Y.shape}')
+        Y = self.bn1(Y)
+        Y = self.relu(Y)
+       
+        Y = self.c2(Y)
+        print(f'  - c2 output shape: {Y.shape}')
+        Y = self.bn2(Y)
+       
+        if self.c3:
+            X = self.c3(X)
+            print(f'  - c3 (1x1 conv) output shape: {X.shape}')
+        Y += X
+        if self.dropout:
+            Y = self.dropout(Y)
+
+        Y = self.relu(Y)
+        print(f'ResNet_Block final output shape: {Y.shape}')
+        return Y
+   
+
+class ResNeXt_Block(nn.Module):
+   
+    '''
+    ResNeXtBlock class takes as argument groups (g), with bot_channels intermediate (bottleneck) channels WHICH IS SET TO 1 (read above). 
+    Lastly, when we need to reduce the height and width of the representation, we set use_1x1conv=True, strides=2.
+    Remember that in and out channels MUST be divisible by the number fo groups.
+   
+    torch.nn.Conv1d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', device=None, dtype=None)
+    '''
+   
+    def __init__(self,input_size, in_channels_res, out_channels_res, kernel_size_res, groups, use_1x1conv=False, stride_res=1,use_dropout=False,dropout_pers=0.2):
+        super().__init__()
+               
+        self.use_1x1conv = use_1x1conv
+       
+        self.c1 = nn.Conv1d(in_channels_res, out_channels_res, 1, stride=1)
+        padding_amount =  calculate_padding(input_size, kernel_size_res, stride_res)
+        self.c2 = nn.Conv1d(out_channels_res, out_channels_res, kernel_size_res, stride=stride_res,padding=padding_amount,
+                                      groups=out_channels_res//groups)
+       
+       
+        self.c3 = nn.Conv1d(out_channels_res, out_channels_res, 1, stride=1)
+       
+        self.bn1 = nn.BatchNorm1d(out_channels_res)
+        self.bn2 = nn.BatchNorm1d(out_channels_res)
+        self.bn3 = nn.BatchNorm1d(out_channels_res)
+        if use_1x1conv:
+            self.c4 = nn.Conv1d(in_channels_res,out_channels_res, kernel_size=1,
+                                     stride=stride_res)
+            self.bn4 = nn.BatchNorm1d(out_channels_res)
+        else:
+            self.c4 = None
+   
+   
+        self.relu = nn.ReLU()
+       
+        if use_dropout:
+           
+            self.dropout = nn.Dropout(p = dropout_pers)
+           
+        else:
+            self.dropout = None
+           
+       
+       
+       
+    def forward(self,X):
+       
+        print(f'ResNeXt_Block input shape: {X.shape}')
+       
+        Y = self.c1(X)
+        Y = self.relu(self.bn1(Y))
+        print(f'  - c1 output shape: {Y.shape}')
+
+        Y = self.c2(Y)
+        Y = self.relu(self.bn2(Y))
+        print(f'  - c2 output shape: {Y.shape}')
+
+        Y = self.c3(Y)
+        Y = self.bn3(Y)
+        print(f'  - c3 output shape: {Y.shape}')
+       
+        if self.c4:
+            X = self.c4(X)
+            X = self.bn4(X)
+            print(f'  - c4 (1x1 conv) output shape: {X.shape}')
+        Y += X
+        if self.dropout:
+            Y = self.dropout(Y)
+           
+        Y = self.relu(Y)
+        print(f'ResNeXt_Block final output shape: {Y.shape}')
+        return Y
+       
+       
+class Head_Block(nn.Module):
+
+    def __init__(self,in_channels_head,out_channels_head,use_dropout,dropout_pers):
+        super().__init__()
+       
+        self.use_dropout = use_dropout
+       
+        self.linear = nn.Linear(in_channels_head, out_channels_head)
+       
+        if use_dropout:
+           
+            self.dropout = nn.Dropout(p = dropout_pers)
+           
+        else:
+            self.dropout = None
+           
+        self.relu = nn.ReLU()
+       
+       
+       
+    def forward(self,X):
+       
+        print(f'Head_Block input shape: {X.shape}')
+       
+        # 1. Pass the input through the linear layer
+        Y = self.linear(X)
+        print(f'  - linear output shape: {Y.shape}')
+       
+        # 2. Apply dropout if it exists
+        if self.dropout:
+            Y = self.dropout(Y)
+       
+        # 3. Apply the ReLU activation function
+        Y = self.relu(Y)
+       
+        print(f'Head_Block final output shape: {Y.shape}')
+        return Y
+           
+       
+class Stem_Block(nn.Module):
+   
+    def __init__(self,input_size, out_channels_stem, kernel_size_stem, stride_stem):
+        super().__init__()
+       
+        padding_amount =  calculate_padding(input_size, kernel_size_stem, stride_stem)
+       
+        self.c1 = nn.Conv1d(1, out_channels_stem, kernel_size_stem, stride=stride_stem,padding=padding_amount)
+        self.bn1 = nn.BatchNorm1d(out_channels_stem)
+        self.relu = nn.ReLU()  # Corrected spelling here
+       
+    def forward(self, X):
+        print(f'Stem_Block input shape: {X.shape}')
+        Y = self.c1(X)
+        print(f'  - c1 output shape: {Y.shape}')
+        Y = self.bn1(Y)
+        Y = self.relu(Y)
+       
+        print(f'Stem_Block final output shape: {Y.shape}')
+        return Y
+
+
+   
+class OneD_CNN(nn.Module):
+   
+    '''
+1D concolutional deep neuronal network. It can be used as an alternative to the GRU network or in combination.
+It could be applied on single intances of isolated NB or on the entire sequence. The stride and kernel size must be 
+tuned in base of the number of samples and the sampling frequency.
+Params:
+   
+    in_channels (int) – Number of channels in the input image
+
+    out_channels (int) – Number of channels produced by the convolution
+
+    kernel_size (int or tuple) – Size of the convolving kernel
+
+    stride (int or tuple, optional) – Stride of the convolution. Default: 1
+
+    padding (int, tuple or str, optional) – Padding added to both sides of the input. Default: 0
+   
+    '''
+   
+    def __init__(self, input_size,last_dropout=True, head_dropout=True, downsampling_rate=2, groups=8,
+              dropout_pers=0.2, Block_Type='ResNet_Block', width_shrink=4,
+              Network_depth=64, Stage_kernel=3, embedding_size=16,
+              Stem_augmentation=32, Stem_kernel=None, Stem_stride=None,Verbose=True):
+       
+       
+        super().__init__()  
+       
+        self.Verbose = Verbose
+       
+        self.input_size = input_size
+        print('-------------------------------------')
+        print('')
+        print(f'Current input size: {self.input_size}')
+        print('')
+        print('-------------------------------------')
+       
+       
+        # ----- STAGES -----
+        # Whether to use or not a dropout layer between stages
+        self.last_dropout = last_dropout
+       
+        # Downsampling factor between successive stages
+        self.downsampling_rate = downsampling_rate
+       
+        # Number of groups in ResNeXt block. Remember that it must be so that both 
+        # in and out channels per stage are divisible by it
+        self.groups = groups
+       
+        # Persentage of dropout nodes
+        self.dropout_pers = dropout_pers
+       
+        # Type of block's architecutre: 'ResNet_Block' or 'ResNeXt_Block'
+        self.Block_Type = Block_Type
+       
+        # Layer scaling factor in the head section
+        self.width_shrink = width_shrink
+       
+        # Maximum depth of the network
+        self.Network_depth = Network_depth
+       
+        # Window size of the bloks in the stages
+        self.Stage_kernel = Stage_kernel
+       
+       
+       
+        # ----- HEAD -----
+        # Output embedding vector size
+        self.embedding_size = embedding_size
+       
+        # Whether to use or not dropout layers in the head
+        self.head_dropout = head_dropout
+       
+       
+        # ----- STEM -----
+        # Define the size of the first set of filters at the Stem section
+        self.Stem_augmentation = Stem_augmentation
+       
+        # Define the kernel/window size of the stem
+        self.Stem_kernel = Stem_kernel
+       
+        # Set the stride to take at the stem
+        self.Stem_stride = Stem_stride
+  
+       
+       
+        # -------------------- BUILDING THE ARCHITECTURE --------------------
+       
+        # Initialize an empty sequential container to build the network
+        self.net = nn.Sequential()
+
+        self.build_stem()
+       
+        self.final_width = self.build_stages()
+       
+        self.build_head()
+       
+       
+       
+   
+    def forward(self,X):
+       
+        print('--------------------------------------------------')
+        print('       NETWORK FORWARD PASS - START       ')
+        print('--------------------------------------------------')
+        print(f'Initial input tensor shape: {X.shape}')
+        
+        output = self.net(X)
+        
+        print('--------------------------------------------------')
+        print('       NETWORK FORWARD PASS - END         ')
+        print('--------------------------------------------------')
+        
+        return output
+       
+    # def stage(self, depth, in_channels_stage ,out_channels_stage):
+    #     blk = []
+       
+       
+    #     if self.Block_Type == 'ResNet_Block':
+    #         for i in range(depth):
+    #             if i == 0:
+    #                 # First does downsampling and channel enlargement.
+    #                 blk.append(ResNet_Block(self.input_size,in_channels_stage, out_channels_stage, self.Stage_kernel, use_1x1conv=True, stride_res=self.downsampling_rate,use_dropout=False,dropout_pers=None))
+                   
+    #                 # Update the input size
+    #                 self.input_size = self.input_size//self.downsampling_rate
+    #                 print('-------------------------------------')
+    #                 print('')
+    #                 print(f'Current input size: {self.input_size}')
+    #                 print('')
+    #                 print('-------------------------------------')
+
+                   
+    #             elif self.last_dropout == True and i == depth-1:
+                   
+                   
+    #                 # Last has added a dropout layer for regularization
+    #                 blk.append(ResNet_Block(self.input_size,out_channels_stage, out_channels_stage, self.Stage_kernel, use_1x1conv=False, stride_res=1,use_dropout=True,dropout_pers=self.dropout_pers))
+                   
+                   
+                   
+    #             else:
+    #                 blk.append(ResNet_Block(self.input_size,out_channels_stage, out_channels_stage, self.Stage_kernel, use_1x1conv=False, stride_res=1,use_dropout=False,dropout_pers=None))
+                   
+                   
+    #         elif self.Block_Type == 'ResNeXt_Block':
+    #         for i in range(depth):
+    #             if i == 0:
+    #                 # First does downsampling and channel enlargement.
+    #                 blk.append(ResNeXt_Block(in_channels_stage, out_channels_stage, self.Stage_kernel, self.groups, use_1x1conv=True, stride_res=self.downsampling_rate,use_dropout=False,dropout_pers=None))
+                   
+                   
+    #             elif self.last_dropout == True and i == depth-1:
+    #                 # Last has added a dropout layer for regularization
+    #                 blk.append(ResNeXt_Block(out_channels_stage, out_channels_stage, self.Stage_kernel, self.groups, use_1x1conv=False, stride_res=1,use_dropout=True,dropout_pers=self.dropout_pers))
+                   
+                   
+                   
+    #             else:
+    #                 blk.append(ResNeXt_Block(out_channels_stage, out_channels_stage, self.Stage_kernel, self.groups, use_1x1conv=False, stride_res=1,use_dropout=False,dropout_pers=None))
+               
+               
+    #     return nn.Sequential(*blk)
+   
+    def stage(self, depth, in_channels_stage ,out_channels_stage):
+       
+        print(f"Parameters: depth={depth}, in_channels_stage={in_channels_stage}, out_channels_stage={out_channels_stage}")
+       
+        blk = []
+       
+        if self.Block_Type == 'ResNet_Block':
+            print(f"Building stage with {self.Block_Type}...")
+            for i in range(depth):
+                print(f"--- Block {i+1}/{depth} ---")
+                if i == 0:
+                    # First does downsampling and channel enlargement.
+                    print("Condition: First block (downsampling and channel enlargement)")
+                    blk.append(ResNet_Block(
+                        self.input_size,
+                        in_channels_stage, 
+                        out_channels_stage, 
+                        self.Stage_kernel, 
+                        use_1x1conv=True, 
+                        stride_res=self.downsampling_rate,
+                        use_dropout=False,
+                        dropout_pers=None
+                    ))
+                    print(f"Created ResNet_Block with in_channels={in_channels_stage}, out_channels={out_channels_stage}, stride_res={self.downsampling_rate}")
+                    # Update the input size
+                    self.input_size = self.input_size//self.downsampling_rate
+                    print('-------------------------------------')
+                    print('')
+                    print(f'Current input size: {self.input_size}')
+                    print('')
+                    print('-------------------------------------')
+
+                elif self.last_dropout == True and i == depth-1:
+                    # Last has added a dropout layer for regularization
+                    print("Condition: Last block with dropout")
+                    blk.append(ResNet_Block(
+                        self.input_size,
+                        out_channels_stage, 
+                        out_channels_stage, 
+                        self.Stage_kernel, 
+                        use_1x1conv=False, 
+                        stride_res=1,
+                        use_dropout=True,
+                        dropout_pers=self.dropout_pers
+                    ))
+                    print(f"Created ResNet_Block with dropout, in_channels={out_channels_stage}, out_channels={out_channels_stage}, dropout_pers={self.dropout_pers}")
+                   
+                else:
+                    print("Condition: Intermediate block")
+                    blk.append(ResNet_Block(
+                        self.input_size,
+                        out_channels_stage, 
+                        out_channels_stage, 
+                        self.Stage_kernel, 
+                        use_1x1conv=False, 
+                        stride_res=1,
+                        use_dropout=False,
+                        dropout_pers=None
+                    ))
+                    print(f"Created ResNet_Block, in_channels={out_channels_stage}, out_channels={out_channels_stage}")
+                   
+        elif self.Block_Type == 'ResNeXt_Block':
+            print(f"Building stage with {self.Block_Type}...")
+            for i in range(depth):
+                print(f"--- Block {i+1}/{depth} ---")
+                if i == 0:
+                    # First does downsampling and channel enlargement.
+                    print("Condition: First block (downsampling and channel enlargement)")
+                    blk.append(ResNeXt_Block(
+                        self.input_size,
+                        in_channels_stage, 
+                        out_channels_stage, 
+                        self.Stage_kernel, 
+                        self.groups, 
+                        use_1x1conv=True, 
+                        stride_res=self.downsampling_rate,
+                        use_dropout=False,
+                        dropout_pers=None
+                    ))
+                    print(f"Created ResNeXt_Block with in_channels={in_channels_stage}, out_channels={out_channels_stage}, groups={self.groups}, stride_res={self.downsampling_rate}")
+                    #Update the input size
+                    self.input_size = self.input_size//self.downsampling_rate
+                    print('-------------------------------------')
+                    print('')
+                    print(f'Current input size: {self.input_size}')
+                    print('')
+                    print('-------------------------------------')
+
+                elif self.last_dropout == True and i == depth-1:
+                    # Last has added a dropout layer for regularization
+                    print("Condition: Last block with dropout")
+                    blk.append(ResNeXt_Block(
+                        self.input_size,
+                        out_channels_stage, 
+                        out_channels_stage, 
+                        self.Stage_kernel, 
+                        self.groups, 
+                        use_1x1conv=False, 
+                        stride_res=1,
+                        use_dropout=True,
+                        dropout_pers=self.dropout_pers
+                    ))
+                    print(f"Created ResNeXt_Block with dropout, in_channels={out_channels_stage}, out_channels={out_channels_stage}, groups={self.groups}, dropout_pers={self.dropout_pers}")
+                   
+                else:
+                    print("Condition: Intermediate block")
+                    blk.append(ResNeXt_Block(
+                        self.input_size,
+                        out_channels_stage, 
+                        out_channels_stage, 
+                        self.Stage_kernel, 
+                        self.groups, 
+                        use_1x1conv=False, 
+                        stride_res=1,
+                        use_dropout=False,
+                        dropout_pers=None
+                    ))
+                    print(f"Created ResNeXt_Block, in_channels={out_channels_stage}, out_channels={out_channels_stage}, groups={self.groups}")
+               
+       
+        return nn.Sequential(*blk)
+   
+
+   
+    def head(self):
+       
+        print('--------------------------------------------------')
+        print('')
+        print(f'          BUILDING HEAD             ')
+        print(f"Initial values: final stage width={self.final_width}, embedding size={self.embedding_size}, width shrink={self.width_shrink}")
+       
+        head_layers = nn.Sequential()
+       
+        # Add the adaptive average pooling layer
+        head_layers.add_module('avg_pool', nn.AdaptiveAvgPool1d(1))
+       
+        # This custom lambda layer will flatten the tensor after pooling
+        head_layers.add_module('flatten', nn.Flatten())
+       
+        # Calculate the number of linear layers
+        num_layers = int(math.log(self.final_width / self.embedding_size) / math.log(self.width_shrink))
+        print(f"Calculated number of layers: {num_layers}")
+       
+        current_in_size = self.final_width
+       
+        for i in range(num_layers):
+            current_out_size = current_in_size // self.width_shrink
+            head_layers.add_module(f'head_block_{i+1}', Head_Block(current_in_size, current_out_size, self.head_dropout, self.dropout_pers))
+            current_in_size = current_out_size
+       
+        # Add a final linear layer if the last output size doesn't match the embedding size
+        if current_in_size != self.embedding_size:
+            head_layers.add_module('final_linear', nn.Linear(current_in_size, self.embedding_size))
+       
+        print("--- Head built successfully ---")
+        return head_layers
+   
+   
+    def build_stages(self):
+        # It inherents the net module
+           
+        Stage_width,Stage_depth = stage_features(depth_max=self.Network_depth,w_in=self.Stem_augmentation,w_m=2)
+           
+        if self.Verbose == True:
+            print('')
+            print('--------------- INFO STAGES --------------')
+           
+            print('Stages depth: ',Stage_depth)
+            print('Stage width: ',Stage_width)
+            print('Block type: ',self.Block_Type)
+            print('')
+           
+        for i in range(len(Stage_depth)):
+            print('--------------------------------------------------')
+            print('')
+            print(f'          BUILDING STAGE {i}               ')
+           
+            # TODO: I must define the input and output channels in the iterative way
+            if i == 0:
+               
+                self.net.add_module(f'stage{i+1}',self.stage( Stage_depth[i], self.Stem_augmentation ,Stage_width[i]))
+               
+            else:
+               
+                self.net.add_module(f'stage{i+1}',self.stage( Stage_depth[i], Stage_width[i-1] ,Stage_width[i]))
+               
+            print('')
+            print('--------------------------------------------------')
+           
+        print('Stages built succesfully')
+        return  Stage_width[-1] # The last number of channels
+               
+    def build_stem(self):
+       
+        print('--------------------------------------------------')
+        print('')
+        print(f'          BUILDING STEM             ')
+        print('')
+       
+        stem = Stem_Block(self.input_size,self.Stem_augmentation, self.Stem_kernel, self.Stem_stride)
+        self.net.add_module('stem', stem)
+       
+        # Update input size
+        self.input_size = self.input_size//self.Stem_stride
+        print('-------------------------------------')
+        print('')
+        print(f'Current input size: {self.input_size}')
+        print('')
+        print('-------------------------------------')
+       
+       
+       
+       
+   
+    def build_head(self):
+        # It inherents thefinal width
+       
+       
+        self.net.add_module(r'head',self.head())
+   
+
+      
+   
+network = OneD_CNN(input_size=512,last_dropout = True,head_dropout = True, downsampling_rate=2,groups=8,dropout_pers=0.2,Block_Type = 'ResNeXt_Block',
+              
+              width_shrink = 4, Network_depth = 16, Stage_kernel = 3, embedding_size = 16,Stem_augmentation = 16,Stem_kernel = 5,Stem_stride = 4)
+
+   
+   
+   
+print(network)      
+   #%%   
+   
+print('--------------- TEST ---------------')
+# Define the dimensions of the input tensor
+batch_size = 1
+channels = 1 
+sequence_length = 512 # You can choose any sequence length you like
+
+# Create a random tensor with the specified dimensions
+input_data = torch.randn(batch_size, channels, sequence_length)
+
+# Pass the random data through the network
+output = network(input_data)
+
+# Print the shape of the output tensor
+print(f"Input data shape: {input_data.shape}")
+print(f"Final output shape: {output.shape}")
