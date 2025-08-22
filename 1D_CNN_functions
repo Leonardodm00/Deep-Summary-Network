@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Aug 21 15:09:28 2025
+
+@author: Admin
+"""
 
 import torch
 from torch.utils.data import Dataset
@@ -76,7 +82,12 @@ which leads to
     n_layers = log(width_input/embedding_size)/log(width_shrink)
 
 
-
+---------- DATA AUGMENTATION ----------
+Data augmentatio nis performed as follows.
+FIrstly time series undergo, separately, to magnitude and temporal warping. Afterwards MSE is calculated between
+the original time series and the augmented ones to determine, through a threshold, which are positive instances, leaving
+the remaining ones as negatives. It follows homogenous temporal shift.
+BE AWARE that the threshold for the MSE is highly sensitive to the overall time series length.
 
 ------------------------------------
 
@@ -91,6 +102,31 @@ NOTES:
 
 
 # ---------------------- UTILITY FUNCTIONS ----------------------
+
+def random_sample_without_replacement(arr: torch.Tensor, num_samples: int):
+    """
+    Randomly samples without replacement from a PyTorch tensor.
+
+    Args:
+        arr (torch.Tensor): The input tensor to sample from.
+        num_samples (int): The number of items to sample.
+
+    Returns:
+        torch.Tensor: A new tensor containing the randomly sampled items.
+    
+    Raises:
+        ValueError: If num_samples is greater than the size of the tensor.
+    """
+    if num_samples > arr.size()[0]:
+        raise ValueError("Number of samples cannot be greater than the tensor size.")
+
+    indices = torch.randperm(arr.size()[0])[:num_samples]
+    
+    
+    return indices
+
+
+
 class TimeSeriesDataset(Dataset):
     def __init__(self, full_time_series, window_size_s=100,fs=None ):
         """
@@ -99,7 +135,7 @@ class TimeSeriesDataset(Dataset):
         
         Args:
             full_time_series (torch.Tensor): The entire time series data
-                                             with shape (total_samples, num_features).
+                                             with shape (1,total_samples).
             window_size_s (int): The size of the sliding window in seconds must be power of 2
         """
         self.full_time_series = full_time_series
@@ -113,7 +149,7 @@ class TimeSeriesDataset(Dataset):
         # Calculate the number of possible windows in the time series.
         # This assumes non-overlapping windows for simplicity.
         # If you want overlapping windows, the calculation would be different.
-        self.num_windows = int((len(self.full_time_series) // self.window_size))
+        self.num_windows = int((self.full_time_series.shape[1] // self.window_size))
 
     def __len__(self):
         """
@@ -129,13 +165,15 @@ class TimeSeriesDataset(Dataset):
             idx (int): The index of the window to retrieve.
         
         Returns:
-            torch.Tensor: A single time series window with shape (window_size, num_features).
+            torch.Tensor: A single time series window with shape (1, window_size).
         """
         start_idx = int(idx * self.window_size)
         end_idx = int(start_idx + self.window_size)
-        window = self.full_time_series[start_idx:end_idx,:]
+        window = self.full_time_series[0,start_idx:end_idx]
         
-        return window
+        
+        
+        return window.reshape(1, -1)
 def closest_power_of_2(n):
     """
     Finds the closest power of 2 to a given number n,
@@ -696,7 +734,7 @@ def get_Smoothed_Cumulative(Cumulative,fs_downsampled,Gaussian_window):
     
         
 
-def calculate_mean_burst_duration(time_series_data, fs,scal_factor = 0.5, Visible=True):
+def calculate_mean_burst_duration(time_series_data, fs,scal_factor = 0.5, Visible=False):
     """
     Calculates the mean duration of bursts in a time series of network data and can plot the results.
 
@@ -762,7 +800,7 @@ def calculate_mean_burst_duration(time_series_data, fs,scal_factor = 0.5, Visibl
     return np.mean(burst_durations)  
 
 def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 600, fs = 10000, w_size = 0.02, overlap = 0.06, 
-                    bin_size_s = 0.05, Isolate_NB = False, Gaussian_window = 0.05,
+                    bin_size_s = 0.05, Isolate_NB = False, Gaussian_window = 0.1,
                      Visible = False,NB_statistics = True):
     
     # Raster_array = nx2, 1st column the channel's idx, 2nd column the timing of spike
@@ -872,7 +910,7 @@ def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 6
             
         if NB_statistics:
             
-            MBD = calculate_mean_burst_duration(Cumulative, fs_downsampled)
+            MBD = calculate_mean_burst_duration(smoothed_cumulative, fs_downsampled)
             
             
             
@@ -1007,7 +1045,7 @@ def time_warp(time_series,n_versions=10, intra_knot_dist=0.2, sigma_scale=15,fs=
     time_series = time_series.numpy()
     
     # Create the time base for the series
-    T = len(time_series)
+    T = time_series.shape[1]
     x = np.linspace(0, T - 1, T)
     
     # Define the numebr of knots. 
@@ -1108,7 +1146,8 @@ def log_uniform(low, high, size=1):
     return log_uniform_samples
 
 
-def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_range= [0.35,0.1],sigma_scale_range= [0.4,0.01],fs = None, shift_magnitude_s=30,Visible = False):
+def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_range= [0.35,0.1],sigma_scale_range= [0.4,0.01],
+                      MSE_threshold= 0.01,fs = None, shift_magnitude_s=30,choose_subset=False,Visible = False):
     '''
     
     This data augmentation algorithm first generates a certain number of surrogates and then splits negatives and 
@@ -1117,6 +1156,7 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
     shift_magnitude_s (float): Max shift magnitude in seconds for the 'Shift' method.
     sigma_scale_range = Temporal shift in s and magnitude scaling for time and magnitude warping resp.
     
+    data size = (1,window size)
     '''
 
   
@@ -1128,7 +1168,7 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
     
     out_temp = []
     
-    
+   
     for it in range(n_param_vector):
         
         out_temp.append(magnitude_warp(data,n_versions=n_versions_insatances, intra_knot_dist=intra_knot_dist[it], sigma_scale=sigma_scale[it],fs= fs))
@@ -1141,18 +1181,21 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
     
     
     # -------- MSE calculation --------
-        # Calculate element-wise squared error
-    element_wise_mse = F.mse_loss(out_temp, data, reduction='none')
+    # Calculate element-wise squared error
+    mse_per_row_ = []    
+    for m in range(out_temp.size()[0]):
+        
+        mse_per_row_.append(F.mse_loss(out_temp[m,:].reshape(1,-1), data))
     
     # Compute the mean for each row
-    mse_per_row = torch.mean(element_wise_mse, dim=1)
+    mse_per_row = torch.stack(mse_per_row_)
     
     
     # mse_per_row = mse_per_row.unsqueeze(1) # unsqueeze to make it 50x1
 
     # --- Step 1: Find the indices of values less than 0.1 ---
     # This creates a boolean tensor (mask) where `True` means the condition is met
-    threshold_mask = mse_per_row < 4
+    threshold_mask = mse_per_row < MSE_threshold
     
     # Use torch.nonzero() to get the explicit indices if you need them
     indices_low_mse = torch.nonzero(threshold_mask)
@@ -1176,7 +1219,7 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
         
         
         plt.figure()
-        plt.plot(t_vec,data.numpy(),label='Original Series',linewidth=3)
+        plt.plot(t_vec,np.squeeze(data.numpy()),label='Original Series',linewidth=3)
         for k in range(len(Positives[:,0])):
             plt.plot(t_vec,Positives[k,:].numpy(), '--',alpha = 0.3 )
             
@@ -1190,7 +1233,7 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
             
             
         plt.figure()
-        plt.plot(t_vec,data.numpy(),label='Original Series',linewidth=3)
+        plt.plot(t_vec,np.squeeze(data.numpy()),label='Original Series',linewidth=3)
         for k in range(len(Negatives[:,0])):
             plt.plot(t_vec,Negatives[k,:].numpy(), '--',alpha = 0.3 )
             
@@ -1231,9 +1274,19 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
     Negatives_final = torch.vstack(Negatives_final)
     Neg_Labels = torch.squeeze(torch.vstack(Neg_Label)).flatten()
     
+    if choose_subset:
+        
+        idx_pos =  random_sample_without_replacement(Positives_final, num_samples= choose_subset)
+        idx_neg=  random_sample_without_replacement(Negatives_final, num_samples= choose_subset)
+        
+        
+        
     
-    return Positives_final,Negatives_final,Pos_Lables,Neg_Labels
+        return Positives_final[idx_pos,:],Negatives_final[idx_neg,:],Pos_Lables[idx_pos],Neg_Labels[idx_neg]
     
+    
+    else:
+        return Positives_final,Negatives_final,Pos_Lables,Neg_Labels
 
 # --------------------------------- 1D CNN ---------------------------------
 class ResNet_Block(nn.Module):
@@ -1507,13 +1560,13 @@ Params:
         
         
     
-    def forward(self, X,fs=None,State='Embedding',n_repl=10,n_repl_params=5) :
+    def forward(self, X,fs=None,State='Embedding',n_repl=5,n_repl_params=5,choose_subset=False) :
         '''
         
         The input tensor size required from the 1DCNN cell is (N,C_in,L) 
         where:
             N = Batch size
-            C_in = Number of channels
+            C_in = Number of channels (1 in our case)
             L = length of the signal sequence.
         
         '''
@@ -1530,7 +1583,7 @@ Params:
            
             # ------- Augment the data -------
             
-            Positives,Negatives,Pos_Labels,Neg_Labels= Data_Augmentation(X,n_repl,n_repl_params,fs=self.input_fs)
+            Positives,Negatives,Pos_Labels,Neg_Labels= Data_Augmentation(X,n_repl,n_repl_params,fs=self.input_fs,choose_subset = choose_subset )
             
             
             
@@ -1543,6 +1596,7 @@ Params:
             # Load the tensors on the device
             Pos_out = Pos_out.to(self.device)
             
+          
             
             # Train
             final_embedding_pos = self.net(Pos_out)
@@ -2482,5 +2536,3 @@ Params:
         
         
 #         self.net.add_module(r'head',self.head())
-
-
