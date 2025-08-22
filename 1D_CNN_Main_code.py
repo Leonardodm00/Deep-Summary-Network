@@ -20,6 +20,7 @@ from torch.utils.data import TensorDataset
 from torch.utils.data import DataLoader
 from torch.utils.data import RandomSampler
 from pytorch_metric_learning.distances import LpDistance
+from pytorch_metric_learning.distances import BatchedDistance, CosineSimilarity
 from datetime import datetime
 directory = r"C:\Users\Admin\Desktop\Leonardo\Summary Networks"  # Replace with your desired path
 os.chdir(directory)
@@ -27,6 +28,70 @@ from CNN_functions import *
 
 
 
+# '''
+
+# This code implements a flexible 1D_CNN architecure which itself can undergo hyperparameter tuning. It is insired on the work of Radosavovic et Al. (2020)
+
+
+
+
+
+
+# NOTES:
+
+
+#     1) Tunable hyperparameters:
+    
+#         Model: width, Kernel sizes, embedding size, depth, dropout, if LeakyReLu is used: negative slope magnitude etc...
+        
+#         Optimizator: learning rate, weight decays (the two betas), etc...
+        
+        
+#     2) Data labels: The traces of reference (control or specific pathologies) have ALL the same label. While surrogate ones MUST have only some common labels
+#             to optimize training. Indeed if the Negative labels are ALL the same the trining would be inefficient and the might even not
+#             converge at all. Therefore the strategy is to construct groups of negative instances by permutating the orginal mini-batch and then 
+#             generate some relative positives.
+                
+                
+#     3) Dataloader: we are handling timeseries data. The shuffle method randomly shuffles the single samples leading to a complete destruction
+#             of the intrinsic temporal relationships. DO NOT USE IT if the dataseet is passed to the default DataLoader. With the costume one,
+#             however, we devide the dataset into chunks (windows) which instead can be randomly chosen and shuffle set to True.
+#             Batch_size determines the number of samples per batch, in the costum function a single sample is an entire window of size defined
+#             (in seconds) fixed in the dataset_--- variable initialized before.
+            
+            
+#     4) Validation loss function: The aim of the entire script is to set up a network that performs an embedding that lays the target neuronal dynamic 
+#                     traces nearby and all others quite far. For this reason validation loss function is an euclidean distance. The 'MARGIN LOSS'
+#                     function utilises the L2 norm (Euclidean distance),it works better than the contrastive loss. 
+#                     Refer to: https://gombru.github.io/2019/04/03/ranking_loss/
+                    
+                    
+                
+#     5) In validation settings the Positive instances are not much variated from the referenc, just the shift is incremented to simulate the lag on an in-silico network. 
+#     We will take two instances of control traces (two different control networks traces concatenated) and evaluate the tendency of the summary network to produce similar embeddings for such traces
+       
+
+        
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ 
+#     6) The ADAMW algorithms and the embedding regularizer both have regularization mechanisms, it's not clear on what they act.
+    
+#     7) The MSE threshold used to distinguish Positive and Negative examples is highly sensitive to the overall time series length.
+
+#     8) The architecutre (especially the depth and width) differently process the sequence of data given the fs_downsample.
+
+#     9) When embeddings are normalized, the euclidean norm equals the cosine similarity as distance metrics for the embeddings
+
+#    10) The 'choose_subset' parameter in Data Augmentation function allows to take out randomly a certain number of positive and negative instances
+    
+# '''
+
+
+
+
+
+
+#%%
 
 
 # ------------- Free cuda -------------
@@ -45,7 +110,7 @@ data_array = []
 for j in range(2):
     
     
-    smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j])
+    smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=True,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
     
     
     cumulative_stdz = Standardization(smoothed_cumulative)
@@ -55,15 +120,10 @@ for j in range(2):
 data = torch.cat((data_array[0], data_array[1]), dim=1)
 
 
-
-# Set the length of trianing data to correctly initialize the network
-window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
-
-# Find the window size closest to a power of two
-Training_data_length = closest_power_of_2(window_size_temp)
+#%
 
 
-
+#%
 # ---------------- TRAINING DATA LOADER ----------------
 
 Dataset_training = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
@@ -75,6 +135,16 @@ Dataloader_training = DataLoader(Dataset_training,
                         drop_last=True) # drop_last is important to ensure all batches have the same size
 
 
+# Set the length of trianing data to correctly initialize the network
+window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+# Find the window size closest to a power of two
+Training_data_length = closest_power_of_2(window_size_temp)
+
+
+#%
+
+#%
 # ---------------------------------------------------------------
 
 #%%
@@ -90,7 +160,9 @@ print(f"Using device: {device}")
 network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
                    head_dropout = True, downsampling_rate=2,groups=8,dropout_pers=0.2,Block_Type = 'ResNeXt_Block',
                    width_shrink = 4, Network_depth = 16, Stage_kernel = 3, embedding_size = 16, 
-                   Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4, device = device)
+                   Stem_augmentation = 16
+                   
+                   , Stem_kernel = 5, Stem_stride = 4, device = device)
 
       
 print(network)       
@@ -101,33 +173,46 @@ network = network.to(device)
 
 
 # --- Training algorithms ---
-reducer_dict = {"pos_loss": ThresholdReducer(0.1), "neg_loss": MeanReducer()}
-reducer = MultipleReducers(reducer_dict)
-loss_fn = losses.ContrastiveLoss(pos_margin=0, neg_margin=1,
-                                 distance=LpDistance(),
+
+reducer = reducers.AvgNonZeroReducer()
+loss_fn = losses.TripletMarginLoss(margin=0.2,
+                                 distance=CosineSimilarity(), #  is preferred in embedding contexts.
                                  reducer = reducer,
-                                 embedding_regularizer = LpRegularizer())
+                                 embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
 
 
-
+# --- Miner ---
+miner_hard = miners.TripletMarginMiner(margin=0.2, type_of_triplets="hard",distance=CosineSimilarity()) 
                                 
 # --- Optimizer ---
 optimizer_fn = torch.optim.AdamW(network.parameters())
 
 #%%
-       
+'''
+The main parameter to control is the MSE
+
+
+'''
+%matplotlib
+n_versions_insatances = 10
+n_param_vector = 5
+# ----------- CHECK AUGMENTATION VALUES 
+Positives,Negatives,Pos_Labels,Neg_Labels = Data_Augmentation(data[:,0:Training_data_length],n_versions_insatances,n_param_vector,intra_knot_dist_range= [0.35,0.1],sigma_scale_range= [0.4,0.01],
+                                                              MSE_threshold= 0.01,fs = fs_downsampled, shift_magnitude_s=30,Visible = True,choose_subset=10)
+
+
 
     
 
 
-
+#%%
 #!!!!!!!!!!!!! DEBUG
 
 
 
 
 
-
+%matplotlib
 
 
 def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device):
@@ -141,26 +226,24 @@ def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device):
     # The training loop now iterates over the dataloader
     for i, data_batch in enumerate(dataloader):
         
-        # data_batch has shape (batch_size, window_size, features)
+        # data_batch has shape (1, window_size)
         
-        # Move the mini-batch to the GPU
-        data_batch = data_batch.to(device)
+        # The mini-batch is moved  to the GPU inside the foward pass
+       
 
 
         # Zero your gradients for every batch!
         optimizer_fn.zero_grad()
 
-        # Make predictions for this batch. Expected size: [1 x sequence_length]
-        final_embeddings,final_labels = model(torch.squeeze(data_batch),fs,State='Training')
+        # Make predictions for this batch. Expected size: [1 x 1 x sequence_length]
+        final_embeddings,final_labels = model(torch.squeeze(data_batch,1),fs,State='Training',choose_subset = 10)
 
 
-
-        #!!!: PUT SOMEWHERE THE MINER
-
-
+        # Miner
+        hard_pairs = miner_hard(final_embeddings, final_labels)
 
         # Compute the loss and its gradients
-        loss = loss_fn(final_embeddings, final_labels)
+        loss = loss_fn(final_embeddings, final_labels,hard_pairs)
         loss.backward()
 
         # Adjust learning weights
@@ -178,3 +261,12 @@ def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device):
      
 avg_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device)
 
+
+
+
+
+
+
+
+     
+        
