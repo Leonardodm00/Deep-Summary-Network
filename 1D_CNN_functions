@@ -143,8 +143,13 @@ class TimeSeriesDataset(Dataset):
         
         # Find the window size closest to a power of two
         self.window_size = closest_power_of_2(window_size_temp)
+        
+        print('---------------- Mini-batch window --------------------')
+        print('')
         print('Actual window size (in samples): ',self.window_size )
         print('Actual window size (in seconds): ',self.window_size/fs )
+        print('')
+        print('------------------------------------------------------')
         
         # Calculate the number of possible windows in the time series.
         # This assumes non-overlapping windows for simplicity.
@@ -1276,8 +1281,20 @@ def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_
     
     if choose_subset:
         
-        idx_pos =  random_sample_without_replacement(Positives_final, num_samples= choose_subset)
-        idx_neg=  random_sample_without_replacement(Negatives_final, num_samples= choose_subset)
+        
+        # Handle when choose_subset is grater than len(positive/negatives_final)
+        if choose_subset > len(Positives_final):
+            choose_subset_ = len(Positives_final)
+            
+        else: choose_subset_ = choose_subset
+        idx_pos =  random_sample_without_replacement(Positives_final, num_samples= choose_subset_)
+        
+        
+        if choose_subset > len(Negatives_final):
+            choose_subset_ = len(Negatives_final)
+            
+        else: choose_subset_ = choose_subset
+        idx_neg=  random_sample_without_replacement(Negatives_final, num_samples= choose_subset_)
         
         
         
@@ -1478,7 +1495,7 @@ Params:
     def __init__(self,input_fs=None, input_size = None,last_dropout=True, head_dropout=True, downsampling_rate=2, groups=8,
               dropout_pers=0.2, Block_Type='ResNet_Block', width_shrink=4,
               Network_depth=64, Stage_kernel=3, embedding_size=16,
-              Stem_augmentation=32, Stem_kernel=None, Stem_stride=None,Verbose=True,device = None):
+              Stem_augmentation=32, Stem_kernel=None, Stem_stride=None,Verbose=True,weight_multiplier = 2,device = None):
         
         
         super().__init__()  
@@ -1486,11 +1503,7 @@ Params:
         self.Verbose = Verbose
         
         self.input_size = input_size
-        print('-------------------------------------')
-        print('')
-        print(f'Current input size: {self.input_size}')
-        print('')
-        print('-------------------------------------')
+        
         
         # Input's sampling frequency in [s]
         self.input_fs = input_fs
@@ -1524,6 +1537,8 @@ Params:
         # Window size of the bloks in the stages
         self.Stage_kernel = Stage_kernel
         
+        # Weight multiplier (wm) for the quantized linear function
+        self.w_m = weight_multiplier
         
         
         # ----- HEAD -----
@@ -1560,7 +1575,7 @@ Params:
         
         
     
-    def forward(self, X,fs=None,State='Embedding',n_repl=5,n_repl_params=5,choose_subset=False) :
+    def forward(self, X,fs=None,State='Embedding',n_repl=10,n_repl_params=20,choose_subset=False) :
         '''
         
         The input tensor size required from the 1DCNN cell is (N,C_in,L) 
@@ -1684,17 +1699,13 @@ Params:
     
     def stage(self, depth, in_channels_stage ,out_channels_stage):
         
-        print(f"Parameters: depth={depth}, in_channels_stage={in_channels_stage}, out_channels_stage={out_channels_stage}")
         
         blk = []
         
         if self.Block_Type == 'ResNet_Block':
-            print(f"Building stage with {self.Block_Type}...")
             for i in range(depth):
-                print(f"--- Block {i+1}/{depth} ---")
                 if i == 0:
                     # First does downsampling and channel enlargement.
-                    print("Condition: First block (downsampling and channel enlargement)")
                     blk.append(ResNet_Block(
                         self.input_size,
                         in_channels_stage, 
@@ -1705,18 +1716,13 @@ Params:
                         use_dropout=False,
                         dropout_pers=None
                     ))
-                    print(f"Created ResNet_Block with in_channels={in_channels_stage}, out_channels={out_channels_stage}, stride_res={self.downsampling_rate}")
                     # Update the input size
                     self.input_size = self.input_size//self.downsampling_rate
-                    print('-------------------------------------')
-                    print('')
-                    print(f'Current input size: {self.input_size}')
-                    print('')
-                    print('-------------------------------------')
+                    
 
                 elif self.last_dropout == True and i == depth-1:
                     # Last has added a dropout layer for regularization
-                    print("Condition: Last block with dropout")
+                    
                     blk.append(ResNet_Block(
                         self.input_size,
                         out_channels_stage, 
@@ -1727,10 +1733,9 @@ Params:
                         use_dropout=True,
                         dropout_pers=self.dropout_pers
                     ))
-                    print(f"Created ResNet_Block with dropout, in_channels={out_channels_stage}, out_channels={out_channels_stage}, dropout_pers={self.dropout_pers}")
                     
                 else:
-                    print("Condition: Intermediate block")
+                    
                     blk.append(ResNet_Block(
                         self.input_size,
                         out_channels_stage, 
@@ -1741,15 +1746,15 @@ Params:
                         use_dropout=False,
                         dropout_pers=None
                     ))
-                    print(f"Created ResNet_Block, in_channels={out_channels_stage}, out_channels={out_channels_stage}")
+                    
                     
         elif self.Block_Type == 'ResNeXt_Block':
-            print(f"Building stage with {self.Block_Type}...")
+            
             for i in range(depth):
-                print(f"--- Block {i+1}/{depth} ---")
+                
                 if i == 0:
                     # First does downsampling and channel enlargement.
-                    print("Condition: First block (downsampling and channel enlargement)")
+                    
                     blk.append(ResNeXt_Block(
                         self.input_size,
                         in_channels_stage, 
@@ -1761,18 +1766,13 @@ Params:
                         use_dropout=False,
                         dropout_pers=None
                     ))
-                    print(f"Created ResNeXt_Block with in_channels={in_channels_stage}, out_channels={out_channels_stage}, groups={self.groups}, stride_res={self.downsampling_rate}")
+                    
                     #Update the input size
                     self.input_size = self.input_size//self.downsampling_rate
-                    print('-------------------------------------')
-                    print('')
-                    print(f'Current input size: {self.input_size}')
-                    print('')
-                    print('-------------------------------------')
+                    
 
                 elif self.last_dropout == True and i == depth-1:
                     # Last has added a dropout layer for regularization
-                    print("Condition: Last block with dropout")
                     blk.append(ResNeXt_Block(
                         self.input_size,
                         out_channels_stage, 
@@ -1784,10 +1784,9 @@ Params:
                         use_dropout=True,
                         dropout_pers=self.dropout_pers
                     ))
-                    print(f"Created ResNeXt_Block with dropout, in_channels={out_channels_stage}, out_channels={out_channels_stage}, groups={self.groups}, dropout_pers={self.dropout_pers}")
                     
                 else:
-                    print("Condition: Intermediate block")
+                    
                     blk.append(ResNeXt_Block(
                         self.input_size,
                         out_channels_stage, 
@@ -1799,7 +1798,6 @@ Params:
                         use_dropout=False,
                         dropout_pers=None
                     ))
-                    print(f"Created ResNeXt_Block, in_channels={out_channels_stage}, out_channels={out_channels_stage}, groups={self.groups}")
                 
         
         return nn.Sequential(*blk)
@@ -1809,10 +1807,7 @@ Params:
     
     def head(self):
         
-        print('--------------------------------------------------')
-        print('')
-        print(f'           BUILDING HEAD            ')
-        print(f"Initial values: final stage width={self.final_width}, embedding size={self.embedding_size}, width shrink={self.width_shrink}")
+        
         
         head_layers = nn.Sequential()
         
@@ -1824,7 +1819,7 @@ Params:
         
         # Calculate the number of linear layers
         num_layers = int(math.log(self.final_width / self.embedding_size) / math.log(self.width_shrink))
-        print(f"Calculated number of layers: {num_layers}")
+       
         
         current_in_size = self.final_width
         
@@ -1837,7 +1832,7 @@ Params:
         if current_in_size != self.embedding_size:
             head_layers.add_module('final_linear', nn.Linear(current_in_size, self.embedding_size))
         
-        print("--- Head built successfully ---")
+        
         return head_layers
  
     
@@ -1845,22 +1840,13 @@ Params:
     def build_stages(self):
         # It inherents the net module
          
-          Stage_width,Stage_depth = stage_features(depth_max=self.Network_depth,w_in=self.Stem_augmentation,w_m=2)
+          Stage_width,Stage_depth = stage_features(depth_max=self.Network_depth,w_in=self.Stem_augmentation,w_m=self.w_m)
          
-          if self.Verbose == True:
-              print('')
-              print('--------------- INFO STAGES --------------')
-             
-              print('Stages depth: ',Stage_depth)
-              print('Stage width: ',Stage_width)
-              print('Block type: ',self.Block_Type)
-              print('')
+          
+              
          
           for i in range(len(Stage_depth)):
-              print('--------------------------------------------------')
-              print('')
-              print(f'              BUILDING STAGE {i}               ')
-             
+              
               # TODO: I must define the input and output channels in the iterative way
               if i == 0:
                  
@@ -1870,10 +1856,7 @@ Params:
                  
                   self.net.add_module(f'stage{i+1}',self.stage( Stage_depth[i], Stage_width[i-1] ,Stage_width[i]))
                  
-              print('')
-              print('--------------------------------------------------')
-          
-          print('Stages built succesfully')
+              
           return  Stage_width[-1] # The last number of channels
              
     def build_stem(self):
@@ -1883,11 +1866,7 @@ Params:
         
         # Update input size
         self.input_size = self.input_size//self.Stem_stride
-        print('-------------------------------------')
-        print('')
-        print(f'Current input size: {self.input_size}')
-        print('')
-        print('-------------------------------------')
+        
         
         
         
@@ -2118,7 +2097,7 @@ Params:
 #     def __init__(self,input_fs=None, input_size = None,last_dropout=True, head_dropout=True, downsampling_rate=2, groups=8,
 #               dropout_pers=0.2, Block_Type='ResNet_Block', width_shrink=4,
 #               Network_depth=64, Stage_kernel=3, embedding_size=16,
-#               Stem_augmentation=32, Stem_kernel=None, Stem_stride=None,Verbose=True,device = None):
+#               Stem_augmentation=32, Stem_kernel=None, Stem_stride=None,Verbose=True,weight_multiplier=2,device = None):
         
         
 #         super().__init__()  
@@ -2163,6 +2142,9 @@ Params:
         
 #         # Window size of the bloks in the stages
 #         self.Stage_kernel = Stage_kernel
+
+        # # Weight multiplier (wm) for the quantized linear function
+        # self.w_m = weight_multiplier
         
         
         
@@ -2486,7 +2468,7 @@ Params:
 #     def build_stages(self):
 #         # It inherents the net module
           
-#         Stage_width,Stage_depth = stage_features(depth_max=self.Network_depth,w_in=self.Stem_augmentation,w_m=2)
+#         Stage_width,Stage_depth = stage_features(depth_max=self.Network_depth,w_in=self.Stem_augmentation,w_m=self.w_m)
           
 #         if self.Verbose == True:
 #             print('')
@@ -2536,3 +2518,4 @@ Params:
         
         
 #         self.net.add_module(r'head',self.head())
+
