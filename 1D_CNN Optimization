@@ -1,0 +1,556 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Aug 23 12:34:54 2025
+
+@author: Admin
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Aug 18 20:59:29 2025
+
+@author: Admin
+"""
+
+import os
+import torch
+from torch import nn
+from pytorch_metric_learning import losses
+from pytorch_metric_learning import miners
+from pytorch_metric_learning import reducers
+from pytorch_metric_learning.distances import LpDistance
+from pytorch_metric_learning.reducers import MultipleReducers
+from pytorch_metric_learning.regularizers import LpRegularizer
+from pytorch_metric_learning import losses
+from pytorch_metric_learning.reducers import MultipleReducers, ThresholdReducer, MeanReducer
+from torch.utils.data import TensorDataset
+from torch.utils.data import DataLoader
+from torch.utils.data import RandomSampler
+from pytorch_metric_learning.distances import LpDistance
+from pytorch_metric_learning.distances import BatchedDistance, CosineSimilarity
+from datetime import datetime
+directory = r"C:\Users\Admin\Desktop\Leonardo\Summary Networks"  # Replace with your desired path
+os.chdir(directory)
+from CNN_functions import *
+
+from skopt.space import Real, Integer
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+import numpy as np
+# import torch
+import scipy.io
+import pdb
+
+# '''
+
+# This code implements a flexible 1D_CNN architecure which itself can undergo hyperparameter tuning. It is insired on the work of Radosavovic et Al. (2020)
+
+# ---------------------------------- HYPERPARAMETER TUNING ----------------------------------
+# I can also make a shallow analysis on the various searched parameters influence on the reduction of the loss. Looking at the marginal profile. If it is flat than no correlation stands
+# otherwise the HP afffects the performance.
+# Two different tuning procedures:
+    # 1) Network architecture: for the body this focuses on depth, wm and block type. Gropus will be fixed to the suggested size of 16 and bottleneck fixed to 1. (d2l)
+    #                       Instead for the head: width_shrink and the embedding size. 
+    # 2) Training HP: ...   Network's margins,learning rates,leaky ReLu negative slope,
+
+# Once the architecture has been optimized the very same optimization approach is used to fine tuning the network's training hyperparameters.
+# ALL the REGULARIZATION techniques will be implemented afterwards when the optimized network will be finally tested and the tuning on regularization techniques done
+# to enhance its generalization performance on unseen data.
+
+
+# ------------- Network Architecture -------------
+
+
+# Parameters' name:
+    
+#     Depth: d  ... It actually is the power of two --> if d=3 than the depth is 8 integer
+#     Width multiplier: wm [1,4] integer 
+#     Block type: blk [0,1] integer ... 0 = ResNet, 1 = ResNeXt
+#     Width shrink: ws  [2,6] Integer
+#     Embedding size: es [8,16] integer
+    
+# NOTE: I don't think there are interdependent HP in this case, I just have some doubts about depth and width.
+
+# Main steps:
+    
+# Random initialization of the kernels and weigths results in Different network realizations which have different optimal hyperparameters which can 
+# significanlty vary from one newtork to another. This suggests that different randomly generated networks need to be optimize independently.  
+
+# Different trials with different seed shall be done, for this reason for each HP set 10 separate trainings will be done and the oveall mean final loss evaluated.
+# In this pipeline there is a foundamental differnece with the epoch-based approach. At every iteration the model parameters are reset. Instead in th eepoch-based training the 
+# params are kept toroughout the epochs.
+
+
+
+# - First random search with full range sizes;
+# - Second random search: unimportant HP are remuved and the remaining ones' 
+#                 ranges are narrowed within the 10% of the best values;
+# - Choose median or best HP values;
+
+
+
+
+
+
+
+# ------------- Network/Training HP -------------
+
+# The functional to minimize in this case MUST be normalized w.r.t the network's MARGINAL. !!!
+
+
+#                    ......
+
+
+
+
+
+
+
+# Searching algorithm: Bayesian Optimization by Gaussian Process.
+
+# This pipeline requires to use K-fold cross validation. (Doing some sort of it)  
+
+# Evaluation metric is the average loss_fun. 
+
+
+# REFERENCES:
+    
+#     ESN Overview: A Practical Guide to Applying Echo State Networks.
+    
+#     Evaluation approach: Which Hype for my New Task? Hints and Random Search for Reservoir Computing Hyperparameters.
+    
+#     Bayesian Optimization algorithm: Scikit-optimize library.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# NOTES:
+
+
+#     1) Tunable hyperparameters:
+    
+#         Model: width, Kernel sizes, embedding size, depth, dropout, if LeakyReLu is used: negative slope magnitude etc...
+        
+#         Optimizator: learning rate, weight decays (the two betas), etc...
+        
+        
+#     2) Data labels: The traces of reference (control or specific pathologies) have ALL the same label. While surrogate ones MUST have only some common labels
+#             to optimize training. Indeed if the Negative labels are ALL the same the trining would be inefficient and the might even not
+#             converge at all. Therefore the strategy is to construct groups of negative instances by permutating the orginal mini-batch and then 
+#             generate some relative positives.
+                
+                
+#     3) Dataloader: we are handling timeseries data. The shuffle method randomly shuffles the single samples leading to a complete destruction
+#             of the intrinsic temporal relationships. DO NOT USE IT if the dataseet is passed to the default DataLoader. With the costume one,
+#             however, we devide the dataset into chunks (windows) which instead can be randomly chosen and shuffle set to True.
+#             Batch_size determines the number of samples per batch, in the costum function a single sample is an entire window of size defined
+#             (in seconds) fixed in the dataset_--- variable initialized before.
+            
+            
+#     4) Validation loss function: The aim of the entire script is to set up a network that performs an embedding that lays the target neuronal dynamic 
+#                     traces nearby and all others quite far. For this reason validation loss function is an euclidean distance. The 'MARGIN LOSS'
+#                     function utilises the L2 norm (Euclidean distance),it works better than the contrastive loss. 
+#                     Refer to: https://gombru.github.io/2019/04/03/ranking_loss/
+                    
+                    
+                
+#     5) In validation settings the Positive instances are not much variated from the referenc, just the shift is incremented to simulate the lag on an in-silico network. 
+#     We will take two instances of control traces (two different control networks traces concatenated) and evaluate the tendency of the summary network to produce similar embeddings for such traces
+
+ 
+#     6) The ADAMW algorithms and the embedding regularizer both have regularization mechanisms, it's not clear on what they act.
+    
+#     7) The MSE threshold used to distinguish Positive and Negative examples is highly sensitive to the overall time series length.
+
+#     8) The architecutre (especially the depth and width) differently process the sequence of data given the fs_downsample.
+
+#     9) When embeddings are normalized, the euclidean norm equals the cosine similarity as distance metrics for the embeddings
+
+#    10) The 'choose_subset' parameter in Data Augmentation function allows to take out randomly a certain number of positive and negative instances
+
+
+
+    
+# '''
+
+
+
+
+def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device,miner_hard):
+    running_loss = 0.
+    last_loss = 0.
+    model.train(True)
+    # Here, we use enumerate(training_loader) instead of
+    # iter(training_loader) so that we can track the batch
+    # index and do some intra-epoch reporting
+    
+    # The training loop now iterates over the dataloader
+    for i, data_batch in enumerate(dataloader):
+        
+        # data_batch has shape (1, window_size)
+        
+        # The mini-batch is moved  to the GPU inside the foward pass
+       
+
+
+        # Zero your gradients for every batch!
+        optimizer_fn.zero_grad()
+
+        # Make predictions for this batch. Expected size: [1 x 1 x sequence_length]
+        final_embeddings,final_labels = model(torch.squeeze(data_batch,1),fs,State='Training',choose_subset = 15)
+
+
+        # Miner
+        hard_pairs = miner_hard(final_embeddings, final_labels)
+
+        # Compute the loss and its gradients
+        loss = loss_fn(final_embeddings, final_labels,hard_pairs)
+        loss.backward()
+
+        # Adjust learning weights
+        optimizer_fn.step()
+
+        # Gather data and report
+        running_loss += loss.item()
+        
+        
+        avg_loss = running_loss / (i+1) # loss per batch
+        print('  batch {} loss: {}'.format(i + 1, avg_loss))
+       
+    return avg_loss     
+     
+     
+
+
+
+def get_newspace(res_gp,pers):
+    
+    '''
+    This function returns the narrowed search space for the Bayesian Optimization 
+    algorithm given the 'pers' persentage of best points from the previous Optimization 
+    Process.
+  
+    
+    pers = between 0 and 1. Persentage of best points chosen.
+    
+    Parameters' name:
+        
+        Depth: d
+        Width multiplier: wm
+        Block type: blk
+        Width shrink: ws
+        Embedding size: es
+    
+    The cited HP are ordered in the same way in 'Params'
+    
+    
+    '''
+    # --- Best points ---
+    n_bp = np.int16(len(res_gp.func_vals[:]) * pers)
+    
+    
+    
+    # --- Objective Function Evaluations ---
+    # Draw out and sort them.
+    
+    # np.argsort() does not sort the array itself. Instead, it returns an array of integer indices that, 
+    # if used to index the original array, would produce a sorted version of the array.
+    Sorting_idx = np.argsort(res_gp.func_vals[:])
+    
+    # Sort function values
+    Sorted_funcval = res_gp.func_vals[Sorting_idx]
+    
+    
+    # --- Extract space values ---
+    # Define storing array sizes
+    n_params = np.int16(len(res_gp.x_iters[0]))
+    
+    
+    Space_temp = np.zeros((n_bp,n_params))
+    
+    i = 0
+    for sort_idx in Sorting_idx[0:n_bp]:
+        
+        
+        Space_temp[i,:] = res_gp.x_iters[sort_idx]
+        i = i+1
+        
+        
+        
+    
+    # ------ Redefine the searching space ------
+    # Find extremities
+    lower_bounds = np.min(Space_temp,axis=0)
+    upper_bounds = np.max(Space_temp,axis=0)
+    
+    
+    # Define the new space
+    
+    # Set HPs' range
+    d = Real(lower_bounds[0],upper_bounds[0],'log-uniform',name = 'Depth')
+    wm = Real(lower_bounds[1],upper_bounds[1],'log-uniform',name = 'Width multiplier')
+    blk  = Real(lower_bounds[2],upper_bounds[2],name = 'Block type')
+    ws =  Real(lower_bounds[3],upper_bounds[3],name = 'Width shrink')
+    es =  Real(lower_bounds[3],upper_bounds[3],name = 'Embedding size')
+    
+
+
+
+
+    space = [d,
+             wm,
+             blk,
+             ws,
+             es
+        ]
+    
+    return space
+
+
+def OneD_CNN_Training_Wrapper(Params):
+    
+ 
+    
+    '''
+    Parameters' name:
+        
+        Depth: d
+        Width multiplier: wm
+        Block type: blk
+        Width shrink: ws
+        Embedding size: es
+    
+    The cited HP are ordered in the same way in 'Params'
+    '''
+    
+    # ---------- Parameters ----------
+    d   = Params[0]
+    wm  = Params[1]
+    blk = Params[2]
+    ws  = Params[3]
+    es  = Params[4]
+    
+    Block_array = ['ResNet_Block','ResNeXt_Block']
+    depth = int(2**d)
+    
+    
+    # ---------- Print Section ----------
+    print('')
+    print('')
+    print("---------------- Hyperparameter Values ---------------")
+    print(f"Depth (d): {d} -> Converted Depth: {depth}")
+    print(f"Width Multiplier (wm): {wm}")
+    print(f"Block Type (blk): {Block_array[blk]}")
+    print(f"Width Shrink (ws): {ws}")
+    print(f"Embedding Size (es): {es}")
+    print('')
+    print('')
+    print('------------------------------------------------------')
+
+        
+    
+    
+
+    # --------------------- DATA PREPARATION ---------------------
+
+    # ------------- Free cuda -------------
+    torch.cuda.empty_cache()
+
+
+    Dataset_training_window_size_s = 200
+
+
+    print('')
+    print('')
+    print('-------------------- Loading data --------------------')
+    # --------------------- PREPARE THE DATASET ---------------------
+    Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
+    Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
+
+    data_array = []
+    for j in range(2):
+        
+        
+        smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+        
+        
+        cumulative_stdz = Standardization(smoothed_cumulative)
+        
+        data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+
+    data = torch.cat((data_array[0], data_array[1]), dim=1)
+
+
+    #%
+    print('')
+    print('')
+    
+    #%
+    # ---------------- TRAINING DATA LOADER ----------------
+
+    Dataset_training = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+    # Create the DataLoader
+    Dataloader_training = DataLoader(Dataset_training, 
+                            batch_size=1, 
+                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=120),
+                            shuffle=False, 
+                            drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+    # Set the length of trianing data to correctly initialize the network
+    window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+    # Find the window size closest to a power of two
+    Training_data_length = closest_power_of_2(window_size_temp)
+
+
+
+
+
+    # --- SET DEVICE ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+           
+            
+    print('')
+    print('')
+    print('-------------------- NETWORK --------------------')
+    network_temp = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                       head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                       width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                       Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+    
+    
+    print(network_temp)
+    del network_temp
+    print('')
+    print('')
+    print('-----------------------------------------------------')
+
+
+    # ... 10 epoch
+    EPOCHS = 3
+    
+    temp_loss = 0
+    
+    for epoch in range(EPOCHS):
+        print('')
+        print('')
+        print('------------------------------------------------------')
+        print(f'----------- Starting instance: {epoch+1} ------------')
+        
+        
+        # --------------------- INITIALIZE THE NETWORK ---------------------
+        
+        # Reset the parameters. Re-state the network:
+        network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                           head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                           width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                           Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+
+             
+
+        # ------- Load the network on the device -------
+        network = network.to(device)
+                
+
+
+        # --- Training algorithms ---
+
+        reducer = reducers.AvgNonZeroReducer()
+        loss_fn = losses.TripletMarginLoss(margin=0.4,
+                                           swap=True,
+                                           distance=CosineSimilarity(), #  is preferred in embedding contexts.
+                                           reducer = reducer,
+                                           embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
+
+
+        # --- Miner ---
+        miner_hard = miners.TripletMarginMiner(margin=0.2, type_of_triplets="hard",distance=CosineSimilarity()) 
+                                        
+        # --- Optimizer ---
+        optimizer_fn = torch.optim.AdamW(network.parameters())
+        
+        
+        
+        # --------------------- TRAINING ---------------------
+        training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard)
+        
+        
+        temp_loss = temp_loss+training_loss
+        print('')
+        print('')
+        print('------------------------------------------------------')
+
+        
+        
+    average_loss = temp_loss/(EPOCHS)
+    
+    
+    return average_loss
+        
+ #%%       
+
+from skopt import gp_minimize
+
+# --------------------- FIRST RANDOM SEARCH --------------------- 
+'''
+Parameters' name:
+    
+        Depth: d  [3,7] It actually is the power of two --> if d=3 than the depth is 8 integer
+        Width multiplier: wm [1,4] integer 
+        Block type: blk [0,1] integer ... 0 = ResNet, 1 = ResNeXt
+        Width shrink: ws  [2,6] Integer
+        Embedding size: es [8,16] integer
+
+The cited HP are ordered in the same way in 'Params'
+'''
+# ----- Define the search space -----
+d = Integer(3,7,name = 'Depth')
+wm = Integer(1,4,name = 'Width multiplier')
+blk = Integer(0,1,name = 'Block type')
+ws = Integer(2,6,name = 'Width shrink')
+es  = Integer(8,16,name = 'Embedding size')
+
+
+
+
+
+space = [d,
+         wm,
+         blk,
+         ws,
+         es
+    ]
+
+
+
+
+# ------- Run the gp -------
+
+res_gp = gp_minimize(OneD_CNN_Training_Wrapper, space, n_calls=100, random_state=0,verbose=True)
+
+  
+# ------- Plot the Partial Dependence Plots (PDP) -------
+
+# This is needed to spotlight possible parameters that do not have great influence
+# on the model performance. These appear to have flat Partial Dependence profiles.
+    
+    
+from skopt.plots import plot_objective
+    
+plt.figure()
+plot_objective(res_gp,n_points=20)
+plt.show()    
