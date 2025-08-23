@@ -26,11 +26,95 @@ directory = r"C:\Users\Admin\Desktop\Leonardo\Summary Networks"  # Replace with 
 os.chdir(directory)
 from CNN_functions import *
 
-
+from skopt.space import Real, Integer
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+import numpy as np
+# import torch
+import scipy.io
+import pdb
 
 # '''
 
 # This code implements a flexible 1D_CNN architecure which itself can undergo hyperparameter tuning. It is insired on the work of Radosavovic et Al. (2020)
+
+# ---------------------------------- HYPERPARAMETER TUNING ----------------------------------
+# I can also make a shallow analysis on the various searched parameters influence on the reduction of the loss. Looking at the marginal profile. If it is flat than no correlation stands
+# otherwise the HP afffects the performance.
+# Two different tuning procedures:
+    # 1) Network architecture: for the body this focuses on depth, wm and block type. Gropus will be fixed to the suggested size of 16 and bottleneck fixed to 1. (d2l)
+    #                       Instead for the head: width_shrink and the embedding size.
+    # 2) Training HP: ...   !!!
+
+
+
+
+# ------------- Network Architecture -------------
+
+
+# Parameters' name:
+    
+#     Depth: d  ... It actually is the power of two --> if d=3 than the depth is 8 integer
+#     Width multiplier: wm [1,4] integer 
+#     Block type: blk [0,1] integer ... 0 = ResNet, 1 = ResNeXt
+#     Width shrink: ws  [2,6] Integer
+#     Embedding size: es [8,16] integer
+    
+# NOTE: I don't think there are interdependent HP in this case, I just have some doubts about depth and width.
+
+# Main steps:
+    
+# Random initialization of the kernels and weigths results in Different network realizations which have different optimal hyperparameters which can 
+# significanlty vary from one newtork to another. This suggests that different randomly generated networks need to be optimize independently.  
+
+# Different trials with different seed shall be done, for this reason for each HP set 10 separate trainings will be done and the oveall mean final loss evaluated.
+# In this pipeline there is a foundamental differnece with the epoch-based approach. At every iteration the model parameters are reset. Instead in th eepoch-based training the 
+# params are kept toroughout the epochs.
+
+
+
+# - First random search with full range sizes;
+# - Second random search: unimportant HP are remuved and the remaining ones' 
+#                 ranges are narrowed within the 10% of the best values;
+# - Choose median or best HP values;
+
+
+# ------------- Network/Training HP -------------
+
+# Network and miner's margins
+
+#                    ......
+
+
+
+
+
+
+
+# Searching algorithm: Bayesian Optimization by Gaussian Process.
+
+# This pipeline requires to use K-fold cross validation. (Doing some sort of it)  
+
+# Evaluation metric is the average loss_fun. 
+
+
+# REFERENCES:
+    
+#     ESN Overview: A Practical Guide to Applying Echo State Networks.
+    
+#     Evaluation approach: Which Hype for my New Task? Hints and Random Search for Reservoir Computing Hyperparameters.
+    
+#     Bayesian Optimization algorithm: Scikit-optimize library.
+
+
+
+
+
+
+
+
+
 
 
 
@@ -69,10 +153,7 @@ from CNN_functions import *
                 
 #     5) In validation settings the Positive instances are not much variated from the referenc, just the shift is incremented to simulate the lag on an in-silico network. 
 #     We will take two instances of control traces (two different control networks traces concatenated) and evaluate the tendency of the summary network to produce similar embeddings for such traces
-       
 
-        
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
  
 #     6) The ADAMW algorithms and the embedding regularizer both have regularization mechanisms, it's not clear on what they act.
     
@@ -83,6 +164,9 @@ from CNN_functions import *
 #     9) When embeddings are normalized, the euclidean norm equals the cosine similarity as distance metrics for the embeddings
 
 #    10) The 'choose_subset' parameter in Data Augmentation function allows to take out randomly a certain number of positive and negative instances
+
+
+
     
 # '''
 
@@ -91,7 +175,7 @@ from CNN_functions import *
 
 
 
-#%%
+
 
 
 # ------------- Free cuda -------------
@@ -175,7 +259,7 @@ network = network.to(device)
 # --- Training algorithms ---
 
 reducer = reducers.AvgNonZeroReducer()
-loss_fn = losses.TripletMarginLoss(margin=0.2,
+loss_fn = losses.TripletMarginLoss(margin=0.4,
                                  distance=CosineSimilarity(), #  is preferred in embedding contexts.
                                  reducer = reducer,
                                  embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
@@ -215,7 +299,7 @@ Positives,Negatives,Pos_Labels,Neg_Labels = Data_Augmentation(data[:,0:Training_
 %matplotlib
 
 
-def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device):
+def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device,miner_hard):
     running_loss = 0.
     last_loss = 0.
     model.train(True)
@@ -236,7 +320,7 @@ def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device):
         optimizer_fn.zero_grad()
 
         # Make predictions for this batch. Expected size: [1 x 1 x sequence_length]
-        final_embeddings,final_labels = model(torch.squeeze(data_batch,1),fs,State='Training',choose_subset = 10)
+        final_embeddings,final_labels = model(torch.squeeze(data_batch,1),fs,State='Training',choose_subset = 15)
 
 
         # Miner
@@ -258,10 +342,6 @@ def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device):
        
     return avg_loss     
      
-     
-avg_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device)
-
-
 
 
 
