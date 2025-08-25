@@ -1,16 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Aug 23 12:34:54 2025
-
-@author: Admin
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Aug 18 20:59:29 2025
-
-@author: Admin
-"""
 
 import os
 import torch
@@ -96,10 +83,14 @@ import pdb
 
 # ------------- Network/Training HP -------------
 
-# The functional to minimize in this case MUST be normalized w.r.t the network's MARGINAL. !!!
+# The functional to minimize in this case MUST be normalized w.r.t the network's MARGINAL. It is a relative measure.
+# The functional value that the Bayesian Optimizer tries to minimize is avg_loss/margin.
 
-
-#                    ......
+# Margin: mrg [0.1,1] Float
+# Learing rate: lr [1e-4,1e-1] Float
+# Beta 1: b1 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
+# Beta 2: b2 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
+# Weight decay: wd [1e-4,1e-2] Float
 
 
 
@@ -188,10 +179,15 @@ import pdb
 
 
 
-def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device,miner_hard):
+def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device,miner_hard,Margin_loss):
+    '''
+    The output loss value (broadcasted to the bayesian optimizer) is normalized by Margin_loss value
+    given to the loss function.
+    '''
+    
     running_loss = 0.
     last_loss = 0.
-    model.train(True)
+    
     # Here, we use enumerate(training_loader) instead of
     # iter(training_loader) so that we can track the batch
     # index and do some intra-epoch reporting
@@ -227,9 +223,9 @@ def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device,miner_hard):
         
         
         avg_loss = running_loss / (i+1) # loss per batch
-        print('  batch {} loss: {}'.format(i + 1, avg_loss))
+        print('  batch {} norm loss: {}'.format(i + 1, avg_loss/Margin_loss))
        
-    return avg_loss     
+    return avg_loss/Margin_loss     
      
      
 
@@ -319,11 +315,13 @@ def get_newspace(res_gp,pers):
     return space
 
 
-def OneD_CNN_Training_Wrapper(Params):
+def OneD_CNN_Arch_Wrapper(Params):
     
  
     
     '''
+    Used for architecture optimization
+    
     Parameters' name:
         
         Depth: d
@@ -342,8 +340,16 @@ def OneD_CNN_Training_Wrapper(Params):
     ws  = Params[3]
     es  = Params[4]
     
+    # Retrieve parameters' values
     Block_array = ['ResNet_Block','ResNeXt_Block']
     depth = int(2**d)
+    
+    
+    # Fixed values
+    Margin_loss = 0.4
+    Margin_miner = Margin_loss/2
+    
+    
     
     
     # ---------- Print Section ----------
@@ -470,7 +476,7 @@ def OneD_CNN_Training_Wrapper(Params):
         # --- Training algorithms ---
 
         reducer = reducers.AvgNonZeroReducer()
-        loss_fn = losses.TripletMarginLoss(margin=0.4,
+        loss_fn = losses.TripletMarginLoss(margin=Margin_loss,
                                            swap=True,
                                            distance=CosineSimilarity(), #  is preferred in embedding contexts.
                                            reducer = reducer,
@@ -478,15 +484,15 @@ def OneD_CNN_Training_Wrapper(Params):
 
 
         # --- Miner ---
-        miner_hard = miners.TripletMarginMiner(margin=0.2, type_of_triplets="hard",distance=CosineSimilarity()) 
+        miner_hard = miners.TripletMarginMiner(margin=Margin_miner, type_of_triplets="hard",distance=CosineSimilarity()) 
                                         
         # --- Optimizer ---
         optimizer_fn = torch.optim.AdamW(network.parameters())
         
         
-        
+        network.train(True)
         # --------------------- TRAINING ---------------------
-        training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard)
+        training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard,Margin_loss)
         
         
         temp_loss = temp_loss+training_loss
@@ -497,15 +503,272 @@ def OneD_CNN_Training_Wrapper(Params):
         
         
     average_loss = temp_loss/(EPOCHS)
+    # The loss has already been normalized in the one epoch training loop
+    average_loss_norm = average_loss
+    
+    return average_loss_norm
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def OneD_CNN_Train_Wrapper(Params):
+    
+ 
+    
+    '''
+    Used for training optimization
+    
+    Parameter names:
+        Margin: mrg 
+        Learing rate: lr 
+        Beta 1: b1
+        Beta 2: b2
+        Weight decay: wd 
+    
+    The cited HP are ordered in the same way in 'Params'
+    '''
     
     
-    return average_loss
+    # ---------------- CHANGE OPTIMIZED PARAMETERS ----------------
+    
+    # Optimized parameters from previous phase
+    d   = 3
+    wm  = 2
+    blk = int(0)
+    ws  = 5
+    es  = 16
+    
+    # Retrieve parameters' values
+    Block_array = ['ResNet_Block','ResNeXt_Block']
+    depth = int(2**d)
+    
+    # ---------- Print Section ----------
+    print('')
+    print('')
+    print("---------------- Hyperparameter Architecture Values ---------------")
+    print(f"Depth (d): {d} -> Converted Depth: {depth}")
+    print(f"Width Multiplier (wm): {wm}")
+    print(f"Block Type (blk): {Block_array[blk]}")
+    print(f"Width Shrink (ws): {ws}")
+    print(f"Embedding Size (es): {es}")
+    print('')
+    print('')
+    print('------------------------------------------------------')
+
+    
+    
+    
+    
+    
+    
+    
+    # ---------- Parameters ----------
+    mrg = Params[0]
+    lr  = Params[1]
+    b1  = Params[2]
+    b2  = Params[3]
+    wd  = Params[4]
+    
+   
+    
+    # Fixed values
+    Margin_loss = mrg
+    Margin_miner = Margin_loss/2
+    
+    
+    print('')
+    print('')
+    print("---------------- Hyperparameter Optimizer Values ---------------")
+    print(f"Margin (mrg): {mrg}")
+    print(f"Learning Rate (lr): {lr}")
+    print(f"Beta 1 (b1): {b1}")
+    print(f"Beta 2 (b2): {b2}")
+    print(f"Weight Decay (wd): {wd}")
+    print('')
+    print('')
+    print('------------------------------------------------------')
         
- #%%       
+    
+        
+    
+    
+
+    # --------------------- DATA PREPARATION ---------------------
+
+    # ------------- Free cuda -------------
+    torch.cuda.empty_cache()
+
+
+    Dataset_training_window_size_s = 200
+
+
+    print('')
+    print('')
+    print('-------------------- Loading data --------------------')
+    # --------------------- PREPARE THE DATASET ---------------------
+    Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
+    Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
+
+    data_array = []
+    for j in range(2):
+        
+        
+        smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+        
+        
+        cumulative_stdz = Standardization(smoothed_cumulative)
+        
+        data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+
+    data = torch.cat((data_array[0], data_array[1]), dim=1)
+
+
+    #%
+    print('')
+    print('')
+    
+    #%
+    # ---------------- TRAINING DATA LOADER ----------------
+
+    Dataset_training = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+    # Create the DataLoader
+    Dataloader_training = DataLoader(Dataset_training, 
+                            batch_size=1, 
+                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=120),
+                            shuffle=False, 
+                            drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+    # Set the length of trianing data to correctly initialize the network
+    window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+    # Find the window size closest to a power of two
+    Training_data_length = closest_power_of_2(window_size_temp)
+
+
+
+
+
+    # --- SET DEVICE ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+           
+            
+    print('')
+    print('')
+    print('-------------------- NETWORK --------------------')
+    network_temp = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                       head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                       width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                       Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+    
+    
+    print(network_temp)
+    del network_temp
+    print('')
+    print('')
+    print('-----------------------------------------------------')
+
+
+    # ... 5 epoch
+    EPOCHS = 4
+    
+    temp_loss = 0
+    
+    for epoch in range(EPOCHS):
+        print('')
+        print('')
+        print('------------------------------------------------------')
+        print(f'----------- Starting instance: {epoch+1} ------------')
+        
+        
+        # --------------------- INITIALIZE THE NETWORK ---------------------
+        
+        # Reset the parameters. Re-state the network:
+        network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                           head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                           width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                           Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+
+             
+
+        # ------- Load the network on the device -------
+        network = network.to(device)
+                
+
+
+        # --- Training algorithms ---
+
+        reducer = reducers.AvgNonZeroReducer()
+        loss_fn = losses.TripletMarginLoss(margin=Margin_loss,
+                                           swap=True,
+                                           distance=CosineSimilarity(), #  is preferred in embedding contexts.
+                                           reducer = reducer,
+                                           embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
+
+
+        # --- Miner ---
+        miner_hard = miners.TripletMarginMiner(margin=Margin_miner, type_of_triplets="hard",distance=CosineSimilarity()) 
+                                        
+        # --- Optimizer ---
+        optimizer_fn = torch.optim.AdamW(network.parameters(),lr = lr, betas=[b1,b2],weight_decay=wd)
+        
+        
+        network.train(True)
+        # --------------------- TRAINING ---------------------
+        training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard,Margin_loss)
+        
+        
+        temp_loss = temp_loss+training_loss
+        print('')
+        print('')
+        print('------------------------------------------------------')
+
+        
+        
+    average_loss = temp_loss/(EPOCHS)
+    # The loss has already been normalized in the one epoch training loop
+    average_loss_norm = average_loss
+    
+    return average_loss_norm
+        
+ #%%  
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------   ARCHITECTURE OPTIMIZATION   ---------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''     
 
 from skopt import gp_minimize
 
-# --------------------- FIRST RANDOM SEARCH --------------------- 
+# --------------------- ARCHITECTURE OPTIMIZATION --------------------- 
 '''
 Parameters' name:
     
@@ -518,8 +781,8 @@ Parameters' name:
 The cited HP are ordered in the same way in 'Params'
 '''
 # ----- Define the search space -----
-d = Integer(3,7,name = 'Depth')
-wm = Integer(1,4,name = 'Width multiplier')
+d = Integer(3,6,name = 'Depth')
+wm = Integer(2,5,name = 'Width multiplier')
 blk = Integer(0,1,name = 'Block type')
 ws = Integer(2,6,name = 'Width shrink')
 es  = Integer(8,16,name = 'Embedding size')
@@ -540,7 +803,10 @@ space = [d,
 
 # ------- Run the gp -------
 
-res_gp = gp_minimize(OneD_CNN_Training_Wrapper, space, n_calls=100, random_state=0,verbose=True)
+res_gp = gp_minimize(OneD_CNN_Arch_Wrapper, space, n_calls=100, random_state=0,verbose=True)
+
+
+
 
   
 # ------- Plot the Partial Dependence Plots (PDP) -------
@@ -550,7 +816,652 @@ res_gp = gp_minimize(OneD_CNN_Training_Wrapper, space, n_calls=100, random_state
     
     
 from skopt.plots import plot_objective
-    
+%matplotlib
+   
 plt.figure()
 plot_objective(res_gp,n_points=20)
 plt.show()    
+
+output_path = r'C:\Users\Admin\Desktop\Leonardo\Summary Networks\Saved networks\250825'
+os.chdir(output_path)
+
+# Retrieve all the values
+# np.argsort() does not sort the array itself. Instead, it returns an array of integer indices that, 
+# if used to index the original array, would produce a sorted version of the array.
+Sorting_idx = np.argsort(res_gp.func_vals[:])
+
+# Sort function values
+Sorted_funcval = res_gp.func_vals[Sorting_idx]
+Row_Space = res_gp.x_iters
+Space_temp = []
+
+for sort_idx in Sorting_idx:
+    
+    
+    Space_temp.append(res_gp.x_iters[sort_idx])
+    
+Space_sorted = np.vstack(Space_temp)
+
+
+# Save
+Save_dict = {
+    
+        'Sorted functional': Sorted_funcval.tolist(),
+        'Sorted Parameter Space': Space_sorted.tolist()
+    
+    
+    
+    }
+import json
+with open('HP_Optim_Arch.json', 'w') as f:
+    json.dump(Save_dict, f, indent=4)
+
+
+
+
+
+
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+---------------------------------------   ARCHITECTURE OPTIMIZATION FINISHED   -----------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------  TRAINING OPTIMIZATION   ------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''     
+
+
+
+
+
+
+
+
+
+# --------------------- TRAINING OPTIMIZATION --------------------- 
+# Manually change the values in the wrapper
+
+'''
+
+Parameter names:
+    Margin: mrg [0.1,1] Float
+    Learing rate: lr [1e-4,1e-1] Float
+    Beta 1: b1 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
+    Beta 2: b2 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
+    Weight decay: wd [1e-4,1e-2] Float
+
+The cited HP are ordered in the same way in 'Params'
+
+'''
+
+# ----- Define the search space -----
+mrg = Real(0.1,1,name = 'Margin')
+lr = Real(1e-4,0.2,'log-uniform',name = 'Learing rate')
+b1 = Real(0.1,0.999999999,name = 'Beta 1')
+b2 = Real(0.1,0.999999999,name = 'Beta 2')
+wd  = Real(1e-4,1e-2,'log-uniform',name = 'Weight decay')
+
+
+
+
+
+space = [mrg,
+         lr,
+         b1,
+         b2,
+         wd
+    ]
+
+
+
+
+# ------- Run the gp -------
+from skopt import gp_minimize
+res_gp = gp_minimize(OneD_CNN_Train_Wrapper, space, n_calls=100, random_state=0,verbose=True)
+
+
+# ------- Plot the Partial Dependence Plots (PDP) -------
+
+# This is needed to spotlight possible parameters that do not have great influence
+# on the model performance. These appear to have flat Partial Dependence profiles.
+    
+    
+from skopt.plots import plot_objective
+%matplotlib
+   
+plt.figure()
+plot_objective(res_gp,n_points=20)
+plt.show()    
+
+
+output_path = r'C:\Users\Admin\Desktop\Leonardo\Summary Networks\Saved networks\250825'
+os.chdir(output_path)
+
+# Retrieve all the values
+# np.argsort() does not sort the array itself. Instead, it returns an array of integer indices that, 
+# if used to index the original array, would produce a sorted version of the array.
+Sorting_idx = np.argsort(res_gp.func_vals[:])
+
+# Sort function values
+Sorted_funcval = res_gp.func_vals[Sorting_idx]
+Row_Space = res_gp.x_iters
+Space_temp = []
+
+for sort_idx in Sorting_idx:
+    
+    
+    Space_temp.append(res_gp.x_iters[sort_idx])
+    
+Space_sorted = np.vstack(Space_temp)
+
+
+# Save
+Save_dict = {
+    
+        'Sorted functional': Sorted_funcval.tolist(),
+        'Sorted Parameter Space': Space_sorted.tolist()
+    
+    
+    
+    }
+import json
+with open('HP_Optim_Train.json', 'w') as f:
+    json.dump(Save_dict, f, indent=4)
+
+
+
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------   TRAINING OPTIMIZATION FINISHED   -------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''
+
+
+#%%
+
+
+
+
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------  FINAL TRAINING   ---------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''   
+'''
+Network training after architecture and training optimizations has been performed
+
+
+'''
+
+
+
+
+
+
+
+# ---------------- ARCHITECTURE OPTIMIZED H-PARAMETERS ----------------
+
+# Optimized parameters from previous phase
+d   = 3
+wm  = 2
+blk = int(0)
+ws  = 5
+es  = 16
+
+# Retrieve parameters' values
+Block_array = ['ResNet_Block','ResNeXt_Block']
+depth = int(2**d)
+
+# ---------- Print Section ----------
+print('')
+print('')
+print("---------------- Hyperparameter Architecture Values ---------------")
+print(f"Depth (d): {d} -> Converted Depth: {depth}")
+print(f"Width Multiplier (wm): {wm}")
+print(f"Block Type (blk): {Block_array[blk]}")
+print(f"Width Shrink (ws): {ws}")
+print(f"Embedding Size (es): {es}")
+print('')
+print('')
+print('------------------------------------------------------')
+
+
+
+
+
+
+
+
+# ---------------- TRAINING OPTIMIZED H-PARAMETERS ----------------
+mrg = 0.8
+lr  = 0.0015
+b1  = 0.1
+b2  = 0.99999
+wd  = 0.01
+
+ 
+
+# Fixed values
+Margin_loss = mrg
+Margin_miner = Margin_loss/2
+
+
+print('')
+print('')
+print("---------------- Hyperparameter Optimizer Values ---------------")
+print(f"Margin (mrg): {mrg}")
+print(f"Learning Rate (lr): {lr}")
+print(f"Beta 1 (b1): {b1}")
+print(f"Beta 2 (b2): {b2}")
+print(f"Weight Decay (wd): {wd}")
+print('')
+print('')
+print('------------------------------------------------------')
+    
+
+    
+
+
+
+# --------------------- DATA PREPARATION ---------------------
+
+# ------------- Free cuda -------------
+torch.cuda.empty_cache()
+
+
+Dataset_training_window_size_s = 200
+
+
+print('')
+print('')
+print('-------------------- Loading data --------------------')
+# --------------------- PREPARE THE DATASET ---------------------
+Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
+Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
+
+data_array = []
+for j in range(2):
+    
+    
+    smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+    
+    
+    cumulative_stdz = Standardization(smoothed_cumulative)
+    
+    data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+
+data = torch.cat((data_array[0], data_array[1]), dim=1)
+
+
+#%
+print('')
+print('')
+
+#%
+# ---------------- TRAINING DATA LOADER ----------------
+
+Dataset_training = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+# Create the DataLoader
+Dataloader_training = DataLoader(Dataset_training, 
+                        batch_size=1, 
+                        sampler=RandomSampler(Dataset_training,replacement=True, num_samples=400),
+                        shuffle=False, 
+                        drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+# Set the length of trianing data to correctly initialize the network
+window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+# Find the window size closest to a power of two
+Training_data_length = closest_power_of_2(window_size_temp)
+
+
+
+
+
+# --- SET DEVICE ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+       
+        
+print('')
+print('')
+print('-------------------- NETWORK --------------------')
+
+# --------------------- INITIALIZE THE NETWORK ---------------------
+
+# Reset the parameters. Re-state the network:
+network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                   head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                   width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                   Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+
+     
+
+# ------- Load the network on the device -------
+network = network.to(device)
+        
+
+
+# --- Training algorithms ---
+
+reducer = reducers.AvgNonZeroReducer()
+loss_fn = losses.TripletMarginLoss(margin=Margin_loss,
+                                   swap=True,
+                                   distance=CosineSimilarity(), #  is preferred in embedding contexts.
+                                   reducer = reducer,
+                                   embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
+
+
+# --- Miner ---
+miner_hard = miners.TripletMarginMiner(margin=Margin_miner, type_of_triplets="hard",distance=CosineSimilarity()) 
+                                
+# --- Optimizer ---
+optimizer_fn = torch.optim.AdamW(network.parameters(),lr = lr, betas=[b1,b2],weight_decay=wd)
+print(network)
+print('')
+print('')
+print('-----------------------------------------------------')
+
+
+# ... 5 epoch
+EPOCHS = 4
+
+temp_loss = 0
+network.train(True)
+for epoch in range(EPOCHS):
+    print('')
+    print('')
+    print('------------------------------------------------------')
+    print(f'----------- Starting instance: {epoch+1} ------------')
+    
+    
+
+    
+    # --------------------- TRAINING ---------------------
+    training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard,Margin_loss)
+    
+    
+    temp_loss = temp_loss+training_loss
+    print('')
+    print('')
+    print('------------------------------------------------------')
+
+    
+    
+average_loss = temp_loss/(EPOCHS)
+# The loss has already been normalized in the one epoch training loop
+average_loss_norm = average_loss
+
+
+
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------  FINAL TRAINING FINISHED  -----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''
+#%%
+'''
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------  FINAL NETWORK EVALUATION   ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+'''
+
+# Generate Control and pathological datasets
+print('')
+print('')
+print('-------------------- Loading data --------------------')
+# --------------------- PREPARE THE DATASET ---------------------
+Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
+Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
+Num_dataloader_samples = 400
+data_array = []
+for j in range(2):
+    
+    
+    smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+    
+    
+    cumulative_stdz = Standardization(smoothed_cumulative)
+    
+    data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+
+data = torch.cat((data_array[0], data_array[1]), dim=1)
+
+
+
+Dataset_control = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+# Create the DataLoader
+Dataloader_control = DataLoader(Dataset_control, 
+                        batch_size=1, 
+                        sampler=RandomSampler(Dataset_control,replacement=True, num_samples=Num_dataloader_samples),
+                        shuffle=False, 
+                        drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+# Set the length of trianing data to correctly initialize the network
+window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+# Find the window size closest to a power of two
+Training_data_length = closest_power_of_2(window_size_temp)
+
+
+
+Char_folder_array = r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Group02_Well14'
+Char_base_array = r'ptrain_Group02_Well14_'
+
+smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array,Char_base=Char_base_array,w_size=0.02,Gaussian_window=0.04)
+
+
+cumulative_stdz = Standardization(smoothed_cumulative)
+
+data =  torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() 
+
+
+Dataset_patho = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+# Create the DataLoader
+Dataloader_patho = DataLoader(Dataset_patho, 
+                        batch_size=1, 
+                        sampler=RandomSampler(Dataset_patho,replacement=True, num_samples=Num_dataloader_samples),
+                        shuffle=False, 
+                        drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+
+
+#%%
+import torch.nn.functional as F
+# ---- PUT THE NETWORK IN EVALUATION MODE ----
+
+network.eval()
+
+Control_embeddings = []
+Patho_embeddings =  []
+# ---- Control embeddings ----
+with torch.no_grad():
+    
+    for i, data_batch in enumerate(Dataloader_control):
+        
+        
+        Emb = network(torch.squeeze(data_batch,1),fs_downsampled,State='Embedding')
+        
+        # Normalize the embeddings w.r.t the magnitude
+        Control_embeddings.append(F.normalize(Emb, p=2, dim=1))
+        
+# ---- Patho embeddings ----
+with torch.no_grad():
+    
+    for i, data_batch in enumerate(Dataloader_patho):
+        
+        
+        Emb = network(torch.squeeze(data_batch,1),fs_downsampled,State='Embedding')
+        
+        # Normalize the embeddings w.r.t the magnitude
+        
+        
+        Patho_embeddings.append(F.normalize(Emb, p=2, dim=1))
+    
+        
+#%%
+# Stack embeddings
+Embeddings =  torch.vstack((torch.vstack(Control_embeddings), torch.vstack(Patho_embeddings))).cpu().numpy().astype(np.float64) 
+    
+   
+    
+# ---- Generate Labels ----
+Control_Labels = np.full(Num_dataloader_samples,0)
+Patho_Labels = np.full(Num_dataloader_samples,1)
+
+Labels = np.concatenate((Control_Labels,Patho_Labels))
+#%%
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from sklearn import metrics
+import numpy as np
+
+def Embedding_Scores(Embeddings,True_Labels,Visible = True):
+    
+    # ------------ K-MEANS ------------
+    
+    '''
+    In practice, the k-means algorithm is very fast (one of the fastest clustering algorithms available), but it falls in local minima. 
+    That’s why it can be useful to restart it several times (ruled by n_init term)
+    
+    Notes:
+        1) It expects embeddings to be already scaled
+    
+    '''
+    n_clusters = len(np.unique(True_Labels))    
+    
+    kmeans = KMeans(init="k-means++", n_clusters=n_clusters, n_init=4, random_state=0)
+    estimator = kmeans.fit(Embeddings)
+    
+    # Define the metrics which require only the true labels and estimator
+    # labels
+    clustering_metrics = [
+        metrics.adjusted_rand_score,
+        metrics.adjusted_mutual_info_score,
+    ]
+    results = [m(True_Labels, estimator.labels_) for m in clustering_metrics]
+    
+    
+    
+    if Visible == True:
+        reduced_data = PCA(n_components=2).fit_transform(Embeddings)
+        kmeans = KMeans(init="k-means++", n_clusters=n_clusters, n_init=4)
+        kmeans.fit(reduced_data)
+        
+                # Step size of the mesh. Decrease to increase the quality of the VQ.
+        h = 0.02  # point in the mesh [x_min, x_max]x[y_min, y_max].
+        
+        # Plot the decision boundary. For that, we will assign a color to each
+        x_min, x_max = reduced_data[:, 0].min() - 1, reduced_data[:, 0].max() + 1
+        y_min, y_max = reduced_data[:, 1].min() - 1, reduced_data[:, 1].max() + 1
+        xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
+        
+        # Obtain labels for each point in mesh. Use last trained model.
+        Z = kmeans.predict(np.c_[xx.ravel(), yy.ravel()])
+        
+        # Put the result into a color plot
+        Z = Z.reshape(xx.shape)
+        plt.figure(1)
+        plt.clf()
+        plt.imshow(
+            Z,
+            interpolation="nearest",
+            extent=(xx.min(), xx.max(), yy.min(), yy.max()),
+            cmap=plt.cm.Paired,
+            aspect="auto",
+            origin="lower",
+        )
+        
+        # plt.scatter(
+        #         reduced_data[:, 0], reduced_data[:, 1], c=True_Labels, s=10, cmap=plt.cm.Paired
+        #             )
+
+        plt.plot(reduced_data[:, 0], reduced_data[:, 1], "k.", markersize=10)
+        # Plot the centroids as a white X
+        centroids = kmeans.cluster_centers_
+        plt.scatter(
+            centroids[:, 0],
+            centroids[:, 1],
+            marker="x",
+            s=169,
+            linewidths=3,
+            color="w",
+            zorder=10,
+        )
+        plt.title(
+            "K-means clustering on the embeddings (PCA-reduced data)\n"
+            "Centroids are marked with white cross"
+        )
+        plt.xlim(x_min, x_max)
+        plt.ylim(y_min, y_max)
+        plt.xticks(())
+        plt.yticks(())
+        plt.show()
+        
+        
+    return results,reduced_data
+
+
+
+results,reduced_data = Embedding_Scores(Embeddings,Labels)
+
+
+
+maskfig = np.where(Labels==0)[0]
+maskfig_patho = np.where(Labels==1)[0]
+
+
+plt.figure()
+
+plt.scatter(reduced_data[maskfig,0],reduced_data[maskfig,1],c= 'k',s=20)
+plt.scatter(reduced_data[maskfig_patho,0],reduced_data[maskfig_patho,1],c= 'r',s=10)
+plt.show()
+
+#%%
+
+
+os.chdir(r'C:\Users\Admin\Desktop\Leonardo\Summary Networks\Saved networks\250825')
+# Save only the state dictionary
+PATH = "Main_Model_.pt"
+torch.save(network.state_dict(), PATH)
