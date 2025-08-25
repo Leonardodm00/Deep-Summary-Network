@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Aug 25 11:42:29 2025
-
-@author: leona
-"""
 
 '''
 This script implements the function 'Embedding accuracy' meant to provide scores on the
@@ -58,7 +52,7 @@ def Embedding_Scores(Embeddings,True_Labels,Visible = True):
         metrics.adjusted_rand_score,
         metrics.adjusted_mutual_info_score,
     ]
-    results = [m(True_Labels, estimator[-1].labels_) for m in clustering_metrics]
+    results = [m(True_Labels, estimator.labels_) for m in clustering_metrics]
     
     
     
@@ -117,7 +111,7 @@ def Embedding_Scores(Embeddings,True_Labels,Visible = True):
     return results 
                     
  
-#%%        
+#%
 Embeddings, True_Labels = make_blobs(
     n_samples=300,
     n_features=10,
@@ -127,3 +121,4 @@ Embeddings, True_Labels = make_blobs(
 )
 #%%
 results = Embedding_Scores(Embeddings,True_Labels,Visible = True)   
+    
