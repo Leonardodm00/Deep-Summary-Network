@@ -1,40 +1,38 @@
 
-
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, TensorDataset, DataLoader, RandomSampler
 from torch import nn
+import torch.nn.functional as F
+
 import math
 from collections import Counter
+from datetime import datetime
 
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-import matplotlib.pyplot as plt
 from sklearn import metrics
-import numpy as np
-
-
+from sklearn.metrics import mean_squared_error
 
 import numpy as np
 from scipy.interpolate import CubicSpline, interp1d
-import torch
-import numpy as np
-from scipy.interpolate import CubicSpline
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.interpolate import CubicSpline
-from sklearn.metrics import mean_squared_error
-import os
-from scipy.io import loadmat
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.io import loadmat
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
-from sklearn.decomposition import PCA
+from scipy.io import loadmat
+import scipy.io
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-import torch.nn.functional as F
+
+import os
+import pdb
+
+from skopt.space import Real, Integer
+
+from pytorch_metric_learning import losses, miners, reducers
+from pytorch_metric_learning.distances import LpDistance, BatchedDistance, CosineSimilarity
+from pytorch_metric_learning.reducers import MultipleReducers, ThresholdReducer, MeanReducer
+from pytorch_metric_learning.regularizers import LpRegularizer
 
 
 '''
@@ -2519,7 +2517,626 @@ Params:
         
 #         self.net.add_module(r'head',self.head())
 
+
+# ------------------------- TRAINING AND OPTIMIZATION -------------------------
+
+
+
+
+def train_one_epoch(model,dataloader,loss_fn,optimizer_fn,fs,device,miner_hard,Margin_loss):
+    '''
+    The output loss value (broadcasted to the bayesian optimizer) is normalized by Margin_loss value
+    given to the loss function.
+    '''
+    
+    running_loss = 0.
+    last_loss = 0.
+    
+    # Here, we use enumerate(training_loader) instead of
+    # iter(training_loader) so that we can track the batch
+    # index and do some intra-epoch reporting
+    
+    # The training loop now iterates over the dataloader
+    for i, data_batch in enumerate(dataloader):
+        
+        # data_batch has shape (1, window_size)
+        
+        # The mini-batch is moved  to the GPU inside the foward pass
+       
+
+
+        # Zero your gradients for every batch!
+        optimizer_fn.zero_grad()
+
+        # Make predictions for this batch. Expected size: [1 x 1 x sequence_length]
+        final_embeddings,final_labels = model(torch.squeeze(data_batch,1),fs,State='Training',choose_subset = 15)
+
+
+        # Miner
+        hard_pairs = miner_hard(final_embeddings, final_labels)
+
+        # Compute the loss and its gradients
+        loss = loss_fn(final_embeddings, final_labels,hard_pairs)
+        loss.backward()
+
+        # Adjust learning weights
+        optimizer_fn.step()
+
+        # Gather data and report
+        running_loss += loss.item()
+        
+        
+        avg_loss = running_loss / (i+1) # loss per batch
+        print('  batch {} norm loss: {}'.format(i + 1, avg_loss/Margin_loss))
+       
+    return avg_loss/Margin_loss     
+     
+     
+
+
+
+def get_newspace(res_gp,pers):
+    
+    '''
+    This function returns the narrowed search space for the Bayesian Optimization 
+    algorithm given the 'pers' persentage of best points from the previous Optimization 
+    Process.
+  
+    
+    pers = between 0 and 1. Persentage of best points chosen.
+    
+    Parameters' name:
+        
+        Depth: d
+        Width multiplier: wm
+        Block type: blk
+        Width shrink: ws
+        Embedding size: es
+    
+    The cited HP are ordered in the same way in 'Params'
+    
+    
+    '''
+    # --- Best points ---
+    n_bp = np.int16(len(res_gp.func_vals[:]) * pers)
+    
+    
+    
+    # --- Objective Function Evaluations ---
+    # Draw out and sort them.
+    
+    # np.argsort() does not sort the array itself. Instead, it returns an array of integer indices that, 
+    # if used to index the original array, would produce a sorted version of the array.
+    Sorting_idx = np.argsort(res_gp.func_vals[:])
+    
+    # Sort function values
+    Sorted_funcval = res_gp.func_vals[Sorting_idx]
+    
+    
+    # --- Extract space values ---
+    # Define storing array sizes
+    n_params = np.int16(len(res_gp.x_iters[0]))
+    
+    
+    Space_temp = np.zeros((n_bp,n_params))
+    
+    i = 0
+    for sort_idx in Sorting_idx[0:n_bp]:
+        
+        
+        Space_temp[i,:] = res_gp.x_iters[sort_idx]
+        i = i+1
+        
+        
+        
+    
+    # ------ Redefine the searching space ------
+    # Find extremities
+    lower_bounds = np.min(Space_temp,axis=0)
+    upper_bounds = np.max(Space_temp,axis=0)
+    
+    
+    # Define the new space
+    
+    # Set HPs' range
+    d = Real(lower_bounds[0],upper_bounds[0],'log-uniform',name = 'Depth')
+    wm = Real(lower_bounds[1],upper_bounds[1],'log-uniform',name = 'Width multiplier')
+    blk  = Real(lower_bounds[2],upper_bounds[2],name = 'Block type')
+    ws =  Real(lower_bounds[3],upper_bounds[3],name = 'Width shrink')
+    es =  Real(lower_bounds[3],upper_bounds[3],name = 'Embedding size')
+    
+
+
+
+
+    space = [d,
+             wm,
+             blk,
+             ws,
+             es
+        ]
+    
+    return space
+
+
+def OneD_CNN_Arch_Wrapper(Params):
+    
+ 
+    
+    '''
+    Used for architecture optimization
+    
+    Parameters' name:
+        
+        Depth: d
+        Width multiplier: wm
+        Block type: blk
+        Width shrink: ws
+        Embedding size: es
+    
+    The cited HP are ordered in the same way in 'Params'
+    '''
+    
+    # ---------- Parameters ----------
+    d   = Params[0]
+    wm  = Params[1]
+    blk = Params[2]
+    ws  = Params[3]
+    es  = Params[4]
+    
+    # Retrieve parameters' values
+    Block_array = ['ResNet_Block','ResNeXt_Block']
+    depth = int(2**d)
+    
+    
+    # Fixed values
+    Margin_loss = 0.4
+    Margin_miner = Margin_loss/2
+    
+    
+    
+    
+    # ---------- Print Section ----------
+    print('')
+    print('')
+    print("---------------- Hyperparameter Values ---------------")
+    print(f"Depth (d): {d} -> Converted Depth: {depth}")
+    print(f"Width Multiplier (wm): {wm}")
+    print(f"Block Type (blk): {Block_array[blk]}")
+    print(f"Width Shrink (ws): {ws}")
+    print(f"Embedding Size (es): {es}")
+    print('')
+    print('')
+    print('------------------------------------------------------')
+
+        
+    
+    
+
+    # --------------------- DATA PREPARATION ---------------------
+
+    # ------------- Free cuda -------------
+    torch.cuda.empty_cache()
+
+
+    Dataset_training_window_size_s = 200
+
+
+    print('')
+    print('')
+    print('-------------------- Loading data --------------------')
+    # --------------------- PREPARE THE DATASET ---------------------
+    Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
+    Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
+
+    data_array = []
+    for j in range(2):
+        
+        
+        smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+        
+        
+        cumulative_stdz = Standardization(smoothed_cumulative)
+        
+        data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+
+    data = torch.cat((data_array[0], data_array[1]), dim=1)
+
+
+    #%
+    print('')
+    print('')
+    
+    #%
+    # ---------------- TRAINING DATA LOADER ----------------
+
+    Dataset_training = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+    # Create the DataLoader
+    Dataloader_training = DataLoader(Dataset_training, 
+                            batch_size=1, 
+                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=120),
+                            shuffle=False, 
+                            drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+    # Set the length of trianing data to correctly initialize the network
+    window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+    # Find the window size closest to a power of two
+    Training_data_length = closest_power_of_2(window_size_temp)
+
+
+
+
+
+    # --- SET DEVICE ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+           
+            
+    print('')
+    print('')
+    print('-------------------- NETWORK --------------------')
+    network_temp = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                       head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                       width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                       Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+    
+    
+    print(network_temp)
+    del network_temp
+    print('')
+    print('')
+    print('-----------------------------------------------------')
+
+
+    # ... 10 epoch
+    EPOCHS = 3
+    
+    temp_loss = 0
+    
+    for epoch in range(EPOCHS):
+        print('')
+        print('')
+        print('------------------------------------------------------')
+        print(f'----------- Starting instance: {epoch+1} ------------')
+        
+        
+        # --------------------- INITIALIZE THE NETWORK ---------------------
+        
+        # Reset the parameters. Re-state the network:
+        network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                           head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                           width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                           Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+
+             
+
+        # ------- Load the network on the device -------
+        network = network.to(device)
+                
+
+
+        # --- Training algorithms ---
+
+        reducer = reducers.AvgNonZeroReducer()
+        loss_fn = losses.TripletMarginLoss(margin=Margin_loss,
+                                           swap=True,
+                                           distance=CosineSimilarity(), #  is preferred in embedding contexts.
+                                           reducer = reducer,
+                                           embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
+
+
+        # --- Miner ---
+        miner_hard = miners.TripletMarginMiner(margin=Margin_miner, type_of_triplets="hard",distance=CosineSimilarity()) 
+                                        
+        # --- Optimizer ---
+        optimizer_fn = torch.optim.AdamW(network.parameters())
+        
+        
+        network.train(True)
+        # --------------------- TRAINING ---------------------
+        training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard,Margin_loss)
+        
+        
+        temp_loss = temp_loss+training_loss
+        print('')
+        print('')
+        print('------------------------------------------------------')
+
+        
+        
+    average_loss = temp_loss/(EPOCHS)
+    # The loss has already been normalized in the one epoch training loop
+    average_loss_norm = average_loss
+    
+    return average_loss_norm
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def OneD_CNN_Train_Wrapper(Params):
+    
+ 
+    
+    '''
+    Used for training optimization
+    
+    Parameter names:
+        Margin: mrg 
+        Learing rate: lr 
+        Beta 1: b1
+        Beta 2: b2
+        Weight decay: wd 
+    
+    The cited HP are ordered in the same way in 'Params'
+    '''
+    
+    
+    # ---------------- CHANGE OPTIMIZED PARAMETERS ----------------
+    
+    # Optimized parameters from previous phase
+    d   = 3
+    wm  = 2
+    blk = int(0)
+    ws  = 5
+    es  = 16
+    
+    # Retrieve parameters' values
+    Block_array = ['ResNet_Block','ResNeXt_Block']
+    depth = int(2**d)
+    
+    # ---------- Print Section ----------
+    print('')
+    print('')
+    print("---------------- Hyperparameter Architecture Values ---------------")
+    print(f"Depth (d): {d} -> Converted Depth: {depth}")
+    print(f"Width Multiplier (wm): {wm}")
+    print(f"Block Type (blk): {Block_array[blk]}")
+    print(f"Width Shrink (ws): {ws}")
+    print(f"Embedding Size (es): {es}")
+    print('')
+    print('')
+    print('------------------------------------------------------')
+
+    
+    
+    
+    
+    
+    
+    
+    # ---------- Parameters ----------
+    mrg = Params[0]
+    lr  = Params[1]
+    b1  = Params[2]
+    b2  = Params[3]
+    wd  = Params[4]
+    
+   
+    
+    # Fixed values
+    Margin_loss = mrg
+    Margin_miner = Margin_loss/2
+    
+    
+    print('')
+    print('')
+    print("---------------- Hyperparameter Optimizer Values ---------------")
+    print(f"Margin (mrg): {mrg}")
+    print(f"Learning Rate (lr): {lr}")
+    print(f"Beta 1 (b1): {b1}")
+    print(f"Beta 2 (b2): {b2}")
+    print(f"Weight Decay (wd): {wd}")
+    print('')
+    print('')
+    print('------------------------------------------------------')
+        
+    
+        
+    
+    
+
+    # --------------------- DATA PREPARATION ---------------------
+
+    # ------------- Free cuda -------------
+    torch.cuda.empty_cache()
+
+
+    Dataset_training_window_size_s = 200
+
+
+    print('')
+    print('')
+    print('-------------------- Loading data --------------------')
+    # --------------------- PREPARE THE DATASET ---------------------
+    Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
+    Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
+
+    data_array = []
+    for j in range(2):
+        
+        
+        smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+        
+        
+        cumulative_stdz = Standardization(smoothed_cumulative)
+        
+        data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+
+    data = torch.cat((data_array[0], data_array[1]), dim=1)
+
+
+    #%
+    print('')
+    print('')
+    
+    #%
+    # ---------------- TRAINING DATA LOADER ----------------
+
+    Dataset_training = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
+    # Create the DataLoader
+    Dataloader_training = DataLoader(Dataset_training, 
+                            batch_size=1, 
+                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=120),
+                            shuffle=False, 
+                            drop_last=True) # drop_last is important to ensure all batches have the same size
+
+
+    # Set the length of trianing data to correctly initialize the network
+    window_size_temp = Dataset_training_window_size_s*fs_downsampled # in samples
+
+    # Find the window size closest to a power of two
+    Training_data_length = closest_power_of_2(window_size_temp)
+
+
+
+
+
+    # --- SET DEVICE ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+           
+            
+    print('')
+    print('')
+    print('-------------------- NETWORK --------------------')
+    network_temp = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                       head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                       width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                       Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+    
+    
+    print(network_temp)
+    del network_temp
+    print('')
+    print('')
+    print('-----------------------------------------------------')
+
+
+    # ... 5 epoch
+    EPOCHS = 4
+    
+    temp_loss = 0
+    
+    for epoch in range(EPOCHS):
+        print('')
+        print('')
+        print('------------------------------------------------------')
+        print(f'----------- Starting instance: {epoch+1} ------------')
+        
+        
+        # --------------------- INITIALIZE THE NETWORK ---------------------
+        
+        # Reset the parameters. Re-state the network:
+        network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, last_dropout = False,
+                           head_dropout = True, downsampling_rate=2, groups=16,dropout_pers=0.2, Block_Type = Block_array[blk],
+                           width_shrink = ws, Network_depth = depth, Stage_kernel = 3, embedding_size = es, 
+                           Stem_augmentation = 16, Stem_kernel = 5, Stem_stride = 4,weight_multiplier = wm, device = device)
+
+             
+
+        # ------- Load the network on the device -------
+        network = network.to(device)
+                
+
+
+        # --- Training algorithms ---
+
+        reducer = reducers.AvgNonZeroReducer()
+        loss_fn = losses.TripletMarginLoss(margin=Margin_loss,
+                                           swap=True,
+                                           distance=CosineSimilarity(), #  is preferred in embedding contexts.
+                                           reducer = reducer,
+                                           embedding_regularizer = None) # See in the obsidian page 'Deep learning Training Regularizers' the reason
+
+
+        # --- Miner ---
+        miner_hard = miners.TripletMarginMiner(margin=Margin_miner, type_of_triplets="hard",distance=CosineSimilarity()) 
+                                        
+        # --- Optimizer ---
+        optimizer_fn = torch.optim.AdamW(network.parameters(),lr = lr, betas=[b1,b2],weight_decay=wd)
+        
+        
+        network.train(True)
+        # --------------------- TRAINING ---------------------
+        training_loss = train_one_epoch(network,Dataloader_training,loss_fn,optimizer_fn,fs_downsampled,device,miner_hard,Margin_loss)
+        
+        
+        temp_loss = temp_loss+training_loss
+        print('')
+        print('')
+        print('------------------------------------------------------')
+
+        
+        
+    average_loss = temp_loss/(EPOCHS)
+    # The loss has already been normalized in the one epoch training loop
+    average_loss_norm = average_loss
+    
+    return average_loss_norm
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ------------------------- EMBEDDING QUALITY METRICS -------------------------
+
 def Embedding_Scores(Embeddings,True_Labels,Visible = True):
     
     # ------------ K-MEANS ------------
@@ -2576,7 +3193,11 @@ def Embedding_Scores(Embeddings,True_Labels,Visible = True):
             origin="lower",
         )
         
-        plt.plot(reduced_data[:, 0], reduced_data[:, 1], "k.", markersize=2)
+        # plt.scatter(
+        #         reduced_data[:, 0], reduced_data[:, 1], c=True_Labels, s=10, cmap=plt.cm.Paired
+        #             )
+
+        plt.plot(reduced_data[:, 0], reduced_data[:, 1], "k.", markersize=10)
         # Plot the centroids as a white X
         centroids = kmeans.cluster_centers_
         plt.scatter(
@@ -2599,6 +3220,6 @@ def Embedding_Scores(Embeddings,True_Labels,Visible = True):
         plt.show()
         
         
-    return results 
+    return results,reduced_data
 
 
