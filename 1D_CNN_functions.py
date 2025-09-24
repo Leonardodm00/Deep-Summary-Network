@@ -1491,9 +1491,9 @@ Params:
     '''
     
     def __init__(self,input_fs=None, input_size = None,last_dropout=True, head_dropout=True, downsampling_rate=2, groups=8,
-              dropout_pers=0.2, Block_Type='ResNet_Block', width_shrink=4,
-              Network_depth=64, Stage_kernel=3, embedding_size=16,
-              Stem_augmentation=32, Stem_kernel=None, Stem_stride=None,Verbose=True,weight_multiplier = 2,device = None):
+              dropout_pers=0.2, Block_Type='ResNet_Block', width_shrink=5,
+              Network_depth=int(2**3), Stage_kernel=3, embedding_size=16,
+              Stem_augmentation=32, Stem_kernel=5, Stem_stride=4,Verbose=False,weight_multiplier = 2,device = None):
         
         
         super().__init__()  
