@@ -1,4 +1,5 @@
 
+
 import os
 import torch
 from torch import nn
@@ -29,68 +30,51 @@ import numpy as np
 import scipy.io
 import pdb
 
-'''
+# '''
 
-This code implements a flexible 1D_CNN architecure which itself can undergo hyperparameter tuning. It is insired on the work of Radosavovic et Al. (2020)
+# This code implements a flexible 1D_CNN architecure which itself can undergo hyperparameter tuning. It is insired on the work of Radosavovic et Al. (2020)
 
----------------------------------- HYPERPARAMETER TUNING ----------------------------------
-I can also make a shallow analysis on the various searched parameters influence on the reduction of the loss. Looking at the marginal profile. If it is flat than no correlation stands
-otherwise the HP afffects the performance.
-Two different tuning procedures:
-    1) Network architecture: for the body this focuses on depth, wm and block type. Gropus will be fixed to the suggested size of 16 and bottleneck fixed to 1. (d2l)
-                          Instead for the head: width_shrink and the embedding size. 
-    2) Training HP: ...   Network's margins,learning rates,leaky ReLu negative slope,
+# ---------------------------------- HYPERPARAMETER TUNING ----------------------------------
+# I can also make a shallow analysis on the various searched parameters influence on the reduction of the loss. Looking at the marginal profile. If it is flat than no correlation stands
+# otherwise the HP afffects the performance.
+# Two different tuning procedures:
+#     1) Network architecture: for the body this focuses on depth, wm and block type. Gropus will be fixed to the suggested size of 16 and bottleneck fixed to 1. (d2l)
+#                           Instead for the head: width_shrink and the embedding size. 
+#     2) Training HP: ...   Network's margins,learning rates,leaky ReLu negative slope,
 
-Once the architecture has been optimized the very same optimization approach is used to fine tuning the network's training hyperparameters.
-ALL the REGULARIZATION techniques will be implemented afterwards when the optimized network will be finally tested and the tuning on regularization techniques done
-to enhance its generalization performance on unseen data.
-
-
-------------- Network Architecture -------------
+# Once the architecture has been optimized the very same optimization approach is used to fine tuning the network's training hyperparameters.
+# ALL the REGULARIZATION techniques will be implemented afterwards when the optimized network will be finally tested and the tuning on regularization techniques done
+# to enhance its generalization performance on unseen data.
 
 
-Parameters' name:
+# ------------- Network Architecture -------------
+
+
+# Parameters' name:
     
-    Depth: d  ... It actually is the power of two --> if d=3 than the depth is 8 integer
-    Width multiplier: wm [1,4] integer 
-    Block type: blk [0,1] integer ... 0 = ResNet, 1 = ResNeXt
-    Width shrink: ws  [2,6] Integer
-    Embedding size: es [8,16] integer
+#     Depth: d  ... It actually is the power of two --> if d=3 than the depth is 8 integer
+#     Width multiplier: wm [1,4] integer 
+#     Block type: blk [0,1] integer ... 0 = ResNet, 1 = ResNeXt
+#     Width shrink: ws  [2,6] Integer
+#     Embedding size: es [8,16] integer
     
-NOTE: I don't think there are interdependent HP in this case, I just have some doubts about depth and width.
+# NOTE: I don't think there are interdependent HP in this case, I just have some doubts about depth and width.
 
-Main steps:
+# Main steps:
     
-Random initialization of the kernels and weigths results in Different network realizations which have different optimal hyperparameters which can 
-significanlty vary from one newtork to another. This suggests that different randomly generated networks need to be optimize independently.  
+# Random initialization of the kernels and weigths results in Different network realizations which have different optimal hyperparameters which can 
+# significanlty vary from one newtork to another. This suggests that different randomly generated networks need to be optimize independently.  
 
-Different trials with different seed shall be done, for this reason for each HP set 10 separate trainings will be done and the oveall mean final loss evaluated.
-In this pipeline there is a foundamental differnece with the epoch-based approach. At every iteration the model parameters are reset. Instead in th eepoch-based training the 
-params are kept toroughout the epochs.
-
-
-
-- First random search with full range sizes;
-- Second random search: unimportant HP are remuved and the remaining ones' 
-                ranges are narrowed within the 10% of the best values;
-- Choose median or best HP values;
+# Different trials with different seed shall be done, for this reason for each HP set 10 separate trainings will be done and the oveall mean final loss evaluated.
+# In this pipeline there is a foundamental differnece with the epoch-based approach. At every iteration the model parameters are reset. Instead in th eepoch-based training the 
+# params are kept toroughout the epochs.
 
 
 
-
-
-
-
-------------- Network/Training HP -------------
-
-The functional to minimize in this case MUST be normalized w.r.t the network's MARGINAL. It is a relative measure.
-The functional value that the Bayesian Optimizer tries to minimize is avg_loss/margin.
-
-Margin: mrg [0.1,1] Float
-Learing rate: lr [1e-4,1e-1] Float
-Beta 1: b1 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
-Beta 2: b2 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
-Weight decay: wd [1e-4,1e-2] Float
+# - First random search with full range sizes;
+# - Second random search: unimportant HP are remuved and the remaining ones' 
+#                 ranges are narrowed within the 10% of the best values;
+# - Choose median or best HP values;
 
 
 
@@ -98,76 +82,94 @@ Weight decay: wd [1e-4,1e-2] Float
 
 
 
-Searching algorithm: Bayesian Optimization by Gaussian Process.
+# ------------- Network/Training HP -------------
 
-This pipeline requires to use K-fold cross validation. (Doing some sort of it)  
+# The functional to minimize in this case MUST be normalized w.r.t the network's MARGINAL. It is a relative measure.
+# The functional value that the Bayesian Optimizer tries to minimize is avg_loss/margin.
 
-Evaluation metric is the average loss_fun. 
+# Margin: mrg [0.1,1] Float
+# Learing rate: lr [1e-4,1e-1] Float
+# Beta 1: b1 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
+# Beta 2: b2 [0.1,1] Float (intentionally NOT log prob indeed typical values approach 1)
+# Weight decay: wd [1e-4,1e-2] Float
 
 
-REFERENCES:
+
+
+
+
+
+# Searching algorithm: Bayesian Optimization by Gaussian Process.
+
+# This pipeline requires to use K-fold cross validation. (Doing some sort of it)  
+
+# Evaluation metric is the average loss_fun. 
+
+
+# REFERENCES:
 
     
-    Evaluation approach: Which Hype for my New Task? Hints and Random Search for Reservoir Computing Hyperparameters.
+#     Evaluation approach: Which Hype for my New Task? Hints and Random Search for Reservoir Computing Hyperparameters.
     
-    Bayesian Optimization algorithm: Scikit-optimize library.
+#     Bayesian Optimization algorithm: Scikit-optimize library.
 
 
 
 
 
-NOTES:
+# NOTES:
 
 
-    1) Tunable hyperparameters:
+#     1) Tunable hyperparameters:
     
-        Model: width, Kernel sizes, embedding size, depth, dropout, if LeakyReLu is used: negative slope magnitude etc...
+#         Model: width, Kernel sizes, embedding size, depth, dropout, if LeakyReLu is used: negative slope magnitude etc...
         
-        Optimizator: learning rate, weight decays (the two betas), etc...
+#         Optimizator: learning rate, weight decays (the two betas), etc...
         
         
-    2) Data labels: The traces of reference (control or specific pathologies) have ALL the same label. While surrogate ones MUST have only some common labels
-            to optimize training. Indeed if the Negative labels are ALL the same the trining would be inefficient and the might even not
-            converge at all. Therefore the strategy is to construct groups of negative instances by permutating the orginal mini-batch and then 
-            generate some relative positives.
+#     2) Data labels: The traces of reference (control or specific pathologies) have ALL the same label. While surrogate ones MUST have only some common labels
+#             to optimize training. Indeed if the Negative labels are ALL the same the trining would be inefficient and the might even not
+#             converge at all. Therefore the strategy is to construct groups of negative instances by permutating the orginal mini-batch and then 
+#             generate some relative positives.
                 
                 
-    3) Dataloader: we are handling timeseries data. The shuffle method randomly shuffles the single samples leading to a complete destruction
-            of the intrinsic temporal relationships. DO NOT USE IT if the dataseet is passed to the default DataLoader. With the costume one,
-            however, we devide the dataset into chunks (windows) which instead can be randomly chosen and shuffle set to True.
-            Batch_size determines the number of samples per batch, in the costum function a single sample is an entire window of size defined
-            (in seconds) fixed in the dataset_--- variable initialized before.
+#     3) Dataloader: we are handling timeseries data. The shuffle method randomly shuffles the single samples leading to a complete destruction
+#             of the intrinsic temporal relationships. DO NOT USE IT if the dataseet is passed to the default DataLoader. With the costume one,
+#             however, we devide the dataset into chunks (windows) which instead can be randomly chosen and shuffle set to True.
+#             Batch_size determines the number of samples per batch, in the costum function a single sample is an entire window of size defined
+#             (in seconds) fixed in the dataset_--- variable initialized before.
             
             
-    4) Validation loss function: The aim of the entire script is to set up a network that performs an embedding that lays the target neuronal dynamic 
-                    traces nearby and all others quite far. For this reason validation loss function is an euclidean distance. The 'MARGIN LOSS'
-                    function utilises the L2 norm (Euclidean distance),it works better than the contrastive loss. 
-                    Refer to: https://gombru.github.io/2019/04/03/ranking_loss/
+#     4) Validation loss function: The aim of the entire script is to set up a network that performs an embedding that lays the target neuronal dynamic 
+#                     traces nearby and all others quite far. For this reason validation loss function is an euclidean distance. The 'MARGIN LOSS'
+#                     function utilises the L2 norm (Euclidean distance),it works better than the contrastive loss. 
+#                     Refer to: https://gombru.github.io/2019/04/03/ranking_loss/
                     
                     
                 
-    5) In validation settings the Positive instances are not much variated from the referenc, just the shift is incremented to simulate the lag on an in-silico network. 
-    We will take two instances of control traces (two different control networks traces concatenated) and evaluate the tendency of the summary network to produce similar embeddings for such traces
+#     5) In validation settings the Positive instances are not much variated from the referenc, just the shift is incremented to simulate the lag on an in-silico network. 
+#     We will take two instances of control traces (two different control networks traces concatenated) and evaluate the tendency of the summary network to produce similar embeddings for such traces
 
  
-    6) The ADAMW algorithms and the embedding regularizer both have regularization mechanisms, it's not clear on what they act.
+#     6) The ADAMW algorithms and the embedding regularizer both have regularization mechanisms, it's not clear on what they act.
     
-    7) The MSE threshold used to distinguish Positive and Negative examples is highly sensitive to the overall time series length.
+#     7) The MSE threshold used to distinguish Positive and Negative examples is highly sensitive to the overall time series length.
 
-    8) The architecutre (especially the depth and width) differently process the sequence of data given the fs_downsample.
+#     8) The architecutre (especially the depth and width) differently process the sequence of data given the fs_downsample.
 
-    9) When embeddings are normalized, the euclidean norm equals the cosine similarity as distance metrics for the embeddings
+#     9) When embeddings are normalized, the euclidean norm equals the cosine similarity as distance metrics for the embeddings
 
-    10) The 'choose_subset' parameter in Data Augmentation function allows to take out randomly a certain number of positive and negative instances
+#     10) The 'choose_subset' parameter in Data Augmentation function allows to take out randomly a certain number of positive and negative instances
 
+#     11) The cumulative data is NORMALIZED (by default) w.r.t. the peak amplitude within the timeseries.
 
-REMEBER at each usage of the algorithm:
-    1) Output path
-    2) Change all the data loading paths in the HP optimization wrapper
-    3) Change the architecture HP prior running training optimization
-    4) Change ALL the optimized HP before final training
+# REMEBER at each usage of the algorithm:
+#     1) Output path
+#     2) Change all the data loading paths in the HP optimization wrapper
+#     3) Change the architecture HP prior running training optimization
+#     4) Change ALL the optimized HP before final training
     
-'''
+# '''
 
  #%%  
  
@@ -547,12 +549,11 @@ data_array = []
 for j in range(2):
     
     
-    smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+    smoothed_cumulative,fs_downsampled = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
     
+
     
-    cumulative_stdz = Standardization(smoothed_cumulative)
-    
-    data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+    data_array.append( torch.unsqueeze(torch.from_numpy(smoothed_cumulative),0).float() )
 
 data = torch.cat((data_array[0], data_array[1]), dim=1)
 
@@ -687,12 +688,10 @@ data_array = []
 for j in range(2):
     
     
-    smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+    smoothed_cumulative,fs_downsampled = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
     
-    
-    cumulative_stdz = Standardization(smoothed_cumulative)
-    
-    data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+ 
+    data_array.append( torch.unsqueeze(torch.from_numpy(smoothed_cumulative),0).float() )
 
 data = torch.cat((data_array[0], data_array[1]), dim=1)
 
@@ -718,12 +717,11 @@ Training_data_length = closest_power_of_2(window_size_temp)
 Char_folder_array = r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Group02_Well14'
 Char_base_array = r'ptrain_Group02_Well14_'
 
-smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array,Char_base=Char_base_array,w_size=0.02,Gaussian_window=0.04)
+smoothed_cumulative,fs_downsampled = Neuronal_traces(Visible=False,Char_folder=Char_folder_array,Char_base=Char_base_array,w_size=0.02,Gaussian_window=0.04)
 
 
-cumulative_stdz = Standardization(smoothed_cumulative)
 
-data =  torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() 
+data =  torch.unsqueeze(torch.from_numpy(smoothed_cumulative),0).float() 
 
 
 Dataset_patho = TimeSeriesDataset(data,fs=fs_downsampled,window_size_s=Dataset_training_window_size_s)
@@ -802,4 +800,3 @@ plt.show()
 # Save only the state dictionary
 PATH = "Main_Model_.pt"
 torch.save(network.state_dict(), PATH)
-
