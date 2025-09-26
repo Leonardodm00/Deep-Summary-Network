@@ -1,4 +1,3 @@
-
 import torch
 from torch.utils.data import Dataset, TensorDataset, DataLoader, RandomSampler
 from torch import nn
@@ -871,6 +870,27 @@ def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 6
     # Calculate NBs
     # You would need to define Rect_window in Python
     if Type == 'PCA':
+        [Cumulative, t_vec, step_s] = Rect_window(fs, w_size, overlap, data, T_max)
+        
+        [IFR, bin_size,window_size] = Get_IFR(data,fs,Cumulative,t_vec,step_s,bin_size_s,Isolate_NB,T_max);
+            
+      
+        fs_downsampled = 1/bin_size_s
+        
+    
+      
+        [IFR_smoothed, IFR_smoothed_concatenated] = Smoothed_IFR(IFR, bin_size,window_size,fs_downsampled,Isolate_NB,Gaussian_window,Visible);
+    
+    
+    
+        [Variance_explained, Projected_trajectories,Coefficients,NB_IFR_PCA_mean] = get_PCA(IFR_smoothed_concatenated,IFR_smoothed,Isolate_NB,Visible);
+    
+        
+    
+        return Projected_trajectories,Variance_explained,fs_downsampled
+    
+    
+    elif Type == 'Cumulative':
         overlap = 0
         [Cumulative, t_vec, step_s] = Rect_window(fs, w_size, overlap, data, T_max)
         
@@ -909,9 +929,8 @@ def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 6
                 plt.xlabel('Time [s]')
                 plt.ylabel('Normalized and Smoothed IFR')
                 plt.show()
-            
-        
-        
+
+       
         return smoothed_cumulative,fs_downsampled
  
     
@@ -1140,8 +1159,8 @@ def log_uniform(low, high, size=1):
     return log_uniform_samples
 
 
-def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_range= [0.35,0.1],sigma_scale_range= [0.4,0.01],
-                      MSE_threshold= 0.01,fs = None, shift_magnitude_s=30,choose_subset=False,Visible = False):
+def Data_Augmentation(data,n_versions_insatances,n_param_vector,intra_knot_dist_range= [0.30,0.1],sigma_scale_range= [0.4,0.01],
+                      MSE_threshold= 0.0002,fs = None, shift_magnitude_s=30,choose_subset=False,Visible = False):
     '''
     
     This data augmentation algorithm first generates a certain number of surrogates and then splits negatives and 
@@ -1564,7 +1583,7 @@ Params:
         
         
     
-    def forward(self, X,fs=None,State='Embedding',n_repl=10,n_repl_params=20,choose_subset=False) :
+    def forward(self, X,fs=None,State='Embedding',n_repl=15,n_repl_params=20,choose_subset=False) :
         '''
         
         The input tensor size required from the 1DCNN cell is (N,C_in,L) 
@@ -3210,4 +3229,3 @@ def Embedding_Scores(Embeddings,True_Labels,Visible = True):
         
         
     return results,reduced_data
-
