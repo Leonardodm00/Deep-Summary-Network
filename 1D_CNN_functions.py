@@ -803,8 +803,9 @@ def calculate_mean_burst_duration(time_series_data, fs,scal_factor = 0.5, Visibl
     return np.mean(burst_durations)  
 
 def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 600, fs = 10000, w_size = 0.02, overlap = 0.06, 
-                    bin_size_s = 0.05, Isolate_NB = False, Gaussian_window = 0.1,
-                     Visible = False,NB_statistics = True):
+                    bin_size_s = 0.05, Isolate_NB = False, Gaussian_window = 0.04,
+                     Visible = False,NB_statistics = False,Normalization_type = 'Peak amplitude'):
+    
     
     # Raster_array = nx2, 1st column the channel's idx, 2nd column the timing of spike
     # Type = PCA or Cumulative. PCA = Usual neuronal dynamics, Cumulative= Cumulative IFR on all the electrodes.
@@ -870,27 +871,6 @@ def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 6
     # Calculate NBs
     # You would need to define Rect_window in Python
     if Type == 'PCA':
-        [Cumulative, t_vec, step_s] = Rect_window(fs, w_size, overlap, data, T_max)
-        
-        [IFR, bin_size,window_size] = Get_IFR(data,fs,Cumulative,t_vec,step_s,bin_size_s,Isolate_NB,T_max);
-            
-   
-        fs_downsampled = 1/bin_size_s
-        
-    
-   
-        [IFR_smoothed, IFR_smoothed_concatenated] = Smoothed_IFR(IFR, bin_size,window_size,fs_downsampled,Isolate_NB,Gaussian_window,Visible);
-    
-    
-    
-        [Variance_explained, Projected_trajectories,Coefficients,NB_IFR_PCA_mean] = get_PCA(IFR_smoothed_concatenated,IFR_smoothed,Isolate_NB,Visible);
-    
-        
-    
-        return Projected_trajectories,Variance_explained,fs_downsampled
-    
-    
-    elif Type == 'Cumulative':
         overlap = 0
         [Cumulative, t_vec, step_s] = Rect_window(fs, w_size, overlap, data, T_max)
         
@@ -898,30 +878,41 @@ def Neuronal_traces(Char_folder=None,Char_base=None,Type ='Cumulative',t_rec = 6
         fs_downsampled = 1/w_size
         
         
-        smoothed_cumulative =  get_Smoothed_Cumulative(Cumulative,fs_downsampled,Gaussian_window)
+        smoothed_cumulative =  get_Smoothed_Cumulative(Cumulative,fs_downsampled,Gaussian_window) 
         
         
-        if Visible == True:
+        if Normalization_type == 'Standardization':
+            print('Cumulative traces are STANDARDIZED')
+            smoothed_cumulative = Standardization(smoothed_cumulative)
+        
+            if Visible == True:
+                
+                plt.figure()
+                plt.plot(t_vec/fs,smoothed_cumulative,color = 'r')
+                # plt.plot(t_vec,Cumulative,color = 'b')
+                plt.xlabel('Time [s]')
+                plt.ylabel('Standardized and Smoothed IFR')
+                plt.show()
+                
+                
+        elif Normalization_type == 'Peak amplitude':
+            print('Cumulative traces are NORMALIZED')
             
-            plt.figure()
-            plt.plot(t_vec*fs_downsampled,smoothed_cumulative)
-            plt.xlabel('Time [s]')
-            plt.ylabel('IFR')
-            plt.show()
+            peak_amplitude = np.max(smoothed_cumulative)
             
-            
-            
-        if NB_statistics:
-            
-            MBD = calculate_mean_burst_duration(smoothed_cumulative, fs_downsampled)
-            
-            
-            
-            
+            smoothed_cumulative = smoothed_cumulative/peak_amplitude
+            if Visible == True:
+                
+                plt.figure()
+                plt.plot(t_vec/fs,smoothed_cumulative,color = 'r')
+                # plt.plot(t_vec,Cumulative,color = 'b')
+                plt.xlabel('Time [s]')
+                plt.ylabel('Normalized and Smoothed IFR')
+                plt.show()
             
         
         
-        return smoothed_cumulative,fs_downsampled, MBD
+        return smoothed_cumulative,fs_downsampled
  
     
 # --------------------------------- DATA AUGMENTATION ---------------------------------
@@ -1490,10 +1481,10 @@ Params:
     
     '''
     
-    def __init__(self,input_fs=None, input_size = None,last_dropout=True, head_dropout=True, downsampling_rate=2, groups=8,
+    def __init__(self,input_fs=None, input_size = None,last_dropout=False, head_dropout=True, downsampling_rate=2, groups=16,
               dropout_pers=0.2, Block_Type='ResNet_Block', width_shrink=5,
               Network_depth=int(2**3), Stage_kernel=3, embedding_size=16,
-              Stem_augmentation=32, Stem_kernel=5, Stem_stride=4,Verbose=False,weight_multiplier = 2,device = None):
+              Stem_augmentation=16, Stem_kernel=5, Stem_stride=4,Verbose=False,weight_multiplier = 2,device = None):
         
         
         super().__init__()  
@@ -2733,12 +2724,11 @@ def OneD_CNN_Arch_Wrapper(Params):
     for j in range(2):
         
         
-        smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+        smoothed_cumulative,fs_downsampled = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
         
+
         
-        cumulative_stdz = Standardization(smoothed_cumulative)
-        
-        data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+        data_array.append( torch.unsqueeze(torch.from_numpy(smoothed_cumulative),0).float() )
 
     data = torch.cat((data_array[0], data_array[1]), dim=1)
 
@@ -2982,12 +2972,11 @@ def OneD_CNN_Train_Wrapper(Params):
     for j in range(2):
         
         
-        smoothed_cumulative,fs_downsampled,MBD = Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
+        smoothed_cumulative,fs_downsampled= Neuronal_traces(Visible=False,Char_folder=Char_folder_array[j],Char_base=Char_base_array[j],w_size=0.02,Gaussian_window=0.04)
         
+
         
-        cumulative_stdz = Standardization(smoothed_cumulative)
-        
-        data_array.append( torch.unsqueeze(torch.from_numpy(cumulative_stdz),0).float() )
+        data_array.append( torch.unsqueeze(torch.from_numpy(smoothed_cumulative),0).float() )
 
     data = torch.cat((data_array[0], data_array[1]), dim=1)
 
@@ -3221,5 +3210,4 @@ def Embedding_Scores(Embeddings,True_Labels,Visible = True):
         
         
     return results,reduced_data
-
 
