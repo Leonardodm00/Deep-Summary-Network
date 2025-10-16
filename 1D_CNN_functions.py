@@ -1,3 +1,4 @@
+
 import torch
 from torch.utils.data import Dataset, TensorDataset, DataLoader, RandomSampler
 from torch import nn
@@ -95,6 +96,9 @@ NOTES:
         for the last block in a stage.
     4) Dropout position is controvelsial, some suggest ot put it just after the linear projection (the conv. layer)
         others after the non linear activation function.
+    5) For computational reasons the Architecture will be optimized on CPU. In fact this should allow parallelizations
+        through multiprocessing. this is done by setting device = torch.device("cpu") otherwise device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
 '''
 
 
@@ -2736,6 +2740,7 @@ def OneD_CNN_Arch_Wrapper(Params):
     print('')
     print('-------------------- Loading data --------------------')
     # --------------------- PREPARE THE DATASET ---------------------
+    #!!! CHANGE DIRECTORIES
     Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
     Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
 
@@ -2763,7 +2768,7 @@ def OneD_CNN_Arch_Wrapper(Params):
     # Create the DataLoader
     Dataloader_training = DataLoader(Dataset_training, 
                             batch_size=1, 
-                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=120),
+                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=180),
                             shuffle=False, 
                             drop_last=True) # drop_last is important to ensure all batches have the same size
 
@@ -2773,13 +2778,14 @@ def OneD_CNN_Arch_Wrapper(Params):
 
     # Find the window size closest to a power of two
     Training_data_length = closest_power_of_2(window_size_temp)
+    print('Training data length: {Training_data_length/fs_downsampled} (in seconds)' )
 
 
 
 
 
     # --- SET DEVICE ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Using device: {device}")
            
             
@@ -2910,6 +2916,7 @@ def OneD_CNN_Train_Wrapper(Params):
     # ---------------- CHANGE OPTIMIZED PARAMETERS ----------------
     
     # Optimized parameters from previous phase
+    #!!! CHANGE ARCHITECTURAL HYPER-PARAMS
     d   = 3
     wm  = 2
     blk = int(0)
@@ -2984,6 +2991,7 @@ def OneD_CNN_Train_Wrapper(Params):
     print('')
     print('-------------------- Loading data --------------------')
     # --------------------- PREPARE THE DATASET ---------------------
+    #!!! CHANGE DIRECTORIES
     Char_folder_array = [r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well11',r'C:\Users\Admin\Desktop\Leonardo\Neuronal Dynamic\Nuova cartella\ptrain_Control00_Well17']
     Char_base_array = ['ptrain_Control00_Well11_','ptrain_Control00_Well17_']
 
@@ -3011,7 +3019,7 @@ def OneD_CNN_Train_Wrapper(Params):
     # Create the DataLoader
     Dataloader_training = DataLoader(Dataset_training, 
                             batch_size=1, 
-                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=120),
+                            sampler=RandomSampler(Dataset_training,replacement=True, num_samples=180),
                             shuffle=False, 
                             drop_last=True) # drop_last is important to ensure all batches have the same size
 
@@ -3027,7 +3035,7 @@ def OneD_CNN_Train_Wrapper(Params):
 
 
     # --- SET DEVICE ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Using device: {device}")
            
             
