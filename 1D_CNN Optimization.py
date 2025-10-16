@@ -163,15 +163,19 @@ import pdb
 
 #     11) The cumulative data is NORMALIZED (by default) w.r.t. the peak amplitude within the timeseries.
 
+#     12) For computational reasons the Architecture will be optimized on CPU. In fact this should allow parallelizations
+    # through multiprocessing. this is done by setting device = torch.device("cpu") otherwise device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 # REMEBER at each usage of the algorithm:
 #     1) Output path
-#     2) Change all the data loading paths in the HP optimization wrapper
-#     3) Change the architecture HP prior running training optimization
-#     4) Change ALL the optimized HP before final training
+#     2) Change all the data loading paths in the HP optimization wrapper  (Ausiliary code)
+#     3) Change the architecture HP prior running training optimization (Ausiliary code)
+#     4) Change ALL the optimized HP before final training  (Ausiliary code)
     
 # '''
 
- #%%  
+ #%  
  
  
  
@@ -381,6 +385,7 @@ space = [mrg,
 
 
 # ------- Run the gp -------
+#!!! CHANGE ARCHITECTURAL HYPERPARAMS
 from skopt import gp_minimize
 res_gp = gp_minimize(OneD_CNN_Train_Wrapper, space, n_calls=100, random_state=0,verbose=True)
 
@@ -466,7 +471,7 @@ Network training after architecture and training optimizations has been performe
 
 
 # ---------------- ARCHITECTURE OPTIMIZED H-PARAMETERS ----------------
-
+#!!! CHANGE ARCHITECTURAL HYPERPARAMS
 # Optimized parameters from previous phase
 d   = 3
 wm  = 2
@@ -499,6 +504,7 @@ print('------------------------------------------------------')
 
 
 # ---------------- TRAINING OPTIMIZED H-PARAMETERS ----------------
+#!!! CHANGE TRAINING HYPERPARAMS
 mrg = 0.8
 lr  = 0.0015
 b1  = 0.1
@@ -585,7 +591,7 @@ Training_data_length = closest_power_of_2(window_size_temp)
 
 
 # --- SET DEVICE ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 print(f"Using device: {device}")
        
         
@@ -604,6 +610,7 @@ network = OneD_CNN(input_fs=fs_downsampled, input_size=Training_data_length, las
      
 
 # ------- Load the network on the device -------
+
 network = network.to(device)
         
 
