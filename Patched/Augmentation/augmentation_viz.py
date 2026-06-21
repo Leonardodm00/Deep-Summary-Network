@@ -28,7 +28,7 @@ import os
 from typing import Optional
 
 import matplotlib
-matplotlib.use("Agg")          # headless backend — no display on compute nodes
+matplotlib.use("Agg")          # headless backend  no display on compute nodes
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -98,7 +98,7 @@ def plot_triplet_instance(
     ¦  (pre-shift)         ¦  (post-shift)        ¦
     +---------------------------------------------+
 
-    WITHOUT pre-shift (2 panels, 2 × 1)  — backward-compatible fallback
+    WITHOUT pre-shift (2 panels, 2 × 1)   backward-compatible fallback
     ---------------------------------
     +----------------------------------------------+
     ¦  POSITIVES  warp + shift                     ¦
@@ -108,23 +108,23 @@ def plot_triplet_instance(
 
     Parameters
     ----------
-    anchor          : (1, T) or (T,) tensor — clean unshifted window.
-    positives       : (P, T) tensor — profile-preserving surrogates, POST-shift.
-    negatives       : (N, T) tensor — profile-destroying surrogates, POST-shift.
-    fs              : sampling rate f_s  [Hz] — x-axis plotted in seconds.
+    anchor          : (1, T) or (T,) tensor  clean unshifted window.
+    positives       : (P, T) tensor  profile-preserving surrogates, POST-shift.
+    negatives       : (N, T) tensor  profile-destroying surrogates, POST-shift.
+    fs              : sampling rate f_s  [Hz]  x-axis plotted in seconds.
     out_dir         : directory for the PNG (created if missing).
     instance_id     : integer used in the filename  triplet_{id:03d}.png.
     max_curves      : max surrogates drawn per panel (random subsample).
     title           : optional suptitle string.
     seed            : RNG seed for the subsampling (reproducible).
-    positives_pre   : (P, T) tensor — same positives BEFORE the circular shift.
+    positives_pre   : (P, T) tensor  same positives BEFORE the circular shift.
                       When supplied (together with negatives_pre), the 4-panel
                       layout is used so the pure warp effect is visible.
-    negatives_pre   : (N, T) tensor — same negatives BEFORE the circular shift.
+    negatives_pre   : (N, T) tensor  same negatives BEFORE the circular shift.
 
     Returns
     -------
-    out_path : str — absolute path of the written PNG.
+    out_path : str  absolute path of the written PNG.
     """
     os.makedirs(out_dir, exist_ok=True)
     rng = np.random.default_rng(seed)
@@ -153,10 +153,10 @@ def plot_triplet_instance(
         )
 
         # column headings (drawn as centered text above each column)
-        fig.text(0.30, 0.97, "warp only  —  pre-shift",
+        fig.text(0.30, 0.97, "warp only    pre-shift",
                  ha="center", va="top", fontsize=10, fontweight="bold",
                  color="dimgray")
-        fig.text(0.73, 0.97, "warp + shift  —  post-shift",
+        fig.text(0.73, 0.97, "warp + shift    post-shift",
                  ha="center", va="top", fontsize=10, fontweight="bold",
                  color="dimgray")
 
