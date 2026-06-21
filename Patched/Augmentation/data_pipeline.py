@@ -198,11 +198,14 @@ class MEAWindowDataset(Dataset):
         ti, s, cond = self.index[i]
         window = self.traces[ti][s:s + self.window_length]
         window = torch.from_numpy(np.ascontiguousarray(window)).float()
-        anchor, positives, negatives = build_triplet_instance(window, self.aug_cfg, self.rng)
+        anchor, positives, negatives, pos_pre, neg_pre = build_triplet_instance(
+            window, self.aug_cfg, self.rng, return_pre_shift=True)
         return {
-            "anchor": anchor,            # (1, T)
-            "positives": positives,      # (1+P, T)  -- condition label
-            "negatives": negatives,      # (N, T)    -- unique negatives
+            "anchor":        anchor,     # (1, T)   clean unshifted window
+            "positives":     positives,  # (1+P, T) warp + shift (network input)
+            "negatives":     negatives,  # (N, T)   warp + shift (network input)
+            "pos_pre_shift": pos_pre,    # (1+P, T) warp only    (viz only)
+            "neg_pre_shift": neg_pre,    # (N, T)   warp only    (viz only)
             "condition": int(cond),
             "meta": (ti, s),
         }
