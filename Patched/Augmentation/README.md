@@ -63,4 +63,25 @@ python -u run_data_pipeline.py \
 | 1 | `closest_power_of_2` convention: **nearest** (current) vs **floor** — must match the encoder engine | `data_pipeline.py`, `closest_power_of_2()` |
 | 2 | Real-mode import: set `from <your_engine_module> import Neuronal_traces` to the actual filename | `run_data_pipeline.py`, `load_traces()` |
 | 3 | σ bands in `AugmentationConfig` are placeholders (`[TUNE]`); tune against the measured burst time scale $\tau_{\text{burst}}$ (from `calculate_mean_burst_duration`) | `augmentation.py`, `AugmentationConfig` |
+
+
+
+# 1. generate the dataset (writes ./burst_data/ : 3 × .npz, 3 × raster PNG, burst_specs.json)
+python generate_burst_data.py
+
+# 2a. validate the WHOLE Topic-1 pipeline on that data (33 checks, run twice)
+python smoke_test_burst_pipeline.py
+
+# 2b. run the front-end on that data and emit the augmentation figures
+python -u run_data_pipeline.py \
+    --data-mode numpy \
+    --npz-specs ./burst_data/burst_specs.json \
+    --window-s 30 --stride-s 15 \
+    --split-method warp_bands \
+    --n-debug-plots 6 \
+    --out-dir ./pipeline_out_burst
+
+
+
+
 | 4 | `--num-workers` should equal the CPUs-per-task granted by the SLURM allocation | CLI flag |
