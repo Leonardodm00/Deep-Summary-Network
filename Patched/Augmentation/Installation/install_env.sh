@@ -24,8 +24,7 @@
 #           # check with: module avail conda | module avail miniconda
 #
 #   (c) Run from a compute / build node, NOT the login node:
-#           srun --pty --ntasks=1 --cpus-per-task=4 --time=01:00:00 bash
-#           # or: qsub -I / salloc (depending on scheduler flavour)
+#           qsub -I -l select=1:ncpus=4:ngpus=1 -l walltime=01:00:00
 #
 # Usage
 # -----
@@ -70,12 +69,12 @@ for arg in "$@"; do
 done
 
 # ── 1. login-node guard ───────────────────────────────────────────────────────
-# On SLURM systems the SLURM_JOB_ID variable is only set on compute nodes.
-if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-    warn "SLURM_JOB_ID is not set — you may be on a login node."
+# On PBS systems PBS_JOBID is only set when running inside a job (batch or interactive).
+if [[ -z "${PBS_JOBID:-}" ]]; then
+    warn "PBS_JOBID is not set — you may be on a login node."
     warn "Heavy installs on login nodes can get killed and may be"
     warn "against site policy. To get an interactive compute node run:"
-    warn "    srun --pty --ntasks=1 --cpus-per-task=4 --time=01:00:00 bash"
+    warn "    qsub -I -l select=1:ncpus=4:ngpus=1 -l walltime=01:00:00"
     echo ""
     read -rp "  Continue anyway? [y/N] " yn
     [[ "$yn" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
