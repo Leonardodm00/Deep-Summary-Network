@@ -281,7 +281,8 @@ def _split_percentile_mse(pool: torch.Tensor, anchor: torch.Tensor, q: float):
     return pool[pos_mask], pool[~pos_mask]
 
 
-def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Generator):
+def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Generator,
+                           return_pre_shift: bool = False):
     """
     Build one anchor's contrastive instance.
 
@@ -331,11 +332,20 @@ def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Gener
             "negative classes after retries; check sigma bands / percentile_q."
         )
 
-    # split-before-shift: shift both classes (label-preserving translation aug)
+    # anchor: always clean and unshifted (matches the inference distribution)
+    anchor = window.reshape(1, -1)
+
+    # PRE-SHIFT: capture surrogates before translation so the plotter can
+    # show the pure warp effect with no circular-shift confound.
+    pos_pre_shift = torch.cat([anchor, pos], dim=0)
+    neg_pre_shift = neg.clone()
+
+    # apply label-preserving circular shift to both surrogate classes
     pos = random_circular_shift(pos, cfg.shift_magnitude_s, cfg.fs, rng)
     neg = random_circular_shift(neg, cfg.shift_magnitude_s, cfg.fs, rng)
 
-    # include the clean (unshifted) anchor among the positives
-    anchor = window.reshape(1, -1)
     positives = torch.cat([anchor, pos], dim=0)
+
+    if return_pre_shift:
+        return anchor, positives, neg, pos_pre_shift, neg_pre_shift
     return anchor, positives, neg
