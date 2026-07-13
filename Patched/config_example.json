@@ -1,0 +1,45 @@
+{
+  "data": {
+    "data_mode": "synthetic",
+    "window_s": 30.0,
+    "train_stride_s": 15.0,
+    "eval_stride_s": 30.0,
+    "split_fractions": [0.6, 0.2, 0.2],
+    "synthetic_duration_s": 600.0,
+    "synthetic_fs": 50.0,
+    "synthetic_n_per_class": [3, 3],
+    "augmentation": {
+      "fs": 50.0,
+      "n_positives": 8,
+      "n_negatives": 8,
+      "shift_magnitude_s": 5.0
+    }
+  },
+  "backbone": {
+    "stem_width": 16
+  },
+  "train": {
+    "windows_per_condition": 4,
+    "batches_per_epoch": 0,
+    "n_seeds": 3,
+    "max_epochs": 60,
+    "patience": 10
+  },
+  "search": {
+    "depth_exponent_range": [3, 5],
+    "width_multiplier_range": [1.5, 2.5],
+    "embedding_size_range": [8, 16],
+    "n_calls_arch": 30,
+    "n_calls_train": 30
+  },
+  "regularization": {
+    "n_calls": 20
+  },
+  "runtime": {
+    "device": "cpu",
+    "num_workers": 0,
+    "out_dir": "out",
+    "cache_dir": "cache",
+    "experiment_name": "run1"
+  }
+}
