@@ -1,0 +1,142 @@
+#!/bin/bash
+# =============================================================================
+# run_search_cpu.pbs -- full 3-class synthetic optimization/search on davinci-1
+#                       (Leonardo S.p.A., PBS), CPU by default.
+# =============================================================================
+#
+# Submit with:   qsub run_search_cpu.pbs
+# Watch with:    qstat -u $USER        (job state)   /   tail -f search.out
+#
+# -----------------------------------------------------------------------------
+# HOW TO CHANGE THE SEARCH BUDGET (the 15/15/10 -> 30/30/20 knob you asked for)
+# -----------------------------------------------------------------------------
+# Edit the five numbers in the "BUDGET" block below. They are passed to
+# run_optimization.py as --n-calls-* / --n-seeds / --max-epochs overrides, which
+# WIN over whatever is in the JSON config -- so you never edit the JSON to
+# resize the run. Rough CPU cost at ~25 s/epoch (measure yours with
+# estimate_walltime.py, do not trust this number blindly):
+#
+#   N_ARCH  N_TRAIN  N_REG  N_SEEDS  MAX_EPOCHS   total runs   ~hours @25s/ep
+#     15      15      10       2         50            82         ~28   (default)
+#     20      20      12       2         60           106         ~44
+#     30      30      20       3         60           243        ~101   (full)
+#
+# After changing the budget, ALSO update the #PBS -l walltime line to match
+# (leave headroom: +30% over the estimate is a good default).
+# -----------------------------------------------------------------------------
+#
+# HOW TO SWITCH TO GPU (three edits, all marked "GPU SWITCH" below):
+#   1. #PBS select line: add ":ngpus=1"
+#   2. uncomment the "module load cuda/12.1" line
+#   3. set DEVICE="cuda" in the RUN block
+# and make sure you set up a GPU env first:  bash setup_env_davinci.sh
+#   --env-name <your_gpu_env> --gpu
+#
+# HPC note (hpc-python-compat): pure ASCII, no non-ASCII bytes, safe across any
+# Windows/MobaXterm transfer.
+# =============================================================================
+
+# --------------------------------------------------------------------------- #
+# PBS directives
+# --------------------------------------------------------------------------- #
+#PBS -N search_3class
+#PBS -l select=1:ncpus=8
+#                          ^^^^^^^  GPU SWITCH: change to
+#                          select=1:ncpus=8:ngpus=1
+#PBS -l walltime=40:00:00
+#                ^^^^^^^^  sized for the ~28 h default budget + margin.
+#                          UPDATE THIS if you change the BUDGET block below.
+#PBS -o search.out
+#PBS -e search.err
+#PBS -j oe
+#                (merge stderr into stdout so you have one log to tail)
+
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# BUDGET  -- edit these five numbers to resize the search (see header table)
+# --------------------------------------------------------------------------- #
+N_ARCH=15          # search.n_calls_arch   (phase 1 BO trials)
+N_TRAIN=15         # search.n_calls_train  (phase 2 BO trials)
+N_REG=10           # regularization.n_calls
+N_SEEDS=2          # train.n_seeds  (seeds averaged per trial)
+MAX_EPOCHS=50      # train.max_epochs (UPPER bound; early stopping may end sooner)
+
+# --------------------------------------------------------------------------- #
+# RUN configuration
+# --------------------------------------------------------------------------- #
+CONFIG="config_search_3class_hpc.json"
+EXPERIMENT="search_3class_hpc"
+DEVICE="cpu"                 # GPU SWITCH: set to "cuda"
+CONDA_ENV="REPLACE_WITH_YOUR_ENV_NAME"   # <-- the name you passed to
+                                         #     setup_env_davinci.sh --env-name
+
+# --------------------------------------------------------------------------- #
+# 1. go to the directory the job was submitted from
+# --------------------------------------------------------------------------- #
+cd "$PBS_O_WORKDIR"
+echo "[job] host        : $(hostname)"
+echo "[job] workdir     : $PBS_O_WORKDIR"
+echo "[job] started     : $(date)"
+echo "[job] budget      : arch=$N_ARCH train=$N_TRAIN reg=$N_REG seeds=$N_SEEDS max_epochs=$MAX_EPOCHS"
+
+# --------------------------------------------------------------------------- #
+# 2. environment
+# --------------------------------------------------------------------------- #
+module load miniconda3
+# GPU SWITCH: uncomment the next line when running on a GPU node
+# module load cuda/12.1
+
+# activate the conda env (the LD_LIBRARY_PATH libstdc++ hook fires here)
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$CONDA_ENV"
+
+# belt-and-suspenders: guarantee the env's libstdc++ wins even if the hook
+# did not run for some reason (davinci-1 GLIBCXX_3.4.26 fix)
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+echo "[job] python      : $(which python)  ($(python --version 2>&1))"
+
+# --------------------------------------------------------------------------- #
+# 3. pre-flight: fail fast on a broken env BEFORE burning walltime
+# --------------------------------------------------------------------------- #
+if [[ -f verify_env_hpc.py ]]; then
+    echo "[job] running verify_env_hpc.py ..."
+    python verify_env_hpc.py
+fi
+
+# dry-run: prints the resolved budget and confirms the data/splits are feasible.
+# Cheap, trains nothing; a config error dies here in seconds instead of hours.
+echo "[job] dry-run pre-flight ..."
+python -u run_optimization.py \
+    --config "$CONFIG" \
+    --device "$DEVICE" \
+    --n-calls-arch  "$N_ARCH" \
+    --n-calls-train "$N_TRAIN" \
+    --n-calls-reg   "$N_REG" \
+    --n-seeds       "$N_SEEDS" \
+    --max-epochs    "$MAX_EPOCHS" \
+    --out-dir  "$PBS_O_WORKDIR/out" \
+    --cache-dir "$PBS_O_WORKDIR/cache" \
+    --experiment-name "$EXPERIMENT" \
+    --dry-run
+
+# --------------------------------------------------------------------------- #
+# 4. the real run
+# --------------------------------------------------------------------------- #
+echo "[job] launching full search ..."
+python -u run_optimization.py \
+    --config "$CONFIG" \
+    --device "$DEVICE" \
+    --n-calls-arch  "$N_ARCH" \
+    --n-calls-train "$N_TRAIN" \
+    --n-calls-reg   "$N_REG" \
+    --n-seeds       "$N_SEEDS" \
+    --max-epochs    "$MAX_EPOCHS" \
+    --out-dir  "$PBS_O_WORKDIR/out" \
+    --cache-dir "$PBS_O_WORKDIR/cache" \
+    --experiment-name "$EXPERIMENT" \
+    --verbose
+
+echo "[job] finished    : $(date)"
+echo "[job] results in  : $PBS_O_WORKDIR/out/$EXPERIMENT/"
