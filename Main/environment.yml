@@ -1,0 +1,63 @@
+# =============================================================================
+# environment.yml -- meacnn conda environment
+# =============================================================================
+#
+# Full dependency specification for the 1D-CNN MEA contrastive pipeline
+# (Topics 1-3). Covers: data augmentation, contrastive DataLoader, the
+# RegNet-style 1D encoder, triplet-metric learning, HPO (skopt + optuna),
+# and embedding evaluation (sklearn).
+#
+# IMPORTANT -- PyTorch is NOT listed here.
+# It must be installed AFTER this environment is created by install_env.sh,
+# which auto-detects the node's CUDA version and fetches the matching wheel.
+# Adding torch here would install the CPU-only conda-forge build, which is
+# silent but wrong on a GPU node.
+#
+# Usage (always via install_env.sh, never directly)
+# -------------------------------------------------
+#   bash install_env.sh          # reads this file; handles torch separately
+#   conda activate meacnn
+#   python verify_env.py
+#
+# To update a single package without rebuilding the whole env:
+#   conda activate meacnn && pip install --upgrade <package>
+# =============================================================================
+
+name: meacnn
+
+channels:
+  - conda-forge          # primary: most up-to-date, consistent ABI
+  - defaults             # fallback for packages absent from conda-forge
+
+dependencies:
+  # -- Python interpreter ----------------------------------------------------
+  - python=3.11          # 3.11: stable, widely supported on HPC, GIL-aware
+
+  # -- core scientific stack -------------------------------------------------
+  #    Pinned to the MINOR version so patch-level updates are still applied
+  #    by `conda update --all`, but no ABI-breaking minor bumps happen silently.
+
+  - numpy=1.26           # np.random.default_rng, np.histogram
+                         # (1.26 = last stable 1.x; tested with torch 2.x)
+  - scipy=1.13           # CubicSpline (not-a-knot), gaussian_filter1d
+  - matplotlib=3.9       # Agg backend (headless HPC), fill_between, scatter
+  - scikit-learn=1.5     # KMeans, PCA, ARI, AMI, MSE
+
+  # -- utilities -------------------------------------------------------------
+  - tqdm>=4.65           # training-loop progress bars
+
+  # -- pip bridge ------------------------------------------------------------
+  #    Packages only available on PyPI, or whose conda builds lag too far
+  #    behind the PyPI ones, are installed via pip AFTER the conda solve.
+  #    install_env.sh installs torch first (CUDA-specific URL), then these.
+  - pip
+
+  - pip:
+    # Hyperparameter optimisation (current: skopt; Topic-3 upgrade: optuna)
+    - scikit-optimize>=0.9,<0.11   # gp_minimize, Real, Integer, plot_objective
+    - optuna>=3.4                   # parallel HPO upgrade path for Topic 3
+
+    # Metric learning (must come AFTER torch is installed)
+    - pytorch-metric-learning>=2.3  # TripletMarginLoss, TripletMarginMiner,
+                                    # AvgNonZeroReducer, CosineSimilarity,
+                                    # LpDistance, LpRegularizer
