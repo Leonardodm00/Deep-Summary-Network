@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -N chsub_extract
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -o chsub_extract.log
+
+# ---- adjust these three for davinci-1 ----
+source ~/.bashrc
+conda activate brian_env          # your env with numpy/scipy/matplotlib
+cd "$PBS_O_WORKDIR"               # dir containing the .py files
+
+FOLDER=/path/to/recording_folder  # holds ptrain_<idx>.mat
+OUT=/path/to/output_dir
+MODE=multichannel                 # multichannel | per_region_single | whole_culture
+
+python3 run_channel_subset_extraction.py "$FOLDER" \
+    --out-dir "$OUT" --mode "$MODE" \
+    --n-subsets 9 --electrodes-per-subset 9 --mfr-threshold 0.1 \
+    --fs-raw 10110.09 --base 0

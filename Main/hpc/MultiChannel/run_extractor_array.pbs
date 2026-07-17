@@ -1,0 +1,19 @@
+#!/bin/bash
+#PBS -N chsub_array
+#PBS -l select=1:ncpus=2:mem=8gb
+#PBS -l walltime=00:30:00
+#PBS -J 0-99
+#PBS -j oe
+#PBS -o chsub_array_^array_index^.log
+
+source ~/.bashrc
+conda activate brian_env
+cd "$PBS_O_WORKDIR"
+
+# RECORDINGS.txt: one recording folder path per line (line N -> array index N)
+FOLDER=$(sed -n "$((PBS_ARRAY_INDEX+1))p" RECORDINGS.txt)
+OUT=/path/to/output_root/$(basename "$FOLDER")
+MODE=multichannel
+
+python3 run_channel_subset_extraction.py "$FOLDER" \
+    --out-dir "$OUT" --mode "$MODE" --fs-raw 10110.09 --base 0 --no-plots
