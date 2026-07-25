@@ -105,7 +105,9 @@ __all__ = [
 def latent_spec_from_config_dict(cfg: Dict[str, object],
                                  duration_s: float = None,
                                  n_neurons: int = None,
-                                 seed: int = None):
+                                 seed: int = None,
+                                 n_per_class: Sequence[int] = None,
+                                 class_overlap: float = None):
     """Build a LatentSpec from a parsed config JSON dict.
 
     MUST agree field-for-field with run_optimization.latent_spec_from_config.
@@ -127,7 +129,9 @@ def latent_spec_from_config_dict(cfg: Dict[str, object],
     lat = dict(data.get("latent", {}) or {})
     runtime = dict(cfg.get("runtime", {}) or {})
 
-    n_per_class = tuple(int(v) for v in data.get("synthetic_n_per_class", (3, 3, 3)))
+    n_per_class = tuple(int(v) for v in (
+        n_per_class if n_per_class is not None
+        else data.get("synthetic_n_per_class", (3, 3, 3))))
     fs = float(data.get("synthetic_fs", 50.0))
     T_rec = float(duration_s if duration_s is not None
                   else data.get("synthetic_duration_s", 600.0))
@@ -140,7 +144,8 @@ def latent_spec_from_config_dict(cfg: Dict[str, object],
         n_per_class=n_per_class,
         duration_s=T_rec,
         fs=fs,
-        class_overlap=float(lat.get("class_overlap", 0.10)),
+        class_overlap=float(class_overlap if class_overlap is not None
+                            else lat.get("class_overlap", 0.10)),
         class_center_mode=str(lat.get("class_center_mode", "interior")),
         n_neurons=n_neu,
         gaussian_window=float(lat.get("gaussian_window", 0.04)),
@@ -323,6 +328,18 @@ def main(argv=None):
                     help="override the neuron count N")
     ap.add_argument("--seed", type=int, default=None,
                     help="override the base seed")
+    ap.add_argument("--n-per-class", type=int, nargs="+", default=None,
+                    metavar="N",
+                    help="override the traces per class, one integer per class. "
+                         "Its LENGTH sets C, so '--n-per-class 3 3 3 3' gives a "
+                         "4-class benchmark. Note the class centres are "
+                         "m_c = (c+1)/(C+1) under the default interior spacing, "
+                         "so the adjacent-centre gap SHRINKS as C grows "
+                         "(0.25 at C=3, 0.20 at C=4): at fixed tau a larger C "
+                         "is a harder task, and tau should be re-chosen, not "
+                         "carried over.")
+    ap.add_argument("--tau", type=float, default=None,
+                    help="override the class overlap tau")
     ap.add_argument("--show-seconds", type=float, default=60.0,
                     help="plot only the first N seconds of each trace "
                          "(0 = whole trace)")
@@ -334,7 +351,8 @@ def main(argv=None):
             cfg = json.load(fh)
 
     spec = latent_spec_from_config_dict(
-        cfg, duration_s=a.duration_s, n_neurons=a.n_neurons, seed=a.seed)
+        cfg, duration_s=a.duration_s, n_neurons=a.n_neurons, seed=a.seed,
+        n_per_class=a.n_per_class, class_overlap=a.tau)
 
     print("=" * 74)
     print("latent benchmark")
