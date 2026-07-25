@@ -141,6 +141,21 @@ def check_overrides():
     print("  [B] --duration-s / --n-neurons / --seed reach the spec; every "
           "other field is untouched OK")
 
+    # --n-per-class sets C, and --tau overrides the overlap
+    four = I.latent_spec_from_config_dict(cfg, n_per_class=[3, 3, 3, 3])
+    assert four.n_classes == 4, four.n_classes
+    assert four.n_per_class == (3, 3, 3, 3), four.n_per_class
+    from latent_burst_generator import _class_mean
+    means = [_class_mean(c, four.n_classes, four.class_center_mode)
+             for c in range(four.n_classes)]
+    assert means == [0.2, 0.4, 0.6, 0.8], means
+    tuned = I.latent_spec_from_config_dict(cfg, n_per_class=[2, 2, 2],
+                                           class_overlap=0.07)
+    assert abs(tuned.class_overlap - 0.07) < 1e-12
+    assert tuned.n_per_class == (2, 2, 2)
+    print("  [B] --n-per-class sets C (4 classes -> m_c = %r) and --tau "
+          "overrides the overlap OK" % (means,))
+
 
 def check_synthesis():
     """[C] + [D] + [E] the generated dataset and its reported coordinates."""
