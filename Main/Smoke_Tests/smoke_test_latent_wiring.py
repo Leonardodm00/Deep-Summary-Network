@@ -141,6 +141,7 @@ def check_fingerprint_sensitivity(tmp):
             "irregularity", "burst_rate", "burst_duration")),
         "n_neurons": _cfg(tmp, n_neurons=50),
         "gaussian_window": _cfg(tmp, gaussian_window=0.05),
+        "class_center_mode": _cfg(tmp, class_center_mode="endpoints"),
         "axis range override": _cfg(tmp, axis_overrides=(
             LatentAxisOverride(name="burst_rate", lo=0.11, hi=0.41),)),
     }

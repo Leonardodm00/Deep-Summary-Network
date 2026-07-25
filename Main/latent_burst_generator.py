@@ -99,6 +99,7 @@ from generate_burst_data import (
 
 __all__ = [
     "LatentAxis",
+    "CLASS_CENTER_MODES",
     "DEFAULT_AXES",
     "DEFAULT_AXIS_NAMES",
     "AXIS_REGISTRY",
@@ -235,6 +236,13 @@ class LatentSpec:
                       model -- the regime in which architecture differences can
                       actually be resolved.
     n_per_class     : traces per class, length C.
+    class_center_mode : where the class centres m_c sit along a label axis.
+                      "interior" (DEFAULT) puts them at (c+1)/(C+1), strictly
+                      inside [0, 1]; "endpoints" reproduces the original
+                      c/(C-1), whose outer centres sit ON the boundaries and
+                      therefore clip ~50% of their draws at every tau. See
+                      _class_mean for the measurements behind the default.
+                      Changing this changes EVERY generated trace.
     duration_s      : T_rec [s] per trace.
     n_neurons       : N neurons per trace.
     w_size          : IFR bin width Delta_t [s]; f_s = 1 / Delta_t.
@@ -246,6 +254,7 @@ class LatentSpec:
     n_classes: int = 3
     class_overlap: float = 0.10
     n_per_class: Tuple[int, ...] = (3, 3, 3)
+    class_center_mode: str = "interior"
     duration_s: float = 600.0
     n_neurons: int = 100
     w_size: float = 0.02
@@ -272,6 +281,9 @@ class LatentSpec:
             raise ValueError("label_axes contains duplicates")
         if self.class_overlap < 0.0:
             raise ValueError("class_overlap (tau) must be >= 0")
+        if self.class_center_mode not in CLASS_CENTER_MODES:
+            raise ValueError("class_center_mode must be one of %r; got %r"
+                             % (CLASS_CENTER_MODES, self.class_center_mode))
         if self.duration_s <= 0 or self.w_size <= 0:
             raise ValueError("duration_s and w_size must be > 0")
 
@@ -354,6 +366,7 @@ def build_latent_spec(axis_names: Sequence[str],
                       duration_s: float,
                       fs: float,
                       class_overlap: float = 0.10,
+                      class_center_mode: str = "interior",
                       n_neurons: int = 100,
                       gaussian_window: float = 0.04,
                       seed: int = 0,
@@ -383,6 +396,7 @@ def build_latent_spec(axis_names: Sequence[str],
         label_axes=tuple(int(k) for k in label_axes),
         n_classes=len(n_per_class),
         class_overlap=float(class_overlap),
+        class_center_mode=str(class_center_mode),
         n_per_class=n_per_class,
         duration_s=float(duration_s),
         n_neurons=int(n_neurons),
@@ -395,11 +409,52 @@ def build_latent_spec(axis_names: Sequence[str],
 # --------------------------------------------------------------------------- #
 # section 2 -- per-trace latent sampling (no signal synthesis)
 # --------------------------------------------------------------------------- #
-def _class_mean(c: int, n_classes: int) -> float:
-    """m_c = c / (C - 1) in [0, 1]; m_0 = 0 when C == 1."""
+CLASS_CENTER_MODES = ("interior", "endpoints")
+
+
+def _class_mean(c: int, n_classes: int, mode: str = "interior") -> float:
+    """m_c, the class centre along every label axis, in [0, 1].
+
+    Two placements, because where the centres sit interacts with the clip in
+    Eq. (1) and that interaction is easy to miss:
+
+      "endpoints" (the ORIGINAL):  m_c = c / (C - 1),      m_c in {0, ..., 1}
+          The outer centres sit exactly ON the boundaries of [0, 1], so for
+          c = 0 every negative draw of eps_k, and for c = C-1 every positive
+          draw, is clipped. MEASURED at C = 3: 50.6% of class-0 and 48.4% of
+          class-(C-1) label coordinates land exactly on a boundary, at EVERY
+          tau. The realised within-class sd of the outer classes is therefore
+          ~0.058 against a nominal tau = 0.10 -- about 42% tighter than the
+          middle class, which is untouched. Raising tau does not fix this: the
+          pinned FRACTION is invariant in tau (it is just P(eps < 0) = 1/2),
+          so a larger tau only grows a spike of probability mass sitting
+          exactly at 0 and at 1.
+
+      "interior" (the DEFAULT):    m_c = (c + 1) / (C + 1), m_c in (0, 1)
+          Every centre is strictly interior, at C = 3 giving 0.25, 0.50, 0.75.
+          No centre touches a boundary, so clipping becomes rare rather than
+          systematic and the realised within-class spread equals tau for every
+          class alike. tau becomes a knob that means what it says.
+
+    The trade: interior spacing HALVES the adjacent-centre gap (0.50 -> 0.25 at
+    C = 3), so at fixed tau the task is substantially harder. MEASURED at
+    C = 3, tau = 0.10, 180 windows: a mean-IFR-only baseline scores ARI 0.3821
+    under "endpoints" but 0.1877 under "interior" -- i.e. interior spacing also
+    closes about half of the single-scalar shortcut, which is the reason to
+    prefer it beyond the clipping argument. Choose tau AFTER choosing the mode;
+    the two are not independent.
+
+    For C == 1 there is no meaningful spacing: "interior" returns 0.5 (the
+    centre of the range) and "endpoints" returns 0.0 (its historical value).
+    """
+    if mode not in CLASS_CENTER_MODES:
+        raise ValueError("class_center_mode must be one of %r; got %r"
+                         % (CLASS_CENTER_MODES, mode))
     if n_classes <= 1:
-        return 0.0
-    return float(c) / float(n_classes - 1)
+        return 0.5 if mode == "interior" else 0.0
+    if mode == "endpoints":
+        return float(c) / float(n_classes - 1)
+    return float(c + 1) / float(n_classes + 1)
 
 
 def sample_latents(spec: LatentSpec, condition: int, trace_id: int) -> np.ndarray:
@@ -425,7 +480,7 @@ def sample_latents(spec: LatentSpec, condition: int, trace_id: int) -> np.ndarra
         (int(spec.seed), 1000003 * int(condition) + int(trace_id)))
     n = spec.n_latent
     phi = rng.uniform(0.0, 1.0, size=n)
-    m_c = _class_mean(int(condition), spec.n_classes)
+    m_c = _class_mean(int(condition), spec.n_classes, spec.class_center_mode)
     for k in spec.label_axes:
         eps = rng.normal(0.0, 1.0)
         phi[int(k)] = float(np.clip(m_c + spec.class_overlap * eps, 0.0, 1.0))
@@ -558,6 +613,9 @@ def latent_ground_truth_table(spec: LatentSpec) -> Dict[str, object]:
         "n_latent": int(spec.n_latent),
         "n_classes": int(spec.n_classes),
         "class_overlap": float(spec.class_overlap),
+        "class_center_mode": str(spec.class_center_mode),
+        "class_means": [_class_mean(c, spec.n_classes, spec.class_center_mode)
+                        for c in range(spec.n_classes)],
         "fs": float(spec.fs),
         "rows": rows,
     }

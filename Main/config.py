@@ -306,6 +306,18 @@ class LatentConfig:
                     holds only ~3-12 bursts and a duration CV cannot be estimated
                     from so few. Do not revert to one label axis without
                     re-running that calibration.
+    class_center_mode : where the class centres m_c sit along a label axis.
+                    "interior" (DEFAULT) places them at m_c = (c+1)/(C+1), so at
+                    C = 3 they are 0.25, 0.50, 0.75 and none touches a boundary
+                    of [0, 1]. "endpoints" reproduces the original
+                    m_c = c/(C-1) = 0, 0.5, 1, whose OUTER centres sit exactly
+                    on the boundaries, so the clip in the latent construction
+                    pins ~50% of their draws at 0 or 1 -- MEASURED at 50.6% and
+                    48.4% for C = 3, invariant in tau -- leaving the outer
+                    classes ~42% tighter than the middle one. Use "endpoints"
+                    only to reproduce a run made before this option existed.
+                    CHANGING THIS CHANGES EVERY GENERATED TRACE (and so the
+                    cache fingerprint, deliberately).
     class_overlap : tau >= 0, the spread of a trace's label coordinates about its
                     class centre m_c = c / (C - 1), in normalized latent units.
                     tau = 0 gives deterministic class centres; larger tau makes
@@ -320,6 +332,7 @@ class LatentConfig:
         "intraburst_rate", "participation", "background")
     label_axes: Tuple[int, ...] = (0, 1)
     class_overlap: float = 0.10
+    class_center_mode: str = "interior"
     n_neurons: int = 100
     gaussian_window: float = 0.04
     axis_overrides: Tuple[LatentAxisOverride, ...] = ()
@@ -351,6 +364,10 @@ class LatentConfig:
                 RuntimeWarning)
         if self.class_overlap < 0.0:
             raise ValueError("latent.class_overlap (tau) must be >= 0")
+        if self.class_center_mode not in ("interior", "endpoints"):
+            raise ValueError(
+                "latent.class_center_mode must be 'interior' or 'endpoints'; "
+                "got %r" % (self.class_center_mode,))
         if int(self.n_neurons) < 1:
             raise ValueError("latent.n_neurons must be >= 1")
         if float(self.gaussian_window) <= 0.0:

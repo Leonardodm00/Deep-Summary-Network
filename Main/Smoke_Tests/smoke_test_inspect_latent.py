@@ -54,7 +54,8 @@ from latent_burst_generator import latent_ground_truth_table     # noqa: E402
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _SPEC_FIELDS = ("label_axes", "n_classes", "n_per_class", "class_overlap",
-                "duration_s", "n_neurons", "w_size", "gaussian_window", "seed")
+                "class_center_mode", "duration_s", "n_neurons", "w_size",
+                "gaussian_window", "seed")
 
 
 def _assert_specs_equal(a, b, label):

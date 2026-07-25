@@ -141,6 +141,7 @@ def latent_spec_from_config_dict(cfg: Dict[str, object],
         duration_s=T_rec,
         fs=fs,
         class_overlap=float(lat.get("class_overlap", 0.10)),
+        class_center_mode=str(lat.get("class_center_mode", "interior")),
         n_neurons=n_neu,
         gaussian_window=float(lat.get("gaussian_window", 0.04)),
         seed=base_seed,
@@ -346,6 +347,11 @@ def main(argv=None):
     print("  C (classes)   : %d,  n_c = %r  ->  %d traces total"
           % (spec.n_classes, list(spec.n_per_class), sum(spec.n_per_class)))
     print("  tau (overlap) : %.4g" % spec.class_overlap)
+    from latent_burst_generator import _class_mean as _cm
+    print("  class centres : mode=%r  ->  m_c = %r"
+          % (spec.class_center_mode,
+             [round(_cm(c, spec.n_classes, spec.class_center_mode), 4)
+              for c in range(spec.n_classes)]))
     print("  T_rec, f_s    : %.4g s, %.4g Hz  ->  K = %d samples"
           % (spec.duration_s, spec.fs, int(round(spec.duration_s * spec.fs))))
     print("  N (neurons)   : %d" % spec.n_neurons)
