@@ -157,12 +157,19 @@ from data_splits import (
     segment_bounds,
     window_starts,
 )
+from latent_burst_generator import (        # [C1]
+    LatentBurstProvider,
+    build_latent_spec,
+    latent_ground_truth_table,
+)
 from train import train, set_global_seed, resolve_device, derive_batches_per_epoch
 from checkpoint import save_checkpoint
 from evaluate import evaluate_and_plot        # also forces the headless Agg backend
 
 __all__ = [
     "build_traces",
+    "latent_spec_from_config",
+    "save_latent_artifacts",
     "resolve_config",
     "FeasibilityReport",
     "check_window_feasibility",
@@ -338,6 +345,55 @@ def resolve_config(args):
 # --------------------------------------------------------------------------- #
 # data:  provider -> cache -> traces
 # --------------------------------------------------------------------------- #
+def latent_spec_from_config(cfg):
+    """[C1] ExperimentConfig -> LatentSpec. The ONE place the mapping happens.
+
+    Everything below the adapter lives in latent_burst_generator.build_latent_spec,
+    which takes plain scalars so it can be unit-tested without importing config.py
+    (whose import chain pulls in torch). This function does nothing but unpack.
+
+    Note which fields come from where: C, n_c, T_rec and f_s are read from the
+    SHARED synthetic_* fields, not duplicated inside the latent block, so a run
+    cannot declare two different sampling rates.
+    """
+    lat = cfg.data.latent
+    return build_latent_spec(
+        axis_names=tuple(lat.axis_names),
+        label_axes=tuple(int(k) for k in lat.label_axes),
+        n_per_class=tuple(int(n) for n in cfg.data.synthetic_n_per_class),
+        duration_s=float(cfg.data.synthetic_duration_s),
+        fs=float(cfg.data.synthetic_fs),
+        class_overlap=float(lat.class_overlap),
+        n_neurons=int(lat.n_neurons),
+        gaussian_window=float(lat.gaussian_window),
+        seed=int(cfg.runtime.seed),
+        axis_overrides=[{"name": ov.name, "lo": ov.lo, "hi": ov.hi,
+                         "orientation": ov.orientation}
+                        for ov in lat.axis_overrides],
+    )
+
+
+def save_latent_artifacts(cfg, out_dir, verbose=False):
+    """[C1] Write latent_ground_truth.json next to the run's other artifacts.
+
+    REQUIRED for the factor-retention analysis (C5): that metric regresses each
+    known latent coordinate phi_k on the learned embedding, and without this
+    table it has no ground truth to regress against. Cheap -- it enumerates the
+    latent vectors WITHOUT synthesizing any signal -- so it is written
+    unconditionally for latent runs, including --dry-run ones, rather than being
+    made contingent on a flag someone will forget to pass.
+
+    Returns the path written.
+    """
+    spec = latent_spec_from_config(cfg)
+    table = latent_ground_truth_table(spec)
+    path = _write_json_ascii(table, Path(out_dir) / "latent_ground_truth.json")
+    if verbose:
+        print("[run] latent ground truth (%d traces, n=%d axes, S=%r) -> %s"
+              % (len(table["rows"]), table["n_latent"], table["label_axes"], path))
+    return path
+
+
 def _data_fingerprint(cfg, specs):
     """[ADDED 3] A stable hash of everything that determines the CACHED TRACES.
 
@@ -360,6 +416,28 @@ def _data_fingerprint(cfg, specs):
         "specs": [{"name": s["name"], "condition": int(s["condition"]),
                    "args": [str(a) for a in s["args"]]} for s in specs],
     }
+    # [C1] The latent parameters MUST enter the fingerprint. The spec list for
+    # latent mode is make_synthetic_specs(n_per_class) -- identical for every tau
+    # and every choice of label axes -- so without this, changing class_overlap
+    # or label_axes would leave the cached traces untouched and the run would
+    # silently train on the OLD benchmark while reporting the NEW config. This
+    # was flagged as the single most likely source of a confusing bug during
+    # wiring, and it is exactly the failure the fingerprint exists to prevent.
+    # The generator's per-axis RANGES are included too, since a recalibrated
+    # [a_k, b_k] changes every trace without changing any other field.
+    if cfg.data.data_mode == "latent":
+        spec = latent_spec_from_config(cfg)
+        payload["latent"] = {
+            "axes": [{"name": a.name, "target": a.target,
+                      "lo": float(a.lo), "hi": float(a.hi),
+                      "orientation": int(a.orientation)} for a in spec.axes],
+            "label_axes": [int(k) for k in spec.label_axes],
+            "class_overlap": float(spec.class_overlap),
+            "n_neurons": int(spec.n_neurons),
+            "w_size": float(spec.w_size),
+            "gaussian_window": float(spec.gaussian_window),
+            "seed": int(spec.seed),
+        }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=True)
     return hashlib.sha1(blob.encode("ascii")).hexdigest()
 
@@ -468,13 +546,38 @@ def build_traces(cfg, overwrite_cache=False, engine_module=None,
 
     if mode == "synthetic":
         n_per_class = tuple(int(n) for n in cfg.data.synthetic_n_per_class)
+        syn = cfg.data.synthetic
         provider = MultiClassSyntheticProvider(
             n_classes=len(n_per_class),
             duration_s=float(cfg.data.synthetic_duration_s),
             fs=float(cfg.data.synthetic_fs),
             seed=int(cfg.runtime.seed),
+            rate_min=float(syn.rate_min),
+            rate_max=float(syn.rate_max),
+            width_min=float(syn.width_min),
+            width_max=float(syn.width_max),
+            amp_jitter_min=float(syn.amp_jitter_min),
+            amp_jitter_max=float(syn.amp_jitter_max),
+            per_class=list(syn.per_class),
         )
         specs = make_synthetic_specs(n_per_class)
+
+    elif mode == "latent":
+        # [C1] The n-latent-factor benchmark. A SEPARATE mode, not a mutation of
+        # "synthetic": the provider call signature is IDENTICAL --
+        # provider(condition, trace_id) -> (x, f_s) -- so make_synthetic_specs and
+        # cache_traces are reused unchanged, and every existing "synthetic" test
+        # keeps meaning what it meant.
+        n_per_class = tuple(int(n) for n in cfg.data.synthetic_n_per_class)
+        spec = latent_spec_from_config(cfg)
+        provider = LatentBurstProvider(spec)
+        specs = make_synthetic_specs(n_per_class)
+        if verbose:
+            print("[run] latent benchmark: n=%d axes %r, label axes S=%r "
+                  "(0-based), tau=%.4g, C=%d, f_s=%.4g Hz"
+                  % (spec.n_latent, [a.name for a in spec.axes],
+                     list(spec.label_axes), spec.class_overlap,
+                     spec.n_classes, spec.fs))
 
     elif mode == "numpy":
         # both schemas accepted -- see _npz_record_fields  [ADDED 11]
@@ -541,6 +644,143 @@ def build_traces(cfg, overwrite_cache=False, engine_module=None,
 
     traces, conditions, fs = load_cached_traces(cache_dir)
     return traces, [int(c) for c in conditions], float(fs)
+
+
+def _resolved_synthetic_params(cfg):
+    """Return a JSON-serializable dict of the EFFECTIVE per-class synthetic
+    generator parameters (rate, base width, amplitude jitter bounds, and whether
+    class-0 amplitude was promoted), computed the SAME way
+    MultiClassSyntheticProvider computes them. This is the record that makes a
+    synthetic run reproducible/inspectable without re-reading the code.
+    """
+    syn = cfg.data.synthetic
+    n_per_class = tuple(int(n) for n in cfg.data.synthetic_n_per_class)
+    C = len(n_per_class)
+
+    def frac(c):
+        return 0.0 if C == 1 else c / (C - 1)
+
+    def override_for(c):
+        if c >= len(syn.per_class) or syn.per_class[c] is None:
+            return (None, None, None, None)
+        o = syn.per_class[c]
+        if isinstance(o, dict):
+            return (o.get("rate"), o.get("width"), o.get("amp_min"), o.get("amp_max"))
+        return (getattr(o, "rate", None), getattr(o, "width", None),
+                getattr(o, "amp_min", None), getattr(o, "amp_max", None))
+
+    per_class_resolved = []
+    for c in range(C):
+        ov_rate, ov_width, ov_amp_min, ov_amp_max = override_for(c)
+        rate = syn.rate_min + (syn.rate_max - syn.rate_min) * frac(c)
+        width = syn.width_max - (syn.width_max - syn.width_min) * frac(c)
+        if ov_rate is not None:
+            rate = float(ov_rate)
+        if ov_width is not None:
+            width = float(ov_width)
+        amp_min = syn.amp_jitter_min if ov_amp_min is None else float(ov_amp_min)
+        amp_max = syn.amp_jitter_max if ov_amp_max is None else float(ov_amp_max)
+        class0_fixed = (c == 0 and ov_amp_min is None)
+        per_class_resolved.append({
+            "class": c,
+            "n_traces": n_per_class[c],
+            "rate_bursts_per_s": float(rate),
+            "base_width_s": float(width),
+            "amp_fixed_1p0": bool(class0_fixed),
+            "amp_jitter_min": None if class0_fixed else float(amp_min),
+            "amp_jitter_max": None if class0_fixed else float(amp_max),
+            "overridden": any(v is not None for v in (ov_rate, ov_width, ov_amp_min, ov_amp_max)),
+        })
+
+    return {
+        "n_classes": C,
+        "duration_s": float(cfg.data.synthetic_duration_s),
+        "fs": float(cfg.data.synthetic_fs),
+        "seed": int(cfg.runtime.seed),
+        "global_sweep": {
+            "rate_min": float(syn.rate_min), "rate_max": float(syn.rate_max),
+            "width_min": float(syn.width_min), "width_max": float(syn.width_max),
+            "amp_jitter_min": float(syn.amp_jitter_min),
+            "amp_jitter_max": float(syn.amp_jitter_max),
+        },
+        "per_class_effective": per_class_resolved,
+    }
+
+
+def save_synthetic_artifacts(cfg, traces, conditions, fs, out_dir, fig_dir,
+                             zoom_s=60.0, verbose=False):
+    """For data_mode == 'synthetic': record the effective generator parameters
+    and render a traces overview figure into the run's out_dir, so every
+    optimization/search run keeps a self-contained snapshot of the exact
+    synthetic data it trained on.
+
+    Reads the ALREADY-GENERATED traces/conditions (no regeneration -> cannot
+    drift from what training actually used). Non-fatal: any plotting error is
+    caught and reported, never aborts the run.
+
+    Returns the path to the params JSON (the figure path is derived from it).
+    """
+    params = _resolved_synthetic_params(cfg)
+    params_path = out_dir / "synthetic_generator_params.json"
+    _write_json_ascii(params, params_path)
+    if verbose:
+        print("[run] wrote synthetic generator params -> %s" % params_path)
+
+    # group traces by condition for plotting
+    by_class = {}
+    for tr, cond in zip(traces, conditions):
+        by_class.setdefault(int(cond), []).append(np.asarray(tr))
+    classes = sorted(by_class)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        duration_s = float(cfg.data.synthetic_duration_s)
+        n_rows = len(classes)
+        fig, axes = plt.subplots(n_rows, 2, figsize=(13, 2.6 * n_rows + 0.5),
+                                 gridspec_kw={"width_ratios": [2.2, 1.0]})
+        if n_rows == 1:
+            axes = np.array([axes])
+        colors = plt.cm.viridis(np.linspace(0.1, 0.85, n_rows))
+        zoom_n = int(zoom_s * fs)
+
+        for r, c in enumerate(classes):
+            trs = by_class[c]
+            t_full = np.arange(len(trs[0])) / fs
+            ax_full = axes[r, 0]
+            n_show = min(3, len(trs))
+            step = 1.6 * max(float(x.max()) for x in trs[:n_show]) if n_show else 1.0
+            for k in range(n_show):
+                ax_full.plot(t_full, trs[k] + k * step, color=colors[r],
+                             alpha=0.85, linewidth=0.7)
+            ax_full.set_title("class %d - full (n=%d shown of %d)"
+                              % (c, n_show, len(trs)), fontsize=9)
+            ax_full.set_xlabel("time (s)")
+            ax_full.set_yticks([])
+            ax_full.set_xlim(0, duration_s)
+
+            ax_zoom = axes[r, 1]
+            rep = trs[0][:zoom_n]
+            ax_zoom.plot(np.arange(len(rep)) / fs, rep, color=colors[r],
+                         linewidth=1.0)
+            ax_zoom.set_title("class %d - zoom 0-%.0fs" % (c, zoom_s), fontsize=9)
+            ax_zoom.set_xlabel("time (s)")
+
+        fig.suptitle("Synthetic traces used this run (seed=%d, fs=%.1f Hz)"
+                     % (int(cfg.runtime.seed), fs), fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        fig_path = fig_dir / "synthetic_traces_overview.png"
+        fig.savefig(fig_path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        if verbose:
+            print("[run] wrote synthetic traces figure -> %s" % fig_path)
+    except Exception as ex:
+        print("[run][warn] could not render synthetic traces figure (%s: %s); "
+              "params JSON was still written." % (type(ex).__name__, ex))
+
+    return params_path
 
 
 # --------------------------------------------------------------------------- #
@@ -1216,6 +1456,18 @@ def run(cfg, args, on_stage_complete=None):
     trace_lengths = [int(t.shape[0]) for t in traces]
     _fire("data", cfg)          # the trace cache is populated; worth protecting
 
+    # Snapshot the synthetic data this run trained on (params + figure), so an
+    # optimization/search run is reproducible and visually inspectable later.
+    if cfg.data.data_mode == "synthetic":
+        save_synthetic_artifacts(cfg, traces, conditions, fs, out_dir, fig_dir,
+                                 verbose=verbose)
+    elif cfg.data.data_mode == "latent":
+        # [C1] Written BEFORE the --dry-run early return, deliberately: the table
+        # is the ground truth the factor-retention analysis needs, it costs no
+        # signal synthesis, and a dry run is exactly when you want to inspect the
+        # benchmark you are about to spend cluster hours on.
+        save_latent_artifacts(cfg, out_dir, verbose=verbose)
+
     # ---- PRE-FLIGHTS (before any training) --------------------------------
     feas = check_window_feasibility(cfg, trace_lengths, conditions, fs)
     sizes = estimate_model_sizes(cfg, skip_search=skip_search)
@@ -1321,7 +1573,8 @@ def build_parser():
                         "INFEASIBLE (window_s=200s vs 120s eval segments).")
 
     g = p.add_argument_group("data")
-    g.add_argument("--data-mode", choices=("synthetic", "numpy", "real"),
+    g.add_argument("--data-mode",
+                   choices=("synthetic", "numpy", "real", "latent"),   # [C1]
                    default=None)
     g.add_argument("--npz-specs", default=None,
                    help="numpy mode: JSON list of {name, condition, path}")

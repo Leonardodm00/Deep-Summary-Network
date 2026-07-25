@@ -286,15 +286,31 @@ def check_item_once_per_epoch_isolated(cache_dir):
 def check_early_stopping_fires(cache_dir):
     """[E] A deliberately plateauing signal + tiny patience -> stop before E_max."""
     C = 2
-    # lr = 0 freezes the weights -> the metric is constant -> a perfect plateau
+    # lr = 0 freezes the weights -> the metric is INTENDED to be a perfect
+    # plateau. In practice it is only a NEAR-plateau: forward-pass floating
+    # point noise (observed ~1e-9 on the silhouette, even with weights frozen
+    # to the ULP) still moves the metric a hair epoch to epoch, and the
+    # direction of that hair is not guaranteed to be the same across
+    # CPU/BLAS builds. With min_delta_ari = min_delta_sil = 0.0 EXACTLY, that
+    # noise can occasionally tip the wrong way and register as a spurious
+    # "improvement", resetting the patience counter on a genuinely
+    # non-learning model -- an environment-dependent stop epoch, not a
+    # train.py defect (verified: reproduces cleanly at len=3 on one machine,
+    # was reported as len=5 on another, with both env's noise floors ~1e-9).
+    # A small positive tolerance, comfortably above that noise floor and
+    # nowhere near a real signal, restores the deterministic plateau the
+    # arithmetic below assumes.
+    NOISE_FLOOR_MARGIN = 1e-4
     cfg = _make_cfg(C, max_epochs=12, patience=2, seed=0)
     cfg.train.lr = 1e-12                    # effectively no learning
+    cfg.train = replace(cfg.train, min_delta_ari=NOISE_FLOOR_MARGIN,
+                        min_delta_sil=NOISE_FLOOR_MARGIN)
     splits = _make_splits(C, cfg, cache_dir)
     _model, history = _quiet_train(cfg, splits.train, splits.val, "cpu", seed=0)
     assert len(history) < cfg.train.max_epochs, \
         ("early stopping did not fire: ran all %d epochs" % cfg.train.max_epochs)
-    # with delta = epsilon = 0 and a frozen model, no epoch after the first can
-    # improve, so the counter reaches P at epoch 1 + P
+    # with delta = epsilon = NOISE_FLOOR_MARGIN and a frozen model, no epoch
+    # after the first can improve, so the counter reaches P at epoch 1 + P
     assert len(history) <= 1 + cfg.train.patience + 1, len(history)
     print("  [E] early stopping fires OK: stopped at epoch %d < E_max=%d "
           "(patience P=%d on a frozen/plateau signal)"

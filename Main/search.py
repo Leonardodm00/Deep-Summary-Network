@@ -133,6 +133,13 @@ from skopt.space import Categorical, Integer, Real
 from skopt.utils import use_named_args
 
 from config import ExperimentConfig
+from objective_utils import (
+    adaptive_epsilon,
+    composite_objective,
+    resolve_n_initial_points,
+    selected_epoch_index,       # [C2] re-exported below; lives in objective_utils
+    selected_epoch_scores,      #      so it is testable without torch
+)
 from train import train
 
 __all__ = [
@@ -143,6 +150,9 @@ __all__ = [
     "best_train_dict",
     "config_from_arch_point",
     "config_from_train_point",
+    "selected_epoch_index",
+    "selected_epoch_scores",
+    "resolve_tie_break_epsilon",
     "evaluate_candidate",
     "search_architecture",
     "search_training",
@@ -371,37 +381,78 @@ def config_from_train_point(base_cfg, point, arch=None):
 # --------------------------------------------------------------------------- #
 # the objective
 # --------------------------------------------------------------------------- #
-def _best_val_ari(history, selection_primary="ari"):
-    """The run's BEST validation score: max over epochs of the PRIMARY selection
-    signal, NaN-safe (a NaN epoch is treated as -inf so it can never win).
+def resolve_tie_break_epsilon(cfg, splits, verbose=False):
+    """[C2] epsilon for THIS study, derived from the validation labels y.
 
-    Returns -inf when no epoch produced a finite score, which the caller maps to
-    FAILED_OBJECTIVE."""
-    key = "ari" if selection_primary == "ari" else "silhouette"
-    best = float("-inf")
-    for h in history:
-        v = float(h[key])
-        if np.isfinite(v) and v > best:
-            best = v
-    return best
+    epsilon = gamma * Delta_min(y) / (s_hi - s_lo), which guarantees
+        epsilon * (s_hi - s_lo) = gamma * Delta_min(y) < Delta_min(y)
+    for every gamma in (0, 1): the total influence the secondary metric can
+    exert is strictly smaller than the smallest genuine primary difference the
+    evaluation set can express, so it reorders configurations ONLY inside an
+    exact primary tie.
+
+    cfg.search.tie_break_gamma == 0.0 disables the tie-break entirely and
+    reproduces the pre-C2 objective (primary metric only). Returns
+    (epsilon or None, info dict).
+
+    COST. min_ari_gap is O(N_eval * C) ARI evaluations, each O(N_eval), i.e.
+    O(N_eval^2 * C) overall, computed ONCE per phase (not per trial). MEASURED
+    by Main/Smoke_Tests/smoke_test_objective_wiring.py [J], which prints the
+    timing on whatever machine it runs on: 43 ms at N_eval = 36 (the archived
+    run), 222 ms at 180, 821 ms at 600. The growth is quadratic, so budget
+    roughly 10 s at N_eval = 2000; if you ever evaluate on tens of thousands of
+    windows, hoist this out of the per-phase path deliberately rather than
+    discovering the cost in a cluster job.
+    """
+    gamma = float(getattr(cfg.search, "tie_break_gamma", 0.0))
+    if gamma <= 0.0:
+        return None, {"enabled": False, "gamma": gamma}
+    y = np.asarray(splits.val.conditions_per_item, dtype=int).ravel()
+    info = adaptive_epsilon(
+        y,
+        sil_lo=float(cfg.search.tie_break_sil_lo),
+        sil_hi=float(cfg.search.tie_break_sil_hi),
+        gamma=gamma,
+    )
+    info["enabled"] = True
+    if verbose:
+        print("[search] tie-break: N_eval=%d C=%d Delta_min(y)=%.6f gamma=%.3g "
+              "-> epsilon=%.6g (max secondary influence %.6g < %.6g)"
+              % (info["n_eval"], info["n_classes"], info["delta_min"],
+                 info["gamma"], info["epsilon"], info["max_secondary_influence"],
+                 info["delta_min"]))
+    return float(info["epsilon"]), info
 
 
-def evaluate_candidate(cfg, splits, device, trial_number, log=None):
-    """Score ONE candidate config: train n_seeds models, return (-mean best-val ARI).
+def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None):
+    """Score ONE candidate config: train n_seeds models, return the mean objective.
 
     This is THE objective. It calls the same train() the final run calls -- the
     smoke test asserts that identity by patching train and observing the call.
 
+    [C2] With epsilon = None (the default) the objective is the pre-C2 one,
+    -mean(primary metric at e*). With epsilon > 0 it is
+
+        J_epsilon(t) = -(1/S) * sum_sigma [ ARI(t,sigma,e*) + epsilon * Sil(t,sigma,e*) ]
+
+    with BOTH metrics read at the SAME selected epoch e*(t, sigma).
+
+    NOTE on what is reported vs what is optimized: record["mean"] / ["std"] /
+    ["scores"] always carry the PRIMARY metric, so they remain comparable across
+    runs with and without the tie-break, and so the per-seed std stays the honest
+    GP noise level of the primary signal. record["objective"] is what
+    gp_minimize actually minimizes.
+
     Returns
     -------
-    (objective, record) where
-        objective : float, -mean(best val ARI) over seeds; FAILED_OBJECTIVE if no
-                    seed produced a finite score
-        record    : dict logged per trial (per-seed scores, mean, std, health)
+    (objective, record)
     """
     n_seeds = int(cfg.train.n_seeds)
     base_seed = int(cfg.runtime.seed)
     scores = []
+    sil_scores = []
+    objectives = []
+    epochs = []
     eff_ranks = []
 
     for n in range(n_seeds):
@@ -415,9 +466,16 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None):
                 "trial %d seed %d raised %s: %s -> scored as FAILED."
                 % (trial_number, seed, type(ex).__name__, ex), RuntimeWarning)
             continue
-        s = _best_val_ari(history, cfg.train.selection_primary)
+        # [C2] both signals at the SAME selected epoch e*
+        s, sil, e_star = selected_epoch_scores(history, cfg.train.selection_primary)
         if np.isfinite(s):
             scores.append(float(s))
+            sil_scores.append(float(sil) if np.isfinite(sil) else float("nan"))
+            epochs.append(int(e_star))
+            if epsilon is None:
+                objectives.append(float(-s))
+            else:
+                objectives.append(float(composite_objective(s, sil, float(epsilon))))
         # eff_rank is the collapse tripwire (mean_pairwise_cos is NOT a reliable
         # absolute signal on non-negative inputs -- it sits near 1 by construction)
         finite_er = [h["health"]["eff_rank"] for h in history
@@ -448,6 +506,10 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None):
                   "scores": [float(v) for v in scores],
                   "mean": float("nan"), "std": float("nan"),
                   "objective": FAILED_OBJECTIVE, "eff_rank": float("nan"),
+                  "sil_scores": [float(v) for v in sil_scores],
+                  "sil_mean": float("nan"),
+                  "selected_epochs": [int(e) for e in epochs],
+                  "epsilon": (None if epsilon is None else float(epsilon)),
                   "n_seeds_ok": int(n_ok), "n_seeds": int(n_seeds), "failed": True}
         if log is not None:
             log.append(record)
@@ -456,7 +518,8 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None):
     arr = np.asarray(scores, dtype=float)
     mean = float(arr.mean())
     std = float(arr.std())                        # population std across seeds
-    objective = -mean                             # gp_minimize MINIMIZES
+    objective = float(np.mean(np.asarray(objectives, dtype=float)))
+    sil_arr = np.asarray(sil_scores, dtype=float)
     record = {
         "trial": int(trial_number),
         "scores": [float(v) for v in arr],
@@ -464,6 +527,11 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None):
         "std": std,                               # the honest GP noise level
         "objective": float(objective),
         "eff_rank": float(np.mean(eff_ranks)) if eff_ranks else float("nan"),
+        "sil_scores": [float(v) for v in sil_arr],
+        "sil_mean": (float(np.nanmean(sil_arr))
+                     if np.any(np.isfinite(sil_arr)) else float("nan")),
+        "selected_epochs": [int(e) for e in epochs],
+        "epsilon": (None if epsilon is None else float(epsilon)),
         "n_seeds_ok": int(n_ok),
         "n_seeds": int(n_seeds),
         "failed": False,
@@ -474,9 +542,15 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None):
 
 
 def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
-            verbose=False, tag=""):
+            verbose=False, tag="", n_initial_points=None, epsilon=None):
     """Shared gp_minimize driver: wires the objective, keeps a trial counter (so the
-    seed blocks stay disjoint), and collects the per-trial log."""
+    seed blocks stay disjoint), and collects the per-trial log.
+
+    [C3] n_initial_points : explicit size of the random initial design. None (or
+        <= 0) reproduces the legacy hard-coded rule min(10, max(1, n_calls // 2))
+        EXACTLY, so pre-C3 configs are unaffected.
+    [C2] epsilon : tie-break weight, or None for the pre-C2 primary-only objective.
+    """
     trial_log = []
     counter = {"t": 0}
 
@@ -494,15 +568,22 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
                    "eff_rank": float("nan"), "failed": True}
             trial_log.append(rec)
             return FAILED_OBJECTIVE
-        obj, rec = evaluate_candidate(cfg, splits, device, t, log=trial_log)
+        obj, rec = evaluate_candidate(cfg, splits, device, t, log=trial_log,
+                                      epsilon=epsilon)
         if verbose:
             print("[%s] trial %3d  obj %+.4f  (val %s = %.4f +/- %.4f, eff_rank %.2f)"
                   % (tag, t, obj, base_cfg.train.selection_primary,
                      rec["mean"], rec["std"], rec["eff_rank"]))
         return obj
 
-    # n_initial_points must not exceed n_calls, or skopt never fits the surrogate
-    n_initial = min(10, max(1, int(n_calls) // 2))
+    # [C3] n_initial_points must not exceed n_calls, or skopt never fits the
+    # surrogate; resolve_n_initial_points enforces that and raises rather than
+    # silently degrading the study to random search.
+    n_initial = resolve_n_initial_points(n_calls, n_initial_points)
+    if verbose:
+        print("[%s] budget: n_calls=%d, n_initial_points=%d (%s)"
+              % (tag, int(n_calls), n_initial,
+                 "explicit" if (n_initial_points or 0) > 0 else "legacy rule"))
     res = gp_minimize(
         func=objective,
         dimensions=space,
@@ -512,6 +593,7 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
         acq_func="EI",
     )
     res.trial_log = trial_log
+    res.n_initial_points_used = int(n_initial)
     return res
 
 
@@ -525,11 +607,14 @@ def search_architecture(cfg, splits, device, space=None, verbose=False):
     point in arch_space() order; use best_arch_dict(res) to name it.
     """
     space = arch_space(cfg.search) if space is None else space
+    epsilon, _info = resolve_tie_break_epsilon(cfg, splits, verbose=verbose)
     return _run_gp(
         space=space, base_cfg=cfg, splits=splits, device=device,
         n_calls=int(cfg.search.n_calls_arch),
         random_state=int(cfg.search.gp_random_state),
-        build_cfg=config_from_arch_point, verbose=verbose, tag="arch")
+        build_cfg=config_from_arch_point, verbose=verbose, tag="arch",
+        n_initial_points=int(cfg.search.n_initial_points),   # [C3]
+        epsilon=epsilon)                                     # [C2]
 
 
 def best_arch_dict(res):
@@ -544,11 +629,14 @@ def search_training(cfg, splits, device, best_arch, verbose=False):
     def build(base_cfg, point):
         return config_from_train_point(base_cfg, point, arch=best_arch)
 
+    epsilon, _info = resolve_tie_break_epsilon(cfg, splits, verbose=verbose)
     return _run_gp(
         space=space, base_cfg=cfg, splits=splits, device=device,
         n_calls=int(cfg.search.n_calls_train),
         random_state=int(cfg.search.gp_random_state),
-        build_cfg=build, verbose=verbose, tag="train")
+        build_cfg=build, verbose=verbose, tag="train",
+        n_initial_points=int(cfg.search.n_initial_points),   # [C3]
+        epsilon=epsilon)                                     # [C2]
 
 
 def best_train_dict(res):
@@ -572,11 +660,14 @@ def retune_architecture(cfg, splits, device, res_arch, verbose=False):
     space = get_newspace(res_arch, cfg.search.refine_top_fraction, cfg.search)
     if verbose:
         print("[retune] narrowed space: %r" % ([ (d.name, type(d).__name__) for d in space ],))
+    epsilon, _info = resolve_tie_break_epsilon(cfg, splits, verbose=verbose)
     return _run_gp(
         space=space, base_cfg=cfg, splits=splits, device=device,
         n_calls=int(cfg.search.n_calls_arch),
         random_state=int(cfg.search.gp_random_state),
-        build_cfg=config_from_arch_point, verbose=verbose, tag="retune")
+        build_cfg=config_from_arch_point, verbose=verbose, tag="retune",
+        n_initial_points=int(cfg.search.n_initial_points),   # [C3]
+        epsilon=epsilon)                                     # [C2]
 
 
 def regularization_space(reg_cfg):
@@ -631,11 +722,23 @@ def search_regularization(cfg, splits, device, verbose=False):
     tuned at dropout = 0, whereas here it is re-tuned jointly with dropout, because
     the two regularizers trade off against each other. The value found HERE wins.
     """
+    # [C2] The tie-break applies here too: this phase is scored by the same
+    # objective, on the same validation split, so epsilon is the same number.
+    # [C3] n_initial_points is DELIBERATELY not taken from SearchConfig here.
+    # This phase has its own budget (RegularizationConfig.n_calls, typically much
+    # smaller than n_calls_arch), and silently applying a SearchConfig field to a
+    # different phase's budget is exactly the kind of cross-wiring that makes a
+    # config unreadable. It therefore keeps the legacy rule. If you want it
+    # configurable, add n_initial_points to RegularizationConfig and pass it here
+    # -- a two-line change, deliberately left to an explicit decision.
+    epsilon, _info = resolve_tie_break_epsilon(cfg, splits, verbose=verbose)
     return _run_gp(
         space=regularization_space(cfg.regularization), base_cfg=cfg, splits=splits,
         device=device, n_calls=int(cfg.regularization.n_calls),
         random_state=int(cfg.regularization.gp_random_state),
-        build_cfg=config_from_reg_point, verbose=verbose, tag="reg")
+        build_cfg=config_from_reg_point, verbose=verbose, tag="reg",
+        n_initial_points=None,                               # [C3] legacy rule
+        epsilon=epsilon)                                     # [C2]
 
 
 def best_reg_dict(res):

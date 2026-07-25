@@ -49,6 +49,10 @@ from augmentation import AugmentationConfig
 
 __all__ = [
     "DataConfig",
+    "SyntheticConfig",
+    "SyntheticClassOverride",
+    "LatentConfig",
+    "LatentAxisOverride",
     "TrainConfig",
     "SearchConfig",
     "RegularizationConfig",
@@ -128,6 +132,248 @@ def config_from_dict(cls, data):
 
 
 # --------------------------------------------------------------------------- #
+# Synthetic burst-generator parameters (MultiClassSyntheticProvider)
+# --------------------------------------------------------------------------- #
+@dataclass
+class SyntheticClassOverride:
+    """Per-class override of the swept synthetic burst-generator parameters.
+
+    Every field defaults to None, meaning "do not override -- use the value the
+    global linear sweep assigns to this class". Only the non-None fields take
+    effect. A class index c that has no entry in SyntheticConfig.per_class (or an
+    entry with all-None fields) is generated purely from the global sweep.
+
+    Fields
+    ------
+    rate    : bursts/second for this class (overrides swept rate(c)).
+    width   : base Gaussian burst width in seconds (overrides swept width(c)).
+    amp_min : lower bound of per-burst amplitude jitter U(amp_min, amp_max).
+    amp_max : upper bound of per-burst amplitude jitter U(amp_min, amp_max).
+
+    Amplitude note: class 0 normally uses a FIXED amplitude a=1.0 (no jitter).
+    Supplying amp_min/amp_max for class 0 PROMOTES it to jittered amplitude like
+    any other class -- this is intentional and lets you break the class-0 special
+    case if you want all classes on equal footing. amp_min and amp_max must be
+    supplied together (both None, or both set); setting only one is an error.
+    """
+
+    rate: float = None
+    width: float = None
+    amp_min: float = None
+    amp_max: float = None
+
+    def __post_init__(self):
+        if self.rate is not None and self.rate <= 0:
+            raise ValueError("SyntheticClassOverride.rate must be > 0 if set")
+        if self.width is not None and self.width <= 0:
+            raise ValueError("SyntheticClassOverride.width must be > 0 if set")
+        if (self.amp_min is None) != (self.amp_max is None):
+            raise ValueError(
+                "SyntheticClassOverride: amp_min and amp_max must be set together "
+                "(both None or both provided)")
+        if self.amp_min is not None:
+            if self.amp_min <= 0 or self.amp_max <= 0:
+                raise ValueError("amp_min and amp_max must be > 0 if set")
+            if self.amp_min > self.amp_max:
+                raise ValueError("require amp_min <= amp_max")
+
+
+@dataclass
+class SyntheticConfig:
+    """Global burst-generator shape parameters for MultiClassSyntheticProvider,
+    plus optional per-class overrides.
+
+    The provider assigns each class c in {0..C-1} a sweep fraction
+        frac(c) = c / (C - 1)      (and frac(0) = 0 when C == 1),
+    then, for the GLOBAL sweep (any class without an override):
+        rate(c)  = rate_min  + (rate_max  - rate_min ) * frac(c)   [bursts/s]
+        width(c) = width_max - (width_max - width_min) * frac(c)   [seconds]
+    i.e. higher class index -> denser (higher rate) and narrower base width.
+    Per-burst amplitude jitter for classes c != 0 is U(amp_jitter_min,
+    amp_jitter_max); class 0 uses fixed a=1.0 unless a per-class amp override is
+    given for it.
+
+    per_class[c] (if present and with non-None fields) overrides the swept
+    rate/width and/or the amplitude jitter bounds for class c only. per_class may
+    be shorter than C: missing trailing classes fall back to the global sweep.
+    """
+
+    rate_min: float = 0.25
+    rate_max: float = 0.55
+    width_min: float = 0.15
+    width_max: float = 0.70
+    amp_jitter_min: float = 0.60
+    amp_jitter_max: float = 1.40
+    per_class: Tuple[SyntheticClassOverride, ...] = ()
+
+    def __post_init__(self):
+        if not (0 < self.rate_min <= self.rate_max):
+            raise ValueError("require 0 < rate_min <= rate_max")
+        if not (0 < self.width_min <= self.width_max):
+            raise ValueError("require 0 < width_min <= width_max")
+        if not (0 < self.amp_jitter_min <= self.amp_jitter_max):
+            raise ValueError("require 0 < amp_jitter_min <= amp_jitter_max")
+
+
+# --------------------------------------------------------------------------- #
+# Latent-factor generator parameters (LatentBurstProvider)   [C1]
+# --------------------------------------------------------------------------- #
+@dataclass
+class LatentAxisOverride:
+    """Per-axis override of a latent axis's PHYSICAL range [a_k, b_k].
+
+    Every field except name defaults to None, meaning "keep the canonical value
+    from latent_burst_generator.AXIS_REGISTRY". This is the calibration hook and
+    it exists for a specific reason: the canonical ranges are NOT independently
+    sourced. They were chosen to bracket the CONTROL_PARAMS / PATHO_PARAMS values
+    already present in generate_burst_data.py, whose own provenance is
+    undocumented. The literature grounds the IDENTITY and the DIRECTION of the
+    axes, not the numbers. Refitting [a_k, b_k] to real recordings must therefore
+    be possible from a config file, without editing code.
+
+    Fields
+    ------
+    name        : which axis to override; must be one of LatentConfig.axis_names.
+    lo, hi      : new range endpoints a_k, b_k in the axis's own physical units
+                  (see LatentAxis.units). Require lo < hi when both are given.
+    orientation : s_k in {+1, -1}; -1 makes phi_k = 1 map to the LOW end.
+    """
+
+    name: str = ""
+    lo: float = None
+    hi: float = None
+    orientation: int = None
+
+    def __post_init__(self):
+        if not str(self.name):
+            raise ValueError("LatentAxisOverride.name must name an axis")
+        if self.orientation is not None and int(self.orientation) not in (1, -1):
+            raise ValueError("LatentAxisOverride.orientation must be +1 or -1")
+        if (self.lo is not None and self.hi is not None
+                and not (float(self.lo) < float(self.hi))):
+            raise ValueError(
+                "LatentAxisOverride(%r): require lo < hi; got (%r, %r)"
+                % (self.name, self.lo, self.hi))
+
+
+@dataclass
+class LatentConfig:
+    """The n-latent-factor phenotype space (data_mode == "latent").   [C1]
+
+    What this buys over data_mode == "synthetic": the synthetic provider drives
+    BOTH of its degrees of freedom from the single scalar frac = c / (C - 1), so
+    the true data manifold is one-dimensional and the C classes are three points
+    on a line. Two consequences, both fatal for model selection: the task is
+    solvable by one hand-crafted scalar (validation ARI saturates at 1.0 and the
+    search objective becomes constant), and eff_rank ~= 1 is simultaneously the
+    CORRECT answer and the signature of representation collapse, so the collapse
+    tripwire cannot fire. Here the latent dimensionality, the class overlap, and
+    the label-relevance of each factor are explicit and tunable.
+
+    WHAT THIS BLOCK DOES NOT CONTAIN, and why. C, T_rec and f_s are NOT
+    duplicated here: latent mode reads them from the fields that already exist
+    and are already fingerprinted --
+        C       = len(DataConfig.synthetic_n_per_class)
+        n_c     =     DataConfig.synthetic_n_per_class[c]
+        T_rec   =     DataConfig.synthetic_duration_s   [s]
+        f_s     =     DataConfig.synthetic_fs           [Hz]  (w_size = 1 / f_s)
+    Two sources of truth for a sampling rate is a bug waiting to happen, and
+    those three fields already enter _data_fingerprint, so reusing them means
+    only the genuinely new parameters below need adding to it.
+
+    n is likewise NOT a field: n = len(axis_names) by construction, exposed as
+    the read-only property n_latent. A separate n_latent field could disagree
+    with the axis list, and there is no useful behaviour for it to have when it
+    does.
+
+    Attributes
+    ----------
+    axis_names    : ordered names of the latent factors, one per axis k. The
+                    ORDER defines the axis indices, so label_axes refers to this
+                    ordering. Names must exist in
+                    latent_burst_generator.AXIS_REGISTRY; the six canonical ones
+                    are irregularity, burst_rate, burst_duration,
+                    intraburst_rate, participation, background.
+    label_axes    : S, the 0-based indices into axis_names that CARRY the class
+                    label. Axes not in S are label-IRRELEVANT but physically real
+                    variation -- the analogue of biological variation the
+                    phenotype label does not name, and the axes whose retention
+                    the factor-retention metric measures.
+                    DEFAULT (0, 1) = irregularity + burst_rate, and this is
+                    CALIBRATED, not arbitrary: a single label axis on
+                    irregularity alone reached only ARI ~= 0.17 even at tau = 0,
+                    because at lambda_b in [0.10, 0.40] bursts/s a 30 s window
+                    holds only ~3-12 bursts and a duration CV cannot be estimated
+                    from so few. Do not revert to one label axis without
+                    re-running that calibration.
+    class_overlap : tau >= 0, the spread of a trace's label coordinates about its
+                    class centre m_c = c / (C - 1), in normalized latent units.
+                    tau = 0 gives deterministic class centres; larger tau makes
+                    the classes overlap. This is THE task-difficulty knob.
+    n_neurons     : N, neurons per simulated culture.
+    gaussian_window : IFR smoothing sd [s].
+    axis_overrides  : optional per-axis range recalibration (see above).
+    """
+
+    axis_names: Tuple[str, ...] = (
+        "irregularity", "burst_rate", "burst_duration",
+        "intraburst_rate", "participation", "background")
+    label_axes: Tuple[int, ...] = (0, 1)
+    class_overlap: float = 0.10
+    n_neurons: int = 100
+    gaussian_window: float = 0.04
+    axis_overrides: Tuple[LatentAxisOverride, ...] = ()
+
+    def __post_init__(self):
+        names = tuple(str(nm) for nm in self.axis_names)
+        if len(names) < 1:
+            raise ValueError("latent.axis_names must list at least one axis")
+        if len(set(names)) != len(names):
+            raise ValueError("latent.axis_names contains duplicates: %r" % (names,))
+        n = len(names)
+        if len(self.label_axes) < 1:
+            raise ValueError(
+                "latent.label_axes must be non-empty: with S empty no axis "
+                "carries the class label and the task is unlearnable")
+        for k in self.label_axes:
+            if not (0 <= int(k) < n):
+                raise ValueError(
+                    "latent.label_axes index %r out of range [0, %d) for "
+                    "axis_names %r" % (k, n, names))
+        if len(set(int(k) for k in self.label_axes)) != len(self.label_axes):
+            raise ValueError("latent.label_axes contains duplicates")
+        if len(self.label_axes) == n:
+            warnings.warn(
+                "latent: EVERY axis carries the class label (S = all axes), so "
+                "there are no label-irrelevant factors left. The factor-retention "
+                "metric has nothing to measure and eff_rank recovers its "
+                "ambiguity as a collapse tripwire.",
+                RuntimeWarning)
+        if self.class_overlap < 0.0:
+            raise ValueError("latent.class_overlap (tau) must be >= 0")
+        if int(self.n_neurons) < 1:
+            raise ValueError("latent.n_neurons must be >= 1")
+        if float(self.gaussian_window) <= 0.0:
+            raise ValueError("latent.gaussian_window must be > 0")
+        for i, ov in enumerate(self.axis_overrides):
+            if str(ov.name) not in names:
+                raise ValueError(
+                    "latent.axis_overrides[%d] names axis %r, which is not among "
+                    "axis_names %r" % (i, ov.name, names))
+
+    @property
+    def n_latent(self) -> int:
+        """n, the number of latent factors. DERIVED: n = len(axis_names)."""
+        return len(self.axis_names)
+
+    @property
+    def free_axes(self) -> Tuple[int, ...]:
+        """Indices k not in S: the label-IRRELEVANT factors."""
+        label = set(int(k) for k in self.label_axes)
+        return tuple(k for k in range(self.n_latent) if k not in label)
+
+
+# --------------------------------------------------------------------------- #
 # Data: loading + windowing + splitting + augmentation params
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -135,16 +381,29 @@ class DataConfig:
     """Data loading, windowing, time-segment splitting, and augmentation params."""
 
     # --- source ---
-    data_mode: str = "synthetic"            # "synthetic" | "real" | "numpy"
+    data_mode: str = "synthetic"            # "synthetic" | "real" | "numpy" | "latent"
     specs_json: str = ""                    # real mode: path to specs list
     npz_specs: str = ""                     # numpy mode: path to burst_specs.json
 
     # --- synthetic generation (multi-class capable) ---
     # one entry per phenotype class: number of synthetic traces for that class;
     # length of this tuple == number of classes C (labels 0..C-1).
+    # ALSO used by data_mode == "latent" (see LatentConfig): C, n_c, T_rec and
+    # f_s are shared rather than duplicated.
     synthetic_n_per_class: Tuple[int, ...] = (2, 1)
     synthetic_duration_s: float = 600.0
     synthetic_fs: float = 50.0
+    # burst-generator shape params (rate/width sweep, amplitude jitter, and
+    # optional per-class overrides). Consumed by build_traces() when
+    # data_mode == "synthetic". Ignored for real/numpy/latent modes.
+    synthetic: "SyntheticConfig" = field(default_factory=lambda: SyntheticConfig())
+    # [C1] n-latent-factor generator params. Consumed by build_traces() when
+    # data_mode == "latent". Ignored for synthetic/real/numpy modes. It is a
+    # SEPARATE mode rather than a mutation of "synthetic" on purpose: several
+    # existing smoke tests and config_toy.json exercise "synthetic", so changing
+    # its semantics would silently alter what those tests mean. A new mode is
+    # additive and leaves every existing test meaningful.
+    latent: "LatentConfig" = field(default_factory=lambda: LatentConfig())
 
     # --- windowing ---
     window_s: float = 200.0
@@ -160,14 +419,22 @@ class DataConfig:
         default_factory=lambda: AugmentationConfig(fs=_PLACEHOLDER_FS))
 
     def __post_init__(self):
-        if self.data_mode not in ("synthetic", "real", "numpy"):
-            raise ValueError("data_mode must be 'synthetic', 'real', or 'numpy'")
+        if self.data_mode not in ("synthetic", "real", "numpy", "latent"):
+            raise ValueError(
+                "data_mode must be 'synthetic', 'real', 'numpy', or 'latent'")
         if len(self.synthetic_n_per_class) < 1:
             raise ValueError("synthetic_n_per_class must have at least one class")
         if any(int(n) < 1 for n in self.synthetic_n_per_class):
             raise ValueError("each synthetic_n_per_class entry must be >= 1")
         if self.synthetic_duration_s <= 0 or self.synthetic_fs <= 0:
             raise ValueError("synthetic_duration_s and synthetic_fs must be > 0")
+        # per-class overrides may not name a class index beyond the declared C
+        n_classes = len(self.synthetic_n_per_class)
+        if len(self.synthetic.per_class) > n_classes:
+            raise ValueError(
+                "synthetic.per_class has %d entries but there are only %d classes "
+                "(synthetic_n_per_class); per_class[c] maps to class c"
+                % (len(self.synthetic.per_class), n_classes))
         if self.window_s <= 0 or self.train_stride_s <= 0 or self.eval_stride_s <= 0:
             raise ValueError("window_s and strides must be > 0")
         if len(self.split_fractions) != 3:
@@ -298,6 +565,43 @@ class SearchConfig:
     n_calls_arch: int = 100
     n_calls_train: int = 100
     gp_random_state: int = 0
+    # [C3] n_init: how many of the n_calls trials are the RANDOM INITIAL DESIGN,
+    # drawn quasi-randomly BEFORE the GP surrogate is ever fitted. 0 means "use
+    # the legacy rule n_init = min(10, max(1, n_calls // 2))", which is what
+    # search.py hard-coded and which every pre-C3 config therefore reproduces
+    # EXACTLY -- so this field is additive and changes no existing run. It is
+    # exposed because n_init is the mechanism by which a study can return a
+    # pre-surrogate random draw as its "optimum": with n_calls = 50 the legacy
+    # rule spends 10 trials before the surrogate exists, and if the objective
+    # saturates, argmin returns the FIRST of the tied trials, which is one of
+    # those 10. Resolved by objective_utils.resolve_n_initial_points.
+    n_initial_points: int = 0
+
+    # [C2] Adaptive lexicographic tie-break. The search objective becomes
+    #     J_eps(t) = -(1/S) sum_sigma [ ARI(t,sigma,e*) + eps * Sil(t,sigma,e*) ],
+    # with BOTH metrics read at the SAME selected epoch e*, and
+    #     eps = tie_break_gamma * Delta_min(y) / (tie_break_sil_hi - tie_break_sil_lo),
+    # where Delta_min(y) is the ARI RESOLUTION of the validation labels y: the
+    # smallest strictly-positive gap below 1 that ARI can take on that set
+    # (search.resolve_tie_break_epsilon -> objective_utils.adaptive_epsilon).
+    # Because eps * (s_hi - s_lo) = gamma * Delta_min(y) < Delta_min(y) for every
+    # gamma in (0, 1), the secondary metric can only reorder configurations that
+    # the primary metric CANNOT separate.
+    #
+    # tie_break_gamma = 0.0 DISABLES the tie-break and reproduces the pre-C2
+    # objective exactly (primary metric only, still read at e*).
+    #
+    # The default is deliberately non-zero: the archived 3-class run had 47 of 50
+    # phase-1 trials return validation ARI of exactly 1.0, so the objective had no
+    # way to rank them and argmin returned the first, a pre-surrogate random draw.
+    # gamma = 0.5 leaves a factor-2 margin on the guarantee.
+    tie_break_gamma: float = 0.5
+    # Assumed bounds [s_lo, s_hi] of the SECONDARY metric. Defaults are the
+    # theoretical silhouette bounds, which is the SAFE choice: it makes the
+    # guarantee hold universally rather than only for the silhouette values this
+    # particular study happens to produce.
+    tie_break_sil_lo: float = -1.0
+    tie_break_sil_hi: float = 1.0
     do_refine: bool = False                 # coarse-to-fine second pass (get_newspace)
     refine_top_fraction: float = 0.10       # fraction of best points used to narrow the box
     do_retune_arch: bool = False            # optional architecture re-tune after phase 2
@@ -334,8 +638,39 @@ class SearchConfig:
                 "one_minus_beta*_range high must be < 1.0 (beta = 1 - x must stay > 0)")
         if self.n_calls_arch < 1 or self.n_calls_train < 1:
             raise ValueError("n_calls_arch and n_calls_train must be >= 1")
+        # [C3] n_initial_points > n_calls would leave the surrogate no trials at
+        # all and silently degrade the phase to pure random search. Checked here
+        # (config construction) as well as in resolve_n_initial_points (call
+        # site), so the error fires BEFORE any trace is generated rather than
+        # after the data cache is built.
+        if self.n_initial_points < 0:
+            raise ValueError(
+                "n_initial_points must be >= 0 (0 means the legacy rule "
+                "min(10, max(1, n_calls // 2)))")
+        if self.n_initial_points > 0:
+            for _name, _n_calls in (("n_calls_arch", self.n_calls_arch),
+                                    ("n_calls_train", self.n_calls_train)):
+                if self.n_initial_points > _n_calls:
+                    raise ValueError(
+                        "n_initial_points (%d) exceeds %s (%d): the GP surrogate "
+                        "would never be fitted in that phase and the study would "
+                        "be pure random search."
+                        % (self.n_initial_points, _name, _n_calls))
         if not (0.0 < self.refine_top_fraction <= 1.0):
             raise ValueError("refine_top_fraction must lie in (0, 1]")
+        # [C2] gamma = 0 is the documented "disabled" value; gamma > 1 would let
+        # the secondary metric overturn a genuine primary difference, which is
+        # precisely the failure mode the derivation exists to exclude.
+        if not (0.0 <= self.tie_break_gamma <= 1.0):
+            raise ValueError(
+                "tie_break_gamma must lie in [0, 1] (0 disables the tie-break; "
+                "gamma > 1 would break the lexicographic guarantee "
+                "eps * (s_hi - s_lo) < Delta_min(y)); got %r"
+                % (self.tie_break_gamma,))
+        if not (self.tie_break_sil_lo < self.tie_break_sil_hi):
+            raise ValueError(
+                "require tie_break_sil_lo < tie_break_sil_hi; got (%r, %r)"
+                % (self.tie_break_sil_lo, self.tie_break_sil_hi))
 
 
 # --------------------------------------------------------------------------- #

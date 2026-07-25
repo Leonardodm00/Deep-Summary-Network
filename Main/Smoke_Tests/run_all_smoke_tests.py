@@ -68,10 +68,15 @@ import time
 from pathlib import Path
 
 # The CANONICAL order, foundational -> compositional (see module docstring).
-# All fifteen suites now exist. Three of them (data_splits, metrics, end_to_end)
+# Sixteen suites now exist. Three of them (data_splits, metrics, end_to_end)
 # were written and passing but had never been committed to the repository; they
-# were recovered and are included here. Any suite listed but absent on disk is
-# reported as a GAP at the end of the run rather than silently skipped.
+# were recovered and are included here. smoke_test_synthetic_config.py was
+# added later (configurable burst-generator params + per-run saved traces) and
+# is placed after smoke_test_run_optimization.py because it imports
+# run_optimization directly (R._resolved_synthetic_params,
+# R.save_synthetic_artifacts), so it depends on that suite's import chain
+# already working. Any suite listed but absent on disk is reported as a GAP at
+# the end of the run rather than silently skipped.
 ORDER = [
     "smoke_test_config.py",
     "smoke_test_backbone.py",
@@ -87,6 +92,7 @@ ORDER = [
     "smoke_test_search.py",
     "smoke_test_end_to_end.py",             # full pipeline + REAL resume
     "smoke_test_run_optimization.py",
+    "smoke_test_synthetic_config.py",       # configurable burst params + saved artifacts
     "smoke_test_run_optimization_colab.py",
 ]
 

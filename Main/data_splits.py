@@ -79,13 +79,48 @@ class MultiClassSyntheticProvider:
 
     def __init__(self, n_classes: int, duration_s: float = 600.0, fs: float = 50.0,
                  seed: int = 0, rate_min: float = 0.25, rate_max: float = 0.55,
-                 width_min: float = 0.15, width_max: float = 0.70):
+                 width_min: float = 0.15, width_max: float = 0.70,
+                 amp_jitter_min: float = 0.60, amp_jitter_max: float = 1.40,
+                 per_class: Sequence = ()):
+        """Parameters
+        ----------
+        n_classes       : number of phenotype classes C (labels 0..C-1).
+        duration_s, fs  : trace duration (s) and sampling rate (Hz).
+        seed            : base seed; per-trace rng seeds are derived as
+                          seed + 1000*condition + trace_id (unchanged).
+        rate_min/max    : global linear sweep of burst rate (bursts/s) across
+                          classes; class c gets rate_min + (rate_max-rate_min)*
+                          frac(c), frac(c)=c/(C-1).
+        width_min/max   : global linear sweep of base burst width (s); class c
+                          gets width_max - (width_max-width_min)*frac(c).
+        amp_jitter_min/max : per-burst amplitude jitter bounds U(min,max) applied
+                          to classes c != 0 (class 0 uses fixed a=1.0). Previously
+                          hard-coded as U(0.6, 1.4); now configurable.
+        per_class       : optional sequence of per-class override objects. Entry
+                          c (if present) may carry .rate, .width, .amp_min,
+                          .amp_max (each may be None = no override). per_class may
+                          be shorter than C; missing entries fall back to the
+                          global sweep. Supplying amp_min/amp_max for class 0
+                          promotes it to jittered amplitude (breaks the a=1.0
+                          special case for that class only).
+
+        Backward compatibility: called with only (n_classes, duration_s, fs,
+        seed) plus the original rate/width kwargs, the rng draw ORDER is
+        identical to the previous implementation, so traces are byte-identical to
+        prior cached runs. The amplitude-jitter draw for c != 0 uses the same
+        rng.uniform call position as before (only its bounds are now
+        parameterized, defaulting to the old 0.6/1.4).
+        """
         if n_classes < 1:
             raise ValueError("n_classes must be >= 1")
         if duration_s <= 0 or fs <= 0:
             raise ValueError("duration_s and fs must be > 0")
         if not (0 < width_min <= width_max):
             raise ValueError("require 0 < width_min <= width_max")
+        if not (0 < rate_min <= rate_max):
+            raise ValueError("require 0 < rate_min <= rate_max")
+        if not (0 < amp_jitter_min <= amp_jitter_max):
+            raise ValueError("require 0 < amp_jitter_min <= amp_jitter_max")
         self.n_classes = int(n_classes)
         self.duration_s = float(duration_s)
         self.fs = float(fs)
@@ -94,6 +129,30 @@ class MultiClassSyntheticProvider:
         self.rate_max = float(rate_max)
         self.width_min = float(width_min)
         self.width_max = float(width_max)
+        self.amp_jitter_min = float(amp_jitter_min)
+        self.amp_jitter_max = float(amp_jitter_max)
+        # normalize per_class into a plain list indexed by class; entries may be
+        # None (no override for that class). Accept objects with attributes
+        # (rate/width/amp_min/amp_max) or plain dicts.
+        self.per_class = list(per_class) if per_class else []
+        if len(self.per_class) > self.n_classes:
+            raise ValueError(
+                "per_class has %d entries but n_classes=%d"
+                % (len(self.per_class), self.n_classes))
+
+    def _override_for(self, condition: int):
+        """Return (rate, width, amp_min, amp_max) overrides for a class as a
+        4-tuple, each element None when not overridden. Reads either attribute-
+        style objects (SyntheticClassOverride) or dicts."""
+        if condition >= len(self.per_class):
+            return (None, None, None, None)
+        o = self.per_class[condition]
+        if o is None:
+            return (None, None, None, None)
+        if isinstance(o, dict):
+            return (o.get("rate"), o.get("width"), o.get("amp_min"), o.get("amp_max"))
+        return (getattr(o, "rate", None), getattr(o, "width", None),
+                getattr(o, "amp_min", None), getattr(o, "amp_max", None))
 
     def _class_fraction(self, condition: int) -> float:
         if self.n_classes == 1:
@@ -107,8 +166,22 @@ class MultiClassSyntheticProvider:
         condition = int(condition)
         trace_id = int(trace_id)
         frac = self._class_fraction(condition)
+
+        ov_rate, ov_width, ov_amp_min, ov_amp_max = self._override_for(condition)
+
+        # swept defaults, then apply per-class overrides where present
         rate = self.rate_min + (self.rate_max - self.rate_min) * frac          # bursts / s
         base_width = self.width_max - (self.width_max - self.width_min) * frac  # seconds
+        if ov_rate is not None:
+            rate = float(ov_rate)
+        if ov_width is not None:
+            base_width = float(ov_width)
+
+        amp_min = self.amp_jitter_min if ov_amp_min is None else float(ov_amp_min)
+        amp_max = self.amp_jitter_max if ov_amp_max is None else float(ov_amp_max)
+        # class 0 is fixed-amplitude (a=1.0) UNLESS an explicit amp override is
+        # given for class 0, which promotes it to jittered like the other classes
+        class0_amp_overridden = (condition == 0 and ov_amp_min is not None)
 
         rng = np.random.default_rng(self.seed + 1000 * condition + trace_id)
         T = int(self.duration_s * self.fs)
@@ -118,12 +191,12 @@ class MultiClassSyntheticProvider:
         n_bursts = max(1, int(rng.poisson(rate * self.duration_s)))
         centers = rng.uniform(0.0, self.duration_s, n_bursts)
         for c in centers:
-            if condition == 0:
+            if condition == 0 and not class0_amp_overridden:
                 w = base_width                        # regular baseline
                 a = 1.0
             else:
                 w = float(rng.uniform(0.5 * base_width, 1.5 * base_width))  # irregular
-                a = float(rng.uniform(0.6, 1.4))
+                a = float(rng.uniform(amp_min, amp_max))
             x += a * np.exp(-0.5 * ((t - c) / w) ** 2)
         return x.astype(np.float32), self.fs
 

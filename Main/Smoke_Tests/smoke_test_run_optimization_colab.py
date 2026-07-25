@@ -174,8 +174,30 @@ class _FakeGoogleColab(object):
 # [A] environment detection
 # --------------------------------------------------------------------------- #
 def check_A():
-    assert C._importable("google.colab") is False, \
-        "google.colab must NOT be importable in this sandbox (sanity check)"
+    # This test must work BOTH off-Colab (where google.colab genuinely is not
+    # importable) AND on a real Colab runtime (where it genuinely IS) -- it must
+    # never assume which one it is running in.
+    real_colab = C._importable("google.colab")
+
+    # IN_COLAB is bound once at module import time. This is the one assertion
+    # that matters regardless of environment: it must match reality, whatever
+    # reality happens to be. If detection were broken (e.g. hard-coded False),
+    # this catches it on a real Colab runtime; a fake could not.
+    assert C.IN_COLAB == real_colab, (
+        "IN_COLAB=%r does not match the actual environment "
+        "(google.colab importable=%r)" % (C.IN_COLAB, real_colab))
+
+    if real_colab:
+        # On a genuine Colab runtime: do NOT swap out the real google.colab
+        # package in sys.modules -- there is nothing to prove by faking
+        # something that is already, verifiably, really there.
+        ok("A", "REAL Colab runtime: IN_COLAB=True verified directly against "
+                "the live environment (no injection needed or attempted)")
+        return
+
+    # Off-Colab: prove the DETECTION MECHANISM itself, since there is no real
+    # google.colab to check against -- inject a fake, confirm it flips, then
+    # confirm removal restores non-importability.
     fake = _FakeGoogleColab()
     fake.install()
     try:
@@ -185,9 +207,6 @@ def check_A():
         fake.remove()
     assert C._importable("google.colab") is False, \
         "removing the fake module must restore non-importability"
-    # IN_COLAB itself is bound at import time, matching the real environment
-    assert C.IN_COLAB is False, \
-        "this sandbox is not Colab; IN_COLAB must reflect that"
     ok("A", "google.colab importability flips correctly on inject/remove; "
             "IN_COLAB correctly False in this non-Colab sandbox")
 
@@ -294,27 +313,52 @@ def check_B():
 # [C] maybe_mount_drive
 # --------------------------------------------------------------------------- #
 def check_C():
-    # not in Colab, mount=True -> no-op, no raise
-    assert C.IN_COLAB is False
+    # mount=False must ALWAYS no-op, on or off Colab, with no side effects.
+    assert C.maybe_mount_drive(False, "/content/drive", verbose=False) is False
+
+    # For mount=True we verify the WIRING -- that maybe_mount_drive calls
+    # google.colab.drive.mount with the mountpoint it was given and returns True
+    # -- WITHOUT ever triggering the real mount. The real mount is not a pure
+    # function: it needs a live IPython kernel to show its auth popup, so it
+    # raises from a plain terminal (no kernel) and would pop an OAuth dialog
+    # inside a notebook. A smoke test must do neither. So we monkeypatch the
+    # mount function to a stub that just records its argument. This path is
+    # identical whether we are on real Colab, in a terminal, or off-Colab
+    # entirely -- the one behaviour that actually matters is environment-
+    # independent, so the test is too.
+    recorded = []
+
+    def stub_mount(mountpoint, **kwargs):
+        recorded.append(mountpoint)
+
+    if C.IN_COLAB:
+        import google.colab.drive as real_drive_mod
+        saved = real_drive_mod.mount
+        real_drive_mod.mount = stub_mount
+        try:
+            result = C.maybe_mount_drive(True, "/content/drive", verbose=False)
+            assert result is True, \
+                "maybe_mount_drive(True, ...) must return True on Colab"
+            assert recorded == ["/content/drive"], recorded
+        finally:
+            real_drive_mod.mount = saved
+        ok("C", "REAL Colab runtime: mount=False no-ops; mount=True calls "
+                "drive.mount with the given mountpoint and returns True "
+                "(verified via a stub -- the real auth flow is never triggered, "
+                "so this works from a terminal too)")
+        return
+
+    # Off-Colab: the same wiring, proven with an injected fake package, PLUS the
+    # mount=True-but-not-Colab no-op path that the Colab branch cannot reach.
     assert C.maybe_mount_drive(True, "/content/drive", verbose=False) is False
 
-    # IN_COLAB is captured ONCE at import time (deliberately -- a notebook's
-    # environment does not change mid-process, so a live re-check on every
-    # call would be pure overhead). Injecting google.colab into sys.modules
-    # after import therefore does NOT retroactively flip it; the test patches
-    # the module constant directly, which is exactly how maybe_mount_drive
-    # reads it (a global lookup in run_optimization_colab's own namespace).
     fake = _FakeGoogleColab()
     fake.install()
     old_in_colab = C.IN_COLAB
     C.IN_COLAB = True
     try:
-        # in Colab, mount=False -> no-op
         assert C.maybe_mount_drive(False, "/content/drive", verbose=False) is False
         assert fake.mount_calls == []
-
-        # in Colab, mount=True -> the fake drive.mount is called with the
-        # exact mountpoint given
         result = C.maybe_mount_drive(True, "/custom/mount", verbose=False)
         assert result is True
         assert fake.mount_calls == ["/custom/mount"], fake.mount_calls
