@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N dsn_4c_easypos
+#PBS -l select=1:ncpus=8
+#PBS -l walltime=110:00:00
+#PBS -o dsn_4c_easypos.out
+#PBS -e dsn_4c_easypos.err
+
+# C=4, n_c=4 (16 traces), T_rec=900 s, tau=0.07, window 60 s at 30% overlap
+# (stride 42 s), depth_exponent in [2,5], 60/60/20 trials, n_initial_points=20,
+# n_seeds=2 -> 282 train() runs. Windows: 192 train / 48 val / 48 test.
+# Estimated ~81 h by scaling the archived 39 h / 242 run measurement (1.78x work
+# per epoch); 110:00:00 leaves ~35% headroom. CONFIRM with the timing run:
+# THE SEARCH PHASES DO NOT RESUME, so an overrun loses everything but the cache.
+# mining_strategy = easypos is the ONLY substantive difference between the two jobs.
+
+cd $PBS_O_WORKDIR
+conda activate meacnn_cpu
+export PYTHONPATH="$PBS_O_WORKDIR:$PYTHONPATH"
+
+python3 run_optimization.py \
+    --config hpc/config_latent_4class_easypos.json \
+    --verbose \
+    --trial-verbose
