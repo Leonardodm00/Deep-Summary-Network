@@ -594,6 +594,26 @@ class SearchConfig:
     # those 10. Resolved by objective_utils.resolve_n_initial_points.
     n_initial_points: int = 0
 
+    # Search STRATEGY.
+    #   "staged" (default, and what every run before this option used):
+    #       phase 1 optimizes the 4 ARCHITECTURE HPs with the optimizer frozen,
+    #       phase 2 optimizes the 5 TRAINING HPs with the architecture frozen at
+    #       the phase-1 winner, then the regularization stage optimizes 2 more
+    #       with both frozen. Cheap per dimension, but it ASSUMES SEPARABILITY:
+    #       that the best architecture is best regardless of the optimizer it
+    #       ends up paired with. A depth that only pays off at a learning rate
+    #       phase 1 never tried is invisible to this search.
+    #   "joint":
+    #       ONE GP over all 10 HPs at once. No separability assumption; pays for
+    #       it in dimension, since 140 trials sample 10-D far more thinly than
+    #       three GPs sample 4-D, 5-D and 2-D.
+    # Which wins is empirical. Run both, same seed, same data.
+    search_mode: str = "staged"
+    # Joint budget. 0 = MATCH the staged total (n_calls_arch + n_calls_train +
+    # regularization.n_calls), which is the only setting under which a
+    # staged-vs-joint comparison is about strategy rather than about compute.
+    n_calls_joint: int = 0
+
     # [C2] Adaptive lexicographic tie-break. The search objective becomes
     #     J_eps(t) = -(1/S) sum_sigma [ ARI(t,sigma,e*) + eps * Sil(t,sigma,e*) ],
     # with BOTH metrics read at the SAME selected epoch e*, and
@@ -660,6 +680,11 @@ class SearchConfig:
         # (config construction) as well as in resolve_n_initial_points (call
         # site), so the error fires BEFORE any trace is generated rather than
         # after the data cache is built.
+        if self.search_mode not in ("staged", "joint"):
+            raise ValueError("search_mode must be 'staged' or 'joint'; got %r"
+                             % (self.search_mode,))
+        if self.n_calls_joint < 0:
+            raise ValueError("n_calls_joint must be >= 0 (0 = match the staged total)")
         if self.n_initial_points < 0:
             raise ValueError(
                 "n_initial_points must be >= 0 (0 means the legacy rule "

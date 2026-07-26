@@ -1168,6 +1168,28 @@ def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
     Ns = int(work.train.n_seeds)
     print("[run] PHASE 1: architecture (%d trials x %d seeds)"
           % (work.search.n_calls_arch, Ns))
+    # SINGLE-STAGE branch: one GP over every HP, then straight to the final
+    # training. The staged phases below are skipped entirely -- not run and
+    # discarded -- so the two modes cost the same only because the joint budget
+    # defaults to the staged total (S.resolve_n_calls_joint).
+    if getattr(cfg.search, "search_mode", "staged") == "joint":
+        res_j = S.search_joint(work, splits, device, verbose=verbose,
+                               train_verbose=trial_verbose)
+        best_j = S.best_joint_dict(res_j)
+        work = S.config_from_joint_point(work, res_j.x)
+        report = {
+            "search_mode": "joint",
+            "joint": {"best": {k: (float(v) if not isinstance(v, (int, bool)) else v)
+                               for k, v in best_j.items()},
+                      "objective": float(res_j.fun),
+                      "n_calls": int(len(res_j.func_vals)),
+                      "n_initial_points": int(getattr(res_j, "n_initial_points_used", 0)),
+                      "trial_log": res_j.trial_log},
+        }
+        if on_stage_complete is not None:
+            on_stage_complete("joint", work)
+        return work, report
+
     res1 = S.search_architecture(work, splits, device, verbose=verbose,
                                  train_verbose=trial_verbose)
     best_arch = _cast_arch(S.best_arch_dict(res1))

@@ -1,0 +1,200 @@
+{
+  "data": {
+    "data_mode": "latent",
+    "specs_json": "",
+    "npz_specs": "",
+    "synthetic_n_per_class": [
+      4,
+      4,
+      4,
+      4
+    ],
+    "synthetic_duration_s": 900.0,
+    "synthetic_fs": 50.0,
+    "synthetic": {
+      "rate_min": 0.25,
+      "rate_max": 0.55,
+      "width_min": 0.15,
+      "width_max": 0.7,
+      "amp_jitter_min": 0.6,
+      "amp_jitter_max": 1.4,
+      "per_class": []
+    },
+    "window_s": 60.0,
+    "train_stride_s": 42.0,
+    "eval_stride_s": 60.0,
+    "split_fractions": [
+      0.6,
+      0.2,
+      0.2
+    ],
+    "drop_boundary_windows": true,
+    "augmentation": {
+      "fs": 50.0,
+      "intra_knot_dist": 0.2,
+      "sigma_mag_pos": [
+        0.01,
+        0.1
+      ],
+      "sigma_mag_neg": [
+        0.2,
+        0.5
+      ],
+      "sigma_time_pos_s": [
+        0.005,
+        0.05
+      ],
+      "sigma_time_neg_s": [
+        0.1,
+        0.4
+      ],
+      "shift_magnitude_s": 5.0,
+      "n_positives": 8,
+      "n_negatives": 8,
+      "split_method": "warp_bands",
+      "percentile_q": 0.3,
+      "k_min": 4,
+      "max_retries": 5,
+      "enforce_nonneg": true
+    },
+    "latent": {
+      "axis_names": [
+        "irregularity",
+        "burst_rate",
+        "burst_duration",
+        "intraburst_rate",
+        "participation",
+        "background"
+      ],
+      "label_axes": [
+        0,
+        1
+      ],
+      "class_overlap": 0.07,
+      "class_center_mode": "interior",
+      "n_neurons": 100,
+      "gaussian_window": 0.04,
+      "axis_overrides": []
+    }
+  },
+  "backbone": {
+    "depth_exponent": 4,
+    "width_multiplier": 2.0,
+    "stem_width": 16,
+    "block_family": 0,
+    "group_width": 16,
+    "embedding_size": 16,
+    "l2_normalize": true,
+    "head_fusion": false,
+    "head_pool_ops": [
+      "mean"
+    ],
+    "head_prenorm": true,
+    "norm_target_cpg": 16,
+    "norm_g_max": 32,
+    "stem_kernel": 5,
+    "stem_stride": 4,
+    "stage_kernel": 3,
+    "downsampling_rate": 2,
+    "dropout": 0.0
+  },
+  "train": {
+    "margin": 0.3,
+    "swap": true,
+    "mining_strategy": "hard",
+    "windows_per_condition": 4,
+    "batches_per_epoch": 0,
+    "lr": 0.0003,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "weight_decay": 0.0001,
+    "max_epochs": 50,
+    "patience": 10,
+    "min_delta_ari": 0.0,
+    "min_delta_sil": 0.0,
+    "selection_primary": "ari",
+    "n_seeds": 2,
+    "use_scheduler": false,
+    "scheduler_type": "cosine",
+    "use_amp": false,
+    "log_every_epochs": 1,
+    "checkpoint_every_epochs": 5
+  },
+  "search": {
+    "depth_exponent_range": [
+      2,
+      5
+    ],
+    "width_multiplier_range": [
+      1.5,
+      3.0
+    ],
+    "block_family_choices": [
+      0,
+      1
+    ],
+    "embedding_size_range": [
+      8,
+      16
+    ],
+    "margin_range": [
+      0.1,
+      1.0
+    ],
+    "lr_range": [
+      0.0001,
+      0.2
+    ],
+    "one_minus_beta1_range": [
+      0.01,
+      0.1
+    ],
+    "one_minus_beta2_range": [
+      0.0001,
+      0.01
+    ],
+    "weight_decay_range": [
+      0.0001,
+      0.01
+    ],
+    "n_calls_arch": 60,
+    "n_calls_train": 60,
+    "gp_random_state": 0,
+    "do_refine": false,
+    "refine_top_fraction": 0.1,
+    "do_retune_arch": false,
+    "n_initial_points": 20,
+    "tie_break_gamma": 0.5,
+    "tie_break_sil_lo": -1.0,
+    "tie_break_sil_hi": 1.0
+  },
+  "regularization": {
+    "dropout_range": [
+      0.0,
+      0.3
+    ],
+    "weight_decay_range": [
+      1e-05,
+      0.01
+    ],
+    "n_calls": 20,
+    "gp_random_state": 0
+  },
+  "eval": {
+    "kmeans_seed": 0,
+    "kmeans_n_init": 10,
+    "silhouette_metric": "cosine",
+    "pca_components": 2
+  },
+  "runtime": {
+    "seed": 0,
+    "device": "cpu",
+    "deterministic": true,
+    "torch_threads": 8,
+    "num_workers": 0,
+    "pin_memory": false,
+    "out_dir": "/davinci-1/home/ldellamea/Deep Summary Network/out",
+    "cache_dir": "/davinci-1/home/ldellamea/Deep Summary Network/cache_latent_4c",
+    "experiment_name": "latent_4class_hard"
+  }
+}

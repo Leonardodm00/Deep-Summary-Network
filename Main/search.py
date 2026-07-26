@@ -158,6 +158,11 @@ __all__ = [
     "search_training",
     "retune_architecture",
     "regularization_space",
+    "joint_space",
+    "config_from_joint_point",
+    "search_joint",
+    "best_joint_dict",
+    "resolve_n_calls_joint",
     "config_from_reg_point",
     "search_regularization",
     "best_reg_dict",
@@ -720,6 +725,134 @@ def config_from_reg_point(base_cfg, point):
     cfg.train.weight_decay = float(p["weight_decay"])
     cfg.validate()
     return cfg
+
+
+# --------------------------------------------------------------------------- #
+# JOINT (single-stage) search -- the alternative to the staged pipeline
+# --------------------------------------------------------------------------- #
+_JOINT_NAMES = ("depth_exponent", "width_multiplier", "block_family",
+                "embedding_size", "margin", "lr", "one_minus_beta1",
+                "one_minus_beta2", "weight_decay", "dropout")
+
+
+def joint_space(search_cfg, reg_cfg):
+    """ALL hyper-parameters in ONE 10-dimensional space.
+
+    The staged pipeline searches 4 dims (architecture), then 5 (training HPs) with
+    the architecture frozen at the phase-1 winner, then 2 (regularization) with both
+    frozen. That decomposition assumes SEPARABILITY: that the best architecture is
+    the best architecture whatever optimizer you eventually pair with it. The
+    assumption is not obviously true -- a deeper network may only beat a shallower
+    one at a learning rate the shallower one cannot tolerate -- and the staged
+    search cannot discover such a pairing, because by the time it varies the
+    learning rate the depth is already fixed.
+
+    Searching jointly makes no separability assumption. It pays for that with
+    dimension: a GP over 10 dims with the same number of trials is a far sparser
+    sample than three GPs over 4, 5 and 2. Which wins is an EMPIRICAL question
+    about this problem, which is why both are available and why the budget is
+    matched (see n_calls_joint).
+
+    weight_decay appears in BOTH train_space and regularization_space; jointly it
+    is ONE dimension, taking the regularization range, which is the wider of the
+    two and the one that wins in staged mode (the reg phase runs last and overwrites
+    the phase-2 value).
+
+    dropout is pinned to 0 throughout the staged arch/train phases and only freed in
+    the final stage; jointly it is free from trial 0.
+    """
+    lo_d, hi_d = search_cfg.depth_exponent_range
+    lo_w, hi_w = search_cfg.width_multiplier_range
+    lo_e, hi_e = search_cfg.embedding_size_range
+    lo_m, hi_m = search_cfg.margin_range
+    lo_lr, hi_lr = search_cfg.lr_range
+    lo_b1, hi_b1 = search_cfg.one_minus_beta1_range
+    lo_b2, hi_b2 = search_cfg.one_minus_beta2_range
+    lo_wd, hi_wd = reg_cfg.weight_decay_range          # the wider of the two
+    lo_dr, hi_dr = reg_cfg.dropout_range
+    return [
+        Integer(int(lo_d), int(hi_d), name="depth_exponent"),
+        Real(float(lo_w), float(hi_w), name="width_multiplier"),
+        Categorical(list(search_cfg.block_family_choices), name="block_family"),
+        Integer(int(lo_e), int(hi_e), name="embedding_size"),
+        Real(float(lo_m), float(hi_m), name="margin"),
+        Real(float(lo_lr), float(hi_lr), prior="log-uniform", name="lr"),
+        Real(float(lo_b1), float(hi_b1), prior="log-uniform", name="one_minus_beta1"),
+        Real(float(lo_b2), float(hi_b2), prior="log-uniform", name="one_minus_beta2"),
+        Real(float(lo_wd), float(hi_wd), prior="log-uniform", name="weight_decay"),
+        Real(float(lo_dr), float(hi_dr), name="dropout"),
+    ]
+
+
+def config_from_joint_point(base_cfg, point):
+    """ExperimentConfig for a joint point: EVERY searched HP moves at once.
+
+    Mirrors config_from_arch_point + config_from_train_point + config_from_reg_point
+    combined, including the beta = 1 - u conversion, so a joint trial and a staged
+    trial that happen to land on the same values build the IDENTICAL config. That
+    identity is what makes the two modes comparable at all, and the smoke test
+    asserts it rather than trusting it.
+    """
+    p = dict(zip(_JOINT_NAMES, point))
+    cfg = _deep_copy_cfg(base_cfg)
+    cfg.backbone = replace(
+        cfg.backbone,
+        depth_exponent=int(p["depth_exponent"]),
+        width_multiplier=float(p["width_multiplier"]),
+        block_family=int(p["block_family"]),
+        embedding_size=int(p["embedding_size"]),
+        dropout=float(p["dropout"]),
+    )
+    cfg.train.margin = float(p["margin"])
+    cfg.train.lr = float(p["lr"])
+    cfg.train.beta1 = 1.0 - float(p["one_minus_beta1"])
+    cfg.train.beta2 = 1.0 - float(p["one_minus_beta2"])
+    cfg.train.weight_decay = float(p["weight_decay"])
+    cfg.validate()
+    return cfg
+
+
+def resolve_n_calls_joint(search_cfg, reg_cfg):
+    """The joint budget. 0 means MATCH the staged pipeline's total, which is the
+    only setting under which the staged/joint comparison is about the STRATEGY
+    rather than about who got more compute."""
+    n = int(getattr(search_cfg, "n_calls_joint", 0))
+    if n > 0:
+        return n
+    return (int(search_cfg.n_calls_arch) + int(search_cfg.n_calls_train)
+            + int(reg_cfg.n_calls))
+
+
+def best_joint_dict(res):
+    """The winning joint point as a dict of the 10 HP names."""
+    return dict(zip(_JOINT_NAMES, res.x))
+
+
+def search_joint(cfg, splits, device, verbose=False, train_verbose=False):
+    """SINGLE-STAGE search: one GP over all 10 hyper-parameters.
+
+    Uses the same objective, the same tie-break epsilon and the same seed-block
+    discipline as the staged phases, so the only difference between the two modes
+    is the SHAPE OF THE SEARCH, not how a candidate is scored.
+    """
+    n_calls = resolve_n_calls_joint(cfg.search, cfg.regularization)
+    epsilon, _info = resolve_tie_break_epsilon(cfg, splits, verbose=verbose)
+    if verbose:
+        print("[joint] single-stage search over %d dimensions, %d trials "
+              "(staged total would be %d + %d + %d = %d)"
+              % (len(_JOINT_NAMES), n_calls, cfg.search.n_calls_arch,
+                 cfg.search.n_calls_train, cfg.regularization.n_calls,
+                 int(cfg.search.n_calls_arch) + int(cfg.search.n_calls_train)
+                 + int(cfg.regularization.n_calls)))
+    return _run_gp(
+        space=joint_space(cfg.search, cfg.regularization),
+        base_cfg=cfg, splits=splits, device=device,
+        n_calls=n_calls,
+        random_state=int(cfg.search.gp_random_state),
+        build_cfg=config_from_joint_point, verbose=verbose, tag="joint",
+        n_initial_points=int(cfg.search.n_initial_points),   # [C3]
+        epsilon=epsilon,                                     # [C2]
+        train_verbose=train_verbose)
 
 
 def search_regularization(cfg, splits, device, verbose=False,
