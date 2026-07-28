@@ -427,9 +427,32 @@ class DataConfig:
     train_stride_s: float = 100.0           # < window_s -> overlapping train windows (diversity)
     eval_stride_s: float = 200.0            # >= window_s -> DISJOINT val / test windows (no dup)
 
-    # --- time-segment split (option A): fractions along each trace's time axis ---
+    # --- split: fractions along each trace's time axis, or whole cultures ---
     split_fractions: Tuple[float, float, float] = (0.6, 0.2, 0.2)   # (train, val, test)
     drop_boundary_windows: bool = True      # drop windows straddling a split boundary
+
+    # split_mode selects WHICH splitter run_optimization builds:
+    #   "time_segment" -- data_splits.make_time_segment_splits (the default, and
+    #                     what every archived result used). Cuts each trace's
+    #                     time axis; no WINDOW straddles a boundary, but every
+    #                     culture contributes windows to all three splits, so
+    #                     culture identity remains exploitable.
+    #   "trace"        -- data_splits.make_trace_splits. A culture belongs to
+    #                     exactly ONE split, stratified by class. This is the
+    #                     split that matches the deployment question "classify a
+    #                     culture the network has never seen".
+    # Changing this INVALIDATES every quantity measured under the other mode:
+    # N_train/N_val/N_eval, batches_per_epoch, the ARI floor, and Delta_min.
+    split_mode: str = "time_segment"
+    # only consulted when split_mode == "trace":
+    trace_split_mode: str = "fractional"    # "fractional" | "leave_one_out"
+    trace_split_fold: int = 0               # which LOO fold; ignored otherwise
+    trace_split_seed: int = 0               # permutation seed, SEPARATE from
+                                            # runtime.seed so that seed-averaging
+                                            # does not reshuffle the split
+    min_train_cultures_per_class: int = 2   # 2 is the minimum at which
+                                            # cross-culture positives exist
+    trace_alloc_rule: str = "largest_remainder"   # | "floor" (see apportion())
 
     # --- augmentation (fs is a PLACEHOLDER; resolved at build time) ---
     augmentation: AugmentationConfig = field(
@@ -454,6 +477,29 @@ class DataConfig:
                 % (len(self.synthetic.per_class), n_classes))
         if self.window_s <= 0 or self.train_stride_s <= 0 or self.eval_stride_s <= 0:
             raise ValueError("window_s and strides must be > 0")
+        if self.split_mode not in ("time_segment", "trace"):
+            raise ValueError(
+                "split_mode must be 'time_segment' or 'trace'; got %r"
+                % (self.split_mode,))
+        if self.trace_split_mode not in ("fractional", "leave_one_out"):
+            raise ValueError(
+                "trace_split_mode must be 'fractional' or 'leave_one_out'; "
+                "got %r" % (self.trace_split_mode,))
+        if self.trace_alloc_rule not in ("largest_remainder", "floor"):
+            raise ValueError(
+                "trace_alloc_rule must be 'largest_remainder' or 'floor'; "
+                "got %r" % (self.trace_alloc_rule,))
+        if self.trace_split_fold < 0:
+            raise ValueError("trace_split_fold must be >= 0")
+        if self.min_train_cultures_per_class < 1:
+            raise ValueError("min_train_cultures_per_class must be >= 1")
+        if (self.split_mode == "trace"
+                and self.min_train_cultures_per_class < 2):
+            warnings.warn(
+                "split_mode='trace' with min_train_cultures_per_class = %d: "
+                "cross-culture positives need at least 2 training cultures per "
+                "class, so a value below 2 will not support Change 4."
+                % (self.min_train_cultures_per_class,), RuntimeWarning)
         if len(self.split_fractions) != 3:
             raise ValueError("split_fractions must be (train, val, test)")
         if any((fr <= 0.0 or fr >= 1.0) for fr in self.split_fractions):

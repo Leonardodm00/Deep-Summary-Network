@@ -154,6 +154,7 @@ from data_splits import (
     MultiClassSyntheticProvider,
     make_synthetic_specs,
     make_time_segment_splits,
+    make_trace_splits,
     segment_bounds,
     window_starts,
 )
@@ -1536,8 +1537,33 @@ def run(cfg, args, on_stage_complete=None):
         }
 
     # ---- splits (fs is injected into the augmentation config HERE) ---------
-    splits = make_time_segment_splits(traces, conditions, fs, cfg.data,
-                                      base_seed=int(cfg.runtime.seed))
+    # cfg.data.split_mode selects the splitter. The two are positionally
+    # interchangeable in their first five arguments by construction.
+    if cfg.data.split_mode == "trace":
+        splits = make_trace_splits(
+            traces, conditions, fs, cfg.data,
+            base_seed=int(cfg.runtime.seed),
+            mode=cfg.data.trace_split_mode,
+            fold=(int(cfg.data.trace_split_fold)
+                  if cfg.data.trace_split_mode == "leave_one_out" else None),
+            split_seed=int(cfg.data.trace_split_seed),
+            min_train_cultures_per_class=int(
+                cfg.data.min_train_cultures_per_class),
+            alloc_rule=cfg.data.trace_alloc_rule,
+        )
+        if verbose:
+            print("[run] WHOLE-CULTURE split (%s): %d / %d / %d cultures, "
+                  "%d / %d / %d windows"
+                  % (cfg.data.trace_split_mode,
+                     len(splits.cultures["train"]), len(splits.cultures["val"]),
+                     len(splits.cultures["test"]),
+                     len(splits.train), len(splits.val), len(splits.test)))
+            for _name in ("train", "val", "test"):
+                print("[run]   %-5s cultures: %s"
+                      % (_name, splits.cultures[_name].tolist()))
+    else:
+        splits = make_time_segment_splits(traces, conditions, fs, cfg.data,
+                                          base_seed=int(cfg.runtime.seed))
 
     # ---- search ------------------------------------------------------------
     report = {}
