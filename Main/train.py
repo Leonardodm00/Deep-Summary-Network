@@ -149,6 +149,11 @@ from data_pipeline import (
     ConditionBalancedBatchSampler, TripletCollator, seed_worker,
 )
 from inference import embed_clean_windows
+from adaptive_patience import (
+    AdaptivePatience,
+    resolve_min_delta_sil,
+    silhouette_floor,
+)
 from metrics import clustering_metrics, embedding_health
 
 __all__ = [
@@ -486,8 +491,20 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
     u_best, v_best = _NEG_INF, _NEG_INF
     best_epoch = 0
     best_state = None
-    patience_counter = 0
     history = []
+    sil_floor = None                # measured once, at the first finite silhouette
+
+    # The early-stopping counter. With tcfg.patience_growth = 0.0 (the default)
+    # this is EXACTLY the previous fixed-patience rule; see
+    # Smoke_Tests/smoke_test_adaptive_patience.py [A], which asserts step-for-step
+    # agreement over 200 random improvement sequences.
+    stopper = AdaptivePatience(
+        patience=int(tcfg.patience),
+        growth=float(tcfg.patience_growth),
+        max_patience=(int(tcfg.max_patience) if tcfg.max_patience else None),
+        reset_on_improvement=bool(tcfg.patience_reset_on_improvement),
+        delta=None,                 # armed below, once the threshold is known
+    )
 
     if ckpt_dir is not None:
         manager = CheckpointManager(
@@ -506,7 +523,14 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             extra = ck.get("extra") or {}
             history = list(extra.get("history", []))
             best_epoch = int(extra.get("best_epoch", 0))
-            patience_counter = int(extra.get("patience_counter", 0))
+            if extra.get("stopper_state") is not None:
+                stopper.load_state_dict(extra["stopper_state"])
+            else:
+                # checkpoint written before growing patience existed: the bare
+                # counter is all there is, and it IS the whole state at g = 0
+                stopper.wait = int(extra.get("patience_counter", 0))
+                stopper._counter = stopper.wait
+            sil_floor = extra.get("sil_floor", None)
             u_best = float(extra.get("u_best", _NEG_INF))
             v_best = float(extra.get("v_best", _NEG_INF))
             best_state = extra.get("best_state", None)
@@ -518,7 +542,6 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
 
     # ---- epoch loop -------------------------------------------------------
     E_max = int(tcfg.max_epochs)
-    P = int(tcfg.patience)
 
     for epoch in range(start_epoch + 1, E_max + 1):
         t0 = time.time()
@@ -574,8 +597,55 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         )
         health = embedding_health(Z_val)               # monitor-only (decision 5)
 
+        # ---- silhouette floor: measured ONCE, on the first epoch that yields a
+        # ---- finite silhouette, then FROZEN for the rest of the run. It must be
+        # ---- frozen: a threshold that moves with the embedding it is judging
+        # ---- would make "improvement" mean something different every epoch.
+        if (sil_floor is None
+                and tcfg.min_delta_sil_mode != "absolute"
+                and int(tcfg.sil_floor_permutations) >= 2
+                and np.isfinite(m["silhouette"])):
+            try:
+                sil_floor = silhouette_floor(
+                    Z_val, y_val,
+                    n_permutations=int(tcfg.sil_floor_permutations),
+                    metric=cfg.eval.silhouette_metric,
+                    seed=int(seed),
+                )
+                if verbose:
+                    print("[train] silhouette floor at epoch %d: mu = %+.6f, "
+                          "sigma = %.6f, q95 = %+.6f (R = %d, N_val = %d, "
+                          "C = %d)"
+                          % (epoch, sil_floor["mu"], sil_floor["sigma"],
+                             sil_floor["q95"], sil_floor["n_valid"],
+                             sil_floor["n_eval"], sil_floor["n_classes"]))
+            except ValueError as ex:
+                warnings.warn(
+                    "silhouette_floor failed at epoch %d (%s); falling back to "
+                    "train.min_delta_sil = %r until it succeeds."
+                    % (epoch, ex, tcfg.min_delta_sil), RuntimeWarning)
+                sil_floor = None
+
+        # Arm the counter as soon as a threshold can be formed. Until then the
+        # configured constant is used, so the run is never left without one.
+        if not stopper.is_armed and (tcfg.min_delta_sil_mode == "absolute"
+                                     or sil_floor is not None):
+            stopper.arm(resolve_min_delta_sil(
+                floor=sil_floor,
+                kappa=float(tcfg.min_delta_sil_kappa),
+                mode=tcfg.min_delta_sil_mode,
+                absolute=float(tcfg.min_delta_sil),
+            ))
+            if verbose and tcfg.min_delta_sil_mode != "absolute":
+                print("[train] min_delta_sil = %.6g (mode %r, kappa %g), "
+                      "replacing the configured %.6g"
+                      % (stopper.delta, tcfg.min_delta_sil_mode,
+                         tcfg.min_delta_sil_kappa, tcfg.min_delta_sil))
+        min_delta_sil_eff = (float(stopper.delta) if stopper.is_armed
+                             else float(tcfg.min_delta_sil))
+
         u_e, v_e, delta, epsilon = _primary_secondary(
-            m, tcfg.selection_primary, tcfg.min_delta_ari, tcfg.min_delta_sil)
+            m, tcfg.selection_primary, tcfg.min_delta_ari, min_delta_sil_eff)
 
         record = {
             "epoch": epoch,
@@ -584,6 +654,7 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             "ami": float(m["ami"]),
             "silhouette": float(m["silhouette"]),
             "n_triplets": int(triplets_epoch),
+            "min_delta_sil_eff": float(min_delta_sil_eff),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "seconds": float(time.time() - t0),
             "health": {k: float(health[k]) for k in
@@ -606,23 +677,25 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         u_best = max(u_best, u_e)
         v_best = max(v_best, v_e)
 
-        if improved:
-            patience_counter = 0
-        else:
-            patience_counter += 1
+        stop_now = stopper.update(improved)
+        record["patience_wait"] = int(stopper.wait)
+        record["patience_budget"] = float(stopper.budget)
 
         if verbose and (epoch % int(tcfg.log_every_epochs) == 0):
             print("[train] epoch %3d | loss %8.5f | ARI %6.3f | AMI %6.3f | "
-                  "sil %6.3f | triplets %6d | eff_rank %5.2f | patience %d/%d"
+                  "sil %6.3f | triplets %6d | eff_rank %5.2f | patience %d/%.4g"
                   % (epoch, train_loss, record["ari"], record["ami"],
                      record["silhouette"], triplets_epoch,
-                     record["health"]["eff_rank"], patience_counter, P))
+                     record["health"]["eff_rank"], stopper.wait,
+                     stopper.budget))
 
         # ---- checkpoints --------------------------------------------------
         if manager is not None:
             extra = {
                 "best_epoch": best_epoch,
-                "patience_counter": patience_counter,
+                "patience_counter": int(stopper.wait),   # legacy key, kept
+                "stopper_state": stopper.state_dict(),
+                "sil_floor": sil_floor,
                 "u_best": u_best,
                 "v_best": v_best,
                 "history": history,
@@ -640,10 +713,12 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             manager.maybe_save_periodic(**save_kw)
 
         # E_stop = min(e_patience, E_max): stop as soon as the counter reaches P
-        if patience_counter >= P:
+        if stop_now:
             if verbose:
-                print("[train] early stop at epoch %d (patience %d reached); "
-                      "best epoch %d" % (epoch, P, best_epoch))
+                print("[train] early stop at epoch %d (wait %d reached budget "
+                      "%.4g; P_0 = %d, growth = %g); best epoch %d"
+                      % (epoch, stopper.wait, stopper.budget, stopper.patience_0,
+                         stopper.growth, best_epoch))
             break
 
     # ---- restore the BEST-EPOCH weights (never the last) -------------------

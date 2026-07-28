@@ -41,8 +41,8 @@ augmentation.py) is pure ASCII as well.
 """
 
 import warnings
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -56,6 +56,9 @@ __all__ = [
     "window_starts",
     "SplitBundle",
     "make_time_segment_splits",
+    "apportion",
+    "assign_cultures",
+    "make_trace_splits",
 ]
 
 _SPLIT_NAMES = ("train", "val", "test")
@@ -280,6 +283,22 @@ class SplitBundle:
                coordinates (segment offset already added), so downstream code and
                tests can verify no sample is shared across splits.
     seg_bounds : list (per original trace) of [(s,e)_train,(s,e)_val,(s,e)_test].
+                 EMPTY for a trace split (no time cut is made).
+
+    trace_of_window : split_name -> int array g, with g[i] the GLOBAL culture
+                 (trace) index u of window i, in the SAME order the Dataset
+                 enumerates windows. Load-bearing in three places: the
+                 culture-first batch sampler, exclude_same_culture_positives
+                 masking, and trace-level silhouette. Populated by BOTH
+                 splitters (for the time-segment splitter every culture appears
+                 in all three splits, which is exactly what this array makes
+                 visible).
+    cultures   : split_name -> sorted int array of the GLOBAL culture indices
+                 assigned to that split. For a trace split the three arrays are
+                 pairwise disjoint; for a time-segment split they are identical.
+    split_kind : "time_segment" or "trace", so a consumer can tell which
+                 leakage guarantee it is holding.
+    fold       : the leave-one-out fold index, or None.
     """
     train: MEAWindowDataset
     val: MEAWindowDataset
@@ -289,6 +308,10 @@ class SplitBundle:
     eval_stride: int
     coverage: Dict[str, List[Tuple[int, int, int, int]]]
     seg_bounds: List[List[Tuple[int, int]]]
+    trace_of_window: Dict[str, np.ndarray] = field(default_factory=dict)
+    cultures: Dict[str, np.ndarray] = field(default_factory=dict)
+    split_kind: str = "time_segment"
+    fold: Optional[int] = None
 
 
 def make_time_segment_splits(traces: Sequence[np.ndarray],
@@ -377,6 +400,19 @@ def make_time_segment_splits(traces: Sequence[np.ndarray],
             base_seed=base_seed,
         )
 
+    # per-window culture provenance (Section 8.3 of the v3 handoff). Derived from
+    # `coverage`, which was built in the SAME nested order MEAWindowDataset
+    # enumerates (outer: trace, inner: increasing start), so index i lines up.
+    trace_of_window = {
+        name: np.array([ti for (ti, _, _, _) in coverage[name]], dtype=int)
+        for name in _SPLIT_NAMES
+    }
+    cultures = {
+        name: np.array(sorted(set(int(ti) for (ti, _, _, _) in coverage[name])),
+                       dtype=int)
+        for name in _SPLIT_NAMES
+    }
+
     return SplitBundle(
         train=datasets["train"],
         val=datasets["val"],
@@ -386,4 +422,398 @@ def make_time_segment_splits(traces: Sequence[np.ndarray],
         eval_stride=eval_stride,
         coverage=coverage,
         seg_bounds=seg_bounds_per_trace,
+        trace_of_window=trace_of_window,
+        cultures=cultures,
+        split_kind="time_segment",
+        fold=None,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Whole-culture (per-trace) splitting -- Change 5 of the v3 handoff
+# --------------------------------------------------------------------------- #
+def apportion(n: int, fractions: Sequence[float],
+              rule: str = "largest_remainder") -> List[int]:
+    """Split n indivisible items into len(fractions) parts.
+
+    rule = "largest_remainder" (DEFAULT, Hamilton apportionment)
+        Give every part floor(f_k * n), then hand the leftovers to the parts with
+        the largest fractional remainders (ties broken by ascending part index,
+        so the result is deterministic). Every part then receives either
+        floor(f_k * n) or ceil(f_k * n), hence
+
+            |assigned_k - f_k * n| < 1   for every k,                        (A)
+
+        and sum_k assigned_k == n exactly.
+
+    rule = "floor"
+        The literal rule in Section 8.2 of the handoff: floor for train and val,
+        remainder to test. Kept so a pre-existing assignment can be reproduced
+        bit-for-bit. WARNING: it does NOT satisfy (A). At n = 18 with
+        (0.6, 0.2, 0.2) it returns (10, 3, 5) -- test overshoots its ideal 3.6 by
+        1.4 cultures, i.e. 28 percent of the data instead of the requested 20.
+        That also breaks assertion (c) of smoke_test_trace_splits.py, which
+        requires every count to be within one of its request.
+
+    Returns a list of length len(fractions).
+    """
+    n = int(n)
+    if n < 0:
+        raise ValueError("n must be >= 0; got %d" % (n,))
+    fr = [float(f) for f in fractions]
+    if len(fr) < 1:
+        raise ValueError("fractions must be non-empty")
+    if any(f < 0.0 for f in fr):
+        raise ValueError("fractions must be non-negative; got %r" % (fr,))
+    if abs(sum(fr) - 1.0) > 1e-6:
+        raise ValueError("fractions must sum to 1.0; got %r (sum %.6f)"
+                         % (fr, sum(fr)))
+
+    if rule == "floor":
+        if len(fr) != 3:
+            raise ValueError("rule='floor' is defined for 3 parts only")
+        n_tr = int(np.floor(fr[0] * n))
+        n_va = int(np.floor(fr[1] * n))
+        return [n_tr, n_va, n - n_tr - n_va]
+
+    if rule != "largest_remainder":
+        raise ValueError("rule must be 'largest_remainder' or 'floor'; got %r"
+                         % (rule,))
+
+    ideal = [f * n for f in fr]
+    base = [int(np.floor(x)) for x in ideal]
+    leftover = n - sum(base)                       # 0 <= leftover < len(fr)
+    order = sorted(range(len(fr)),
+                   key=lambda k: (-(ideal[k] - base[k]), k))
+    for k in order[:leftover]:
+        base[k] += 1
+    return base
+
+
+def _enforce_minima(counts: Sequence[int], minima: Sequence[int]) -> List[int]:
+    """Move items between parts until counts[k] >= minima[k] for every k.
+
+    Items are always taken from the part with the largest surplus over its own
+    minimum (ties broken by ascending index), so the perturbation away from the
+    requested apportionment is as small as possible. Returns None when
+    sum(minima) > sum(counts), which is the genuinely infeasible case.
+    """
+    counts = [int(c) for c in counts]
+    minima = [int(m) for m in minima]
+    if sum(minima) > sum(counts):
+        return None
+    for k in range(len(counts)):
+        while counts[k] < minima[k]:
+            donors = sorted(
+                ((counts[j] - minima[j], -j) for j in range(len(counts))
+                 if j != k),
+                reverse=True)
+            surplus, neg_j = donors[0]
+            if surplus <= 0:                       # unreachable given the guard
+                return None
+            counts[-neg_j] -= 1
+            counts[k] += 1
+    return counts
+
+
+def assign_cultures(conditions: Sequence[int],
+                    fractions: Sequence[float] = (0.6, 0.2, 0.2),
+                    seed: int = 0,
+                    mode: str = "fractional",
+                    fold: Optional[int] = None,
+                    min_train_cultures_per_class: int = 2,
+                    alloc_rule: str = "largest_remainder"
+                    ) -> Dict[str, List[int]]:
+    """Assign each culture index u to EXACTLY ONE of train / val / test.
+
+    This is the pure, torch-free, array-free core of make_trace_splits: it takes
+    only the label vector and returns the three index lists, so it can be tested
+    exhaustively without generating a single trace.
+
+    Stratification. The fractions are applied WITHIN each class separately, so
+    every class is present in every split (this is what makes per-class metrics
+    defined on every split).
+
+    mode = "fractional"
+        For each class c, permute that class's culture indices with an RNG seeded
+        from (seed, c), apportion by `alloc_rule`, then repair so that each split
+        holds at least one culture of class c and train holds at least
+        min_train_cultures_per_class of them.
+
+    mode = "leave_one_out"
+        n_folds = min_c n_c folds. In fold f, culture f of each class is test,
+        culture (f + 1) mod n_c is validation, the rest are train. Cultures are
+        taken in ASCENDING GLOBAL INDEX order, NOT permuted, so "fold 3" names
+        the same held-out culture on every machine and in every log. Each culture
+        is test in exactly one fold iff every class has the same n_c.
+
+    Returns {"train": [...], "val": [...], "test": [...]}, each list sorted
+    ascending. Raises ValueError with n_c and the fractions named when the
+    minimum-occupancy constraints cannot be met.
+    """
+    if mode not in ("fractional", "leave_one_out"):
+        raise ValueError("mode must be 'fractional' or 'leave_one_out'; got %r"
+                         % (mode,))
+    min_train = int(min_train_cultures_per_class)
+    if min_train < 1:
+        raise ValueError("min_train_cultures_per_class must be >= 1; got %d"
+                         % (min_train,))
+
+    cond = np.asarray(conditions, dtype=int).ravel()
+    if cond.size == 0:
+        raise ValueError("conditions is empty: there are no cultures to split")
+    # sorted() rather than set iteration: assignment must not depend on hash order
+    classes = sorted(set(int(c) for c in cond.tolist()))
+    if classes[0] < 0:
+        raise ValueError(
+            "class labels must be non-negative (0..C-1); got %r. The per-class "
+            "RNG is seeded with [seed, c], which requires c >= 0."
+            % (classes[:8],))
+    by_class = {c: [int(u) for u in np.flatnonzero(cond == c).tolist()]
+                for c in classes}
+
+    out = {name: [] for name in _SPLIT_NAMES}
+
+    if mode == "fractional":
+        for c in classes:
+            idx = list(by_class[c])                # already ascending
+            n_c = len(idx)
+            if n_c < min_train + 2:
+                raise ValueError(
+                    "class %d has n_c = %d culture(s), but a whole-culture split "
+                    "needs at least min_train_cultures_per_class + 2 = %d "
+                    "(train >= %d, val >= 1, test >= 1) under fractions %r. Use "
+                    "mode='leave_one_out', lower min_train_cultures_per_class, "
+                    "or record more cultures."
+                    % (c, n_c, min_train + 2, min_train, tuple(fractions)))
+            # independent, reproducible stream per class: adding a class does not
+            # perturb the assignment of the classes already there
+            rng = np.random.default_rng([int(seed), int(c)])
+            perm = rng.permutation(n_c)
+            shuffled = [idx[int(p)] for p in perm]
+
+            counts = apportion(n_c, fractions, rule=alloc_rule)
+            repaired = _enforce_minima(counts, (min_train, 1, 1))
+            if repaired is None:                   # unreachable given the guard
+                raise ValueError(
+                    "class %d: cannot satisfy (train >= %d, val >= 1, test >= 1) "
+                    "with n_c = %d and fractions %r"
+                    % (c, min_train, n_c, tuple(fractions)))
+            n_tr, n_va, _n_te = repaired
+            out["train"].extend(shuffled[:n_tr])
+            out["val"].extend(shuffled[n_tr:n_tr + n_va])
+            out["test"].extend(shuffled[n_tr + n_va:])
+
+    else:                                          # leave_one_out
+        n_folds = min(len(by_class[c]) for c in classes)
+        sizes = sorted(set(len(by_class[c]) for c in classes))
+        if len(sizes) > 1:
+            warnings.warn(
+                "leave_one_out with unequal class sizes %r: using n_folds = %d "
+                "(the smallest). Cultures of the larger classes beyond that "
+                "index are always training cultures, so 'each culture is test "
+                "exactly once' does NOT hold here." % (sizes, n_folds),
+                RuntimeWarning)
+        if fold is None:
+            raise ValueError(
+                "mode='leave_one_out' requires an explicit fold in [0, %d); "
+                "pass fold=0 for the first fold" % (n_folds,))
+        f = int(fold)
+        if not (0 <= f < n_folds):
+            raise ValueError("fold must lie in [0, %d); got %d" % (n_folds, f))
+        for c in classes:
+            idx = list(by_class[c])                # ascending, NOT permuted
+            n_c = len(idx)
+            if n_c < min_train + 2:
+                raise ValueError(
+                    "class %d has n_c = %d culture(s); leave_one_out needs at "
+                    "least min_train_cultures_per_class + 2 = %d (1 test, 1 val, "
+                    ">= %d train)" % (c, n_c, min_train + 2, min_train))
+            i_te = f % n_c
+            i_va = (f + 1) % n_c
+            out["test"].append(idx[i_te])
+            out["val"].append(idx[i_va])
+            out["train"].extend([idx[j] for j in range(n_c)
+                                 if j not in (i_te, i_va)])
+
+    for name in _SPLIT_NAMES:
+        out[name] = sorted(out[name])
+    return out
+
+
+def make_trace_splits(traces: Sequence[np.ndarray],
+                      conditions: Sequence[int],
+                      fs: float,
+                      data_cfg: DataConfig,
+                      base_seed: int = 0,
+                      mode: str = "fractional",
+                      fold: Optional[int] = None,
+                      split_seed: int = 0,
+                      min_train_cultures_per_class: int = 2,
+                      fractions: Optional[Sequence[float]] = None,
+                      alloc_rule: str = "largest_remainder") -> SplitBundle:
+    """Whole-culture train / val / test split: a culture belongs to ONE split.
+
+    Replaces the time-segment split for the deployment question "classify a
+    culture the network has never seen". make_time_segment_splits guarantees only
+    that no WINDOW straddles a boundary; every culture still contributes windows
+    to all three splits, so culture identity is exploitable. Here, assignment is
+    at culture granularity and stratified by class.
+
+    The first five parameters are positionally identical to
+    make_time_segment_splits, so the two splitters are drop-in swappable at every
+    existing call site.
+
+    Parameters
+    ----------
+    traces      : list of 1-D float arrays, one FULL-LENGTH trace per culture
+    conditions  : class label c per culture, aligned with traces
+    fs          : common sampling rate [Hz]
+    data_cfg    : DataConfig supplying window_s, train_stride_s, eval_stride_s,
+                  split_fractions (unless `fractions` overrides it) and the
+                  augmentation params
+    base_seed   : seed for the datasets' per-worker augmentation RNG (NOT the
+                  split assignment -- see split_seed)
+    mode        : "fractional" or "leave_one_out"
+    fold        : which leave-one-out fold to build; required for that mode
+    split_seed  : seed for the culture PERMUTATION. Deliberately separate from
+                  base_seed so that seed-averaging over training seeds does not
+                  silently reshuffle the split underneath the average.
+    min_train_cultures_per_class : floor on training cultures per class. The
+                  default of 2 is the smallest value at which cross-culture
+                  positives (Change 4) exist at all, since an anchor needs at
+                  least one same-class partner from a DIFFERENT culture.
+    fractions   : (train, val, test); defaults to data_cfg.split_fractions
+    alloc_rule  : "largest_remainder" (default) or "floor"; see apportion()
+
+    Windowing. Windows tile the WHOLE trace -- there is no time cut -- using
+    exactly MEAWindowDataset's rule via window_starts(), with train_stride for
+    training cultures and eval_stride for validation and test cultures.
+
+    Determinism. Identical (split_seed, fractions, conditions, mode, fold) give
+    an identical assignment on any machine: class order comes from sorted(), the
+    per-class stream is np.random.default_rng([split_seed, c]), and no set or
+    dict iteration order is consulted anywhere in the assignment.
+
+    Returns a SplitBundle with split_kind == "trace" and a populated
+    trace_of_window (GLOBAL culture indices, Section 8.3 of the handoff).
+    """
+    if len(traces) != len(conditions):
+        raise ValueError("traces and conditions must have equal length")
+    if fs <= 0:
+        raise ValueError("fs must be > 0")
+
+    frac = tuple(data_cfg.split_fractions if fractions is None else fractions)
+
+    W = int(round(data_cfg.window_s * fs))
+    train_stride = int(round(data_cfg.train_stride_s * fs))
+    eval_stride = int(round(data_cfg.eval_stride_s * fs))
+    if W < 1:
+        raise ValueError("window_s * fs rounds to < 1 sample")
+    if train_stride < 1 or eval_stride < 1:
+        raise ValueError("stride_s * fs rounds to < 1 sample")
+    stride_by_split = {"train": train_stride, "val": eval_stride,
+                       "test": eval_stride}
+
+    assignment = assign_cultures(
+        conditions=conditions,
+        fractions=frac,
+        seed=split_seed,
+        mode=mode,
+        fold=fold,
+        min_train_cultures_per_class=min_train_cultures_per_class,
+        alloc_rule=alloc_rule,
+    )
+
+    # hard invariant, cheap to check, catastrophic to get wrong
+    for a in range(len(_SPLIT_NAMES)):
+        for b in range(a + 1, len(_SPLIT_NAMES)):
+            na, nb = _SPLIT_NAMES[a], _SPLIT_NAMES[b]
+            shared = sorted(set(assignment[na]) & set(assignment[nb]))
+            if shared:
+                raise AssertionError(
+                    "internal error: culture(s) %s assigned to both '%s' and "
+                    "'%s'" % (shared, na, nb))
+
+    aug_cfg = data_cfg.resolved_augmentation(fs)
+    arrays = [np.ascontiguousarray(t, dtype=np.float32) for t in traces]
+
+    datasets = {}
+    coverage = {name: [] for name in _SPLIT_NAMES}
+    trace_of_window = {}
+    too_short = []
+
+    for name in _SPLIT_NAMES:
+        globals_here = assignment[name]            # sorted GLOBAL culture indices
+        stride = stride_by_split[name]
+        sub_traces = [arrays[u] for u in globals_here]
+        sub_conditions = [int(conditions[u]) for u in globals_here]
+
+        for u in globals_here:
+            if arrays[u].shape[0] < W:
+                too_short.append((name, u, int(arrays[u].shape[0])))
+
+        n_windows = sum(len(window_starts(arrays[u].shape[0], W, stride))
+                        for u in globals_here)
+        if n_windows == 0:
+            raise ValueError(
+                "split '%s' produced 0 windows: window_s = %.4g s (%d samples) "
+                "exceeds every assigned culture's length. Reduce window_s, or "
+                "check that the traces are full-length recordings."
+                % (name, data_cfg.window_s, W))
+
+        ds = MEAWindowDataset(
+            traces=sub_traces,
+            conditions=sub_conditions,
+            window_length=W,
+            stride=stride,
+            aug_cfg=aug_cfg,
+            base_seed=base_seed,
+        )
+        datasets[name] = ds
+
+        # Provenance is read back OUT of the Dataset's own index rather than
+        # re-derived, so it cannot drift from what the Dataset actually yields.
+        # ds.index holds (local_trace_idx, start, condition); local -> global is
+        # positional because sub_traces was built in globals_here order.
+        g_of_local = {i: u for i, u in enumerate(globals_here)}
+        trace_of_window[name] = np.array(
+            [g_of_local[ti] for (ti, _s, _c) in ds.index], dtype=int)
+        coverage[name] = [(g_of_local[ti], int(s), int(s) + W, int(c))
+                          for (ti, s, c) in ds.index]
+
+    if too_short:
+        warnings.warn(
+            "culture(s) shorter than one window (%d samples) contribute NO "
+            "windows and are therefore silently absent from their split: %r. "
+            "This is the one route by which a class can vanish from a split "
+            "despite stratified assignment." % (W, too_short[:8]),
+            RuntimeWarning)
+
+    all_conditions = set(int(c) for c in conditions)
+    for name in _SPLIT_NAMES:
+        present = set(c for (_, _, _, c) in coverage[name])
+        missing = sorted(all_conditions - present)
+        if missing:
+            warnings.warn(
+                "split '%s' has NO windows for condition(s) %s; per-cluster "
+                "metrics (ARI, silhouette) are undefined there." % (name, missing),
+                RuntimeWarning)
+
+    cultures = {name: np.array(assignment[name], dtype=int)
+                for name in _SPLIT_NAMES}
+
+    return SplitBundle(
+        train=datasets["train"],
+        val=datasets["val"],
+        test=datasets["test"],
+        window_length=W,
+        train_stride=train_stride,
+        eval_stride=eval_stride,
+        coverage=coverage,
+        seg_bounds=[],                             # no time cut is made
+        trace_of_window=trace_of_window,
+        cultures=cultures,
+        split_kind="trace",
+        fold=(None if mode != "leave_one_out" else int(fold)),
     )

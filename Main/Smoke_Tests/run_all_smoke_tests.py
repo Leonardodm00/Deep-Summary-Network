@@ -83,11 +83,13 @@ ORDER = [
     "smoke_test_augmentation.py",
     "smoke_test_data_pipeline.py",
     "smoke_test_data_splits.py",            # the LEAKAGE GUARANTEE
+    "smoke_test_trace_splits.py",           # WHOLE-CULTURE leakage guarantee
     "smoke_test_metrics.py",                # the SEARCH OBJECTIVE
     "smoke_test_inference.py",
     "smoke_test_checkpoint.py",
     "smoke_test_evaluate.py",
     "smoke_test_burst_pipeline.py",
+    "smoke_test_adaptive_patience.py",      # growing patience + silhouette floor
     "smoke_test_train.py",
     "smoke_test_search.py",
     "smoke_test_end_to_end.py",             # full pipeline + REAL resume
@@ -104,6 +106,12 @@ MISSING = {
         "the SEARCH OBJECTIVE (metrics.py): eff_rank, closed-form cosine",
     "smoke_test_end_to_end.py":
         "full pipeline, all 3 pre-flights, artifacts, REAL resume-from-last.pt",
+    "smoke_test_trace_splits.py":
+        "the WHOLE-CULTURE leakage guarantee (make_trace_splits): disjointness, "
+        "stratification, tiling, trace_of_window, determinism",
+    "smoke_test_adaptive_patience.py":
+        "growing-patience termination bound and the label-shuffled silhouette "
+        "floor that sets its threshold",
 }
 
 
