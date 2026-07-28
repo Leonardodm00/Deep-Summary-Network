@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -N dsn_4c_semihard_multi
+#PBS -l select=1:ncpus=48
+#PBS -l walltime=36:00:00
+#PBS -o dsn_4c_semihard_multi.out
+#PBS -e dsn_4c_semihard_multi.err
+
+# 3x2 factorial cell: semihard_multi  (easy positives + SEMIHARD negatives)
+#   factor A: mining_strategy   in {hard, easy_positive, easy_pos_semihard_neg}
+#   factor B: backbone.head_fusion in {false = last stage only,
+#                                      true  = fuse all stage outputs}
+# Every other field is IDENTICAL across the four cells (verified field-by-field).
+#
+# Benchmark: C=4, n_c=4 (16 traces), T_rec=900 s, tau=0.07, interior centres,
+# window 60 s / stride 42 s, 192/288/48 windows, depth [2,5], 60/60/20 trials,
+# n_initial_points=20, n_seeds=2 -> 282 train() runs.
+#
+# WALLTIME: measured 8.28 s/epoch at 30 threads, mean 17.25 epochs/run
+# -> ~11 h typical, ~32 h if nothing early-stops. 36 h has margin, and the
+# SEARCH PHASES DO NOT RESUME, so an overrun loses the whole job.
+#
+# THREADS: torch.set_num_threads() alone does NOT bind the BLAS library
+# underneath, which otherwise grabs every visible core and contends with
+# PyTorch's own pool. OMP/MKL must be exported in the shell BEFORE python
+# starts -- setting torch_threads in the JSON is not sufficient.
+# NOTE: measured parallel efficiency was only 43% at 30 threads, so 48 may
+# not beat 30. Run hpc/sweep_threads.sh if you want the real optimum.
+
+set -e
+cd "$PBS_O_WORKDIR"
+eval "$(conda shell.bash hook)"
+conda activate meacnn_cpu
+export PYTHONPATH="$PBS_O_WORKDIR:$PYTHONPATH"
+export OMP_NUM_THREADS=48
+export MKL_NUM_THREADS=48
+
+python3 run_optimization.py \
+    --config hpc/config_4c_semihard_multi.json \
+    --verbose \
+    --trial-verbose

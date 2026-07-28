@@ -26,7 +26,8 @@ Checks:
   [F] With P > E_max the ceiling fires instead, and the BEST-epoch (not the last)
       weights are returned: the restored model, re-embedded and re-scored, must
       REPRODUCE the ARI recorded at the best epoch of history.
-  [G] BOTH mining strategies ("hard", "easy_positive") run and mine a non-empty
+  [G] ALL THREE mining strategies ("hard", "easy_positive",
+      "easy_pos_semihard_neg") run and mine a non-empty
       total number of triplets.
   [H] Determinism: two runs with the same seed give identical history and
       bit-identical final weights.
@@ -394,7 +395,7 @@ def check_best_epoch_restored(cache_dir):
 def check_both_miners(cache_dir):
     """[G] Both mining strategies run and mine a non-empty triplet total."""
     C = 2
-    for mining in ("hard", "easy_positive"):
+    for mining in ("hard", "easy_positive", "easy_pos_semihard_neg"):
         cfg = _make_cfg(C, max_epochs=3, patience=3, mining=mining, seed=0)
         splits = _make_splits(C, cfg, cache_dir)
         _model, history = _quiet_train(cfg, splits.train, splits.val, "cpu", seed=0)

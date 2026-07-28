@@ -483,7 +483,11 @@ class TrainConfig:
     # --- loss / miner ---
     margin: float = 0.3                     # loss margin m (searched in phase 2; default / fixed value)
     swap: bool = True                       # TripletMarginLoss swap
-    mining_strategy: str = "hard"           # "hard" | "easy_positive"
+    # "hard"                  : TripletMarginMiner(type_of_triplets="hard") --
+    #                           positives FARTHER than negatives (violating triplets)
+    # "easy_positive"         : BatchEasyHardMiner(pos=easy, neg=hard)
+    # "easy_pos_semihard_neg" : BatchEasyHardMiner(pos=easy, neg=semihard)
+    mining_strategy: str = "hard"
 
     # --- batching (ConditionBalancedBatchSampler; added in Stage 5) ---
     # windows_per_condition = B_c: windows drawn from EACH phenotype class per
@@ -520,8 +524,11 @@ class TrainConfig:
     checkpoint_every_epochs: int = 5
 
     def __post_init__(self):
-        if self.mining_strategy not in ("hard", "easy_positive"):
-            raise ValueError("mining_strategy must be 'hard' or 'easy_positive'")
+        if self.mining_strategy not in ("hard", "easy_positive",
+                                        "easy_pos_semihard_neg"):
+            raise ValueError(
+                "mining_strategy must be 'hard', 'easy_positive', or "
+                "'easy_pos_semihard_neg'; got %r" % (self.mining_strategy,))
         if self.margin <= 0.0:
             raise ValueError("margin must be > 0")
         if self.lr <= 0.0:

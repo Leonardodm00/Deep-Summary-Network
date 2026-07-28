@@ -228,10 +228,30 @@ def build_loss_and_miner(train_cfg):
             neg_strategy="hard",
             distance=distances.CosineSimilarity(),
         )
+    elif train_cfg.mining_strategy == "easy_pos_semihard_neg":
+        # Easy positives, SEMIHARD negatives. The intended middle ground between
+        # the two strategies above: easy positives avoid the collapse pressure of
+        # dragging every same-class window to one point (which is what would
+        # destroy the label-irrelevant latent factors the C5 metric measures),
+        # while semihard negatives -- those FARTHER than the positive but still
+        # inside the margin -- avoid both the vanishing gradients of easy
+        # negatives and the noise-amplifying instability of the hardest ones.
+        #
+        # NOTE the pytorch-metric-learning constraint: pos_strategy and
+        # neg_strategy may not BOTH be "semihard" (nor may "all" be paired with
+        # "semihard"). easy + semihard is a permitted combination; the smoke test
+        # constructs this miner for real and asserts it mines a non-empty set,
+        # which is what actually verifies the combination against the installed
+        # PML version rather than against this comment.
+        miner = miners.BatchEasyHardMiner(
+            pos_strategy="easy",
+            neg_strategy="semihard",
+            distance=distances.CosineSimilarity(),
+        )
     else:
         raise ValueError(
-            "unknown mining_strategy %r (expected 'hard' or 'easy_positive')"
-            % (train_cfg.mining_strategy,))
+            "unknown mining_strategy %r (expected 'hard', 'easy_positive', or "
+            "'easy_pos_semihard_neg')" % (train_cfg.mining_strategy,))
     return loss_fn, miner
 
 
