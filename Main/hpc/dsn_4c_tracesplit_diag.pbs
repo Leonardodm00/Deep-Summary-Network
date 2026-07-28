@@ -1,0 +1,86 @@
+#!/bin/bash
+#PBS -N dsn_4c_tracesplit_diag
+#PBS -l select=1:ncpus=48
+#PBS -l walltime=02:00:00
+#PBS -o dsn_4c_tracesplit_diag.out
+#PBS -e dsn_4c_tracesplit_diag.err
+
+# ===========================================================================
+# WIRING DIAGNOSTIC -- whole-culture split (Change 5) + growing patience.
+#
+# This is handoff section 9.1 step 6: a short, two-seed, leave_one_out run
+# whose purpose is to CONFIRM THE WIRING and to MEASURE the quantities the
+# rest of the plan depends on. It is NOT a performance run and its ARI must
+# not be compared with any archived 4c factorial number -- the split changed,
+# so every previously measured quantity is void by construction.
+#
+# WHAT IS ACTUALLY EXERCISED HERE
+#   Change 5   whole-culture split, leave_one_out, fold 0        YES
+#   growing patience + measured silhouette floor                 YES
+#   Change 3   selection_primary = "silhouette"                  YES (see note)
+#   Change 1   n_g cap (n_g <= 14)                               NO -- unimplemented
+#   Change 4   cross-culture positives, rho instrumentation      NO -- unimplemented
+#   Change 2   factor_retention removal                          NO -- unimplemented
+#
+# Because Change 4 is not in, rho (frac_neg_surrogate) DOES NOT EXIST YET and
+# this run cannot report it. n_g is still B_c * (1 + P_b) = 4 * (1 + 8) = 36,
+# well above the target of 14. That is expected: this run is about the SPLIT.
+#
+# GEOMETRY (computed, not estimated; reproduce with --dry-run)
+#   16 cultures = 4 classes x 4, T_rec = 900 s, fs = 50 Hz -> L = 45000 samples
+#   W = 3000 samples (60 s), train stride 2100 (42 s), eval stride 3000 (60 s)
+#   leave_one_out fold 0:
+#       train cultures [2,3,6,7,10,11,14,15]   8 cultures, 21 windows each = 168
+#       val   cultures [1,5,9,13]              4 cultures, 15 windows each =  60
+#       test  cultures [0,4,8,12]              4 cultures, 15 windows each =  60
+#   batch: C * B_c = 4 * 4 = 16 source windows
+#   batches_per_epoch (derived from 0) = ceil(168 / 16) = 11
+#   All four folds are balanced 8/4/4 cultures and 168/60/60 windows.
+#
+# WHY --skip-search IS NOT OPTIONAL HERE
+#   smoke_test_selected_epoch.py FAILS under selection_primary="silhouette".
+#   That failure is PRE-EXISTING (it reproduces in the pre-change snapshot) and
+#   means objective_utils.selected_epoch_index disagrees with train.py about
+#   which epoch was selected. That function is called from exactly one place,
+#   search.py:477, inside the HPO objective. With --skip-search the HPO objective
+#   never runs, so the diagnostic is unaffected. DO NOT run an HPO search under
+#   selection_primary="silhouette" until that drift is fixed: the search would
+#   score a different epoch from the one the trainer chose.
+#
+# PATIENCE
+#   patience = 6, patience_growth = 0.5 -> effective patience
+#   ceil(6 / (1 - 0.5)) = 12 consecutive plateau epochs, under max_epochs = 20,
+#   so early stopping CAN fire and is observable. patience_reset_on_improvement
+#   is false, so budget earned on a plateau is kept across an improvement.
+#
+# WALLTIME
+#   ~8.3 s/epoch was measured at 30 threads on the 192-window factorial; this
+#   run has 168 train windows and no search, so 2 seeds x <= 20 epochs is a few
+#   minutes. 2 h is generous margin for trace generation on a cold cache.
+#
+# THREADS
+#   torch.set_num_threads() does NOT bind the BLAS library underneath. OMP/MKL
+#   must be exported BEFORE python starts; setting torch_threads in the JSON is
+#   not sufficient. Measured parallel efficiency was only 43% at 30 threads, so
+#   48 may not beat 30 -- irrelevant at this job size, kept for consistency
+#   with the factorial scripts.
+#
+# CACHE
+#   cache_dir is deliberately the SAME as the 4c factorial. The generated traces
+#   depend only on the data-generation parameters, which are byte-identical to
+#   config_4c_easypos_single.json; only the SPLIT of those traces changed. So
+#   this is a cache hit, not a regeneration, and there is no writer race because
+#   nothing else is running.
+# ===========================================================================
+
+cd $PBS_O_WORKDIR
+conda activate meacnn_cpu
+export PYTHONPATH="$PBS_O_WORKDIR:$PYTHONPATH"
+export OMP_NUM_THREADS=48
+export MKL_NUM_THREADS=48
+
+python3 run_optimization.py \
+    --config hpc/config_4c_tracesplit_diag.json \
+    --skip-search \
+    --skip-regularization \
+    --verbose
