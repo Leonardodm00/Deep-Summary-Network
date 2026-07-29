@@ -66,9 +66,11 @@ from sklearn.metrics import adjusted_rand_score
 __all__ = [
     "min_ari_gap",
     "adaptive_epsilon",
+    "tie_break_applicable",
     "composite_objective",
     "selected_epoch_index",
     "selected_epoch_scores",
+    "primary_secondary_scores",
     "resolve_n_initial_points",
 ]
 
@@ -167,6 +169,47 @@ def adaptive_epsilon(y: Sequence[int],
         "n_classes": info["n_classes"],
         "max_secondary_influence": float(epsilon * width),
     }
+
+
+def tie_break_applicable(selection_primary="ari", gamma=0.0):
+    """[C3] Whether the Eq. (4) tie-break can be FORMED for this configuration.
+
+    Pure policy, deliberately separated from resolve_tie_break_epsilon in
+    search.py: that module imports train, hence torch and skopt, so anything
+    living there cannot be tested without the full environment. The decision
+    itself needs neither, so it belongs here beside adaptive_epsilon.
+
+    Returns
+    -------
+    (applicable, reason) where reason is "" when applicable is True, and
+    otherwise names WHICH condition failed:
+        "gamma <= 0"          the tie-break is switched off by configuration;
+        "continuous primary"  epsilon = gamma * Delta_min(y) / (s_hi - s_lo) is
+                              premised on a primary with a smallest expressible
+                              gap. Delta_min(y) exists for ARI because ARI on a
+                              fixed y of N_eval points takes finitely many
+                              values. The mean silhouette is continuous in Z, so
+                              it has no Delta_min, exact ties between trials have
+                              probability zero, and a weight whose entire
+                              justification is "it acts only inside an exact tie"
+                              has nothing to act on. Swapping the two halves of
+                              Eq. (4) would preserve its form and discard its
+                              premise, so the tie-break is disabled instead and
+                              the search minimises the primary alone.
+
+    The gamma test is applied FIRST, so a study that had already set
+    tie_break_gamma = 0 reports the reason it actually chose rather than being
+    told about a premise it never relied on.
+    """
+    g = float(gamma)
+    if (not np.isfinite(g)) or g <= 0.0:
+        return False, "gamma <= 0"
+    if selection_primary == "ari":
+        return True, ""
+    if selection_primary == "silhouette":
+        return False, "continuous primary"
+    raise ValueError("selection_primary must be 'ari' or 'silhouette'; got %r"
+                     % (selection_primary,))
 
 
 def composite_objective(ari: float, silhouette: float, epsilon: float) -> float:
@@ -278,6 +321,44 @@ def selected_epoch_scores(history, selection_primary="ari"):
     ari = _finite_or_neg_inf(h["ari"])
     sil = float(h["silhouette"])
     return ari, sil, int(h.get("epoch", i_star + 1))
+
+
+def primary_secondary_scores(history, selection_primary="ari"):
+    """[C3] (u, v, ari, sil, epoch) at e*, with (u, v) ordered by ROLE.
+
+    selected_epoch_scores returns the pair ordered by NAME -- ARI first, always.
+    That is the right contract for a reader that wants a named metric, and the
+    WRONG one for the search, which needs whichever metric cfg.train.
+    selection_primary designates as primary. Keeping both orderings available,
+    from one function, is what stops the two from drifting apart.
+
+    Returns
+    -------
+    (u, v, ari, sil, epoch) where
+        u     : float, the PRIMARY at e*. Carries the -inf convention of
+                _finite_or_neg_inf, so a degenerate embedding can never win a
+                comparison and composite_objective maps it to the worst
+                attainable objective.
+        v     : float, the SECONDARY at e*. May be non-finite;
+                composite_objective treats a non-finite secondary as
+                contributing 0 rather than poisoning a valid primary.
+        ari   : float, ARI at e*, ALWAYS, whatever the roles are.
+        sil   : float, silhouette at e*, ALWAYS, whatever the roles are.
+        epoch : int, the "epoch" field at e*, or 0 for "no epoch selected".
+
+    ari and sil are returned alongside (u, v) so that a caller can record both
+    metrics under their own names and never has to infer which one a role-keyed
+    field holds.
+    """
+    ari, sil, epoch = selected_epoch_scores(history, selection_primary)
+    if selection_primary == "ari":
+        return ari, sil, ari, sil, epoch
+    if selection_primary == "silhouette":
+        # The primary must carry the -inf convention; selected_epoch_scores
+        # applies it to ARI only, because ARI is the primary under the default.
+        return _finite_or_neg_inf(sil), ari, ari, sil, epoch
+    raise ValueError("selection_primary must be 'ari' or 'silhouette'; got %r"
+                     % (selection_primary,))
 
 
 # --------------------------------------------------------------------------- #

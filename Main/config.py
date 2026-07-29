@@ -454,6 +454,27 @@ class DataConfig:
                                             # cross-culture positives exist
     trace_alloc_rule: str = "largest_remainder"   # | "floor" (see apportion())
 
+    # --- [C4] cross-culture positives ---------------------------------------
+    # Default "augmentation" keeps this change INERT until switched on, matching
+    # the posture of every other change on this branch (D1-R12).
+    positives_mode: str = "augmentation"    # "augmentation" | "cross_culture"
+    # U_c, the number of DISTINCT training cultures of each class drawn per
+    # batch, BEFORE the availability clamp of Eq. (3). The clamp is applied at
+    # sampler construction, where the actual culture counts are known; this
+    # field is only the request.
+    cultures_per_class_per_batch: int = 12
+    windows_per_culture_per_batch: int = 1  # q
+    # Forbid g_i == g_j for an anchor-positive pair. With U_c = 2 and q = 1 every
+    # same-class pair is already cross-culture and this is vacuous; it bites for
+    # q > 1, which is exactly when within-culture pairs reappear.
+    exclude_same_culture_positives: bool = True
+    # n_g^max, the cap on rows sharing a class label per class per batch. NOTE
+    # the source cited for a cap of 14 supports 16, and its MECHANISM does not
+    # transfer to this setting -- do not re-derive 14 from that paper. The cap's
+    # value here is as a REGRESSION GUARD: it turns a later config edit that
+    # reintroduces a large degenerate group into an immediate exception.
+    max_group_size: int = 16
+
     # --- augmentation (fs is a PLACEHOLDER; resolved at build time) ---
     augmentation: AugmentationConfig = field(
         default_factory=lambda: AugmentationConfig(fs=_PLACEHOLDER_FS))
@@ -493,8 +514,46 @@ class DataConfig:
             raise ValueError("trace_split_fold must be >= 0")
         if self.min_train_cultures_per_class < 1:
             raise ValueError("min_train_cultures_per_class must be >= 1")
-        if (self.split_mode == "trace"
-                and self.min_train_cultures_per_class < 2):
+        # --- [C4] cross-culture positives: validation ----------------------
+        if self.positives_mode not in ("augmentation", "cross_culture"):
+            raise ValueError(
+                "positives_mode must be 'augmentation' or 'cross_culture'; "
+                "got %r" % (self.positives_mode,))
+        if self.cultures_per_class_per_batch < 1:
+            raise ValueError("cultures_per_class_per_batch (U_c) must be >= 1")
+        if self.windows_per_culture_per_batch < 1:
+            raise ValueError("windows_per_culture_per_batch (q) must be >= 1")
+        if self.max_group_size < 2:
+            raise ValueError(
+                "max_group_size must be >= 2: a group of one row per class "
+                "contains no positive pair at all")
+        if self.positives_mode == "cross_culture":
+            # The group-size cap is NOT enforced here. It needs two things this
+            # dataclass cannot see:
+            #   - U_eff, the culture count after the Eq. (3) availability clamp,
+            #     which depends on the split;
+            #   - train.mining_strategy, which lives in TrainConfig.
+            # The second is what gates it. The cap traces to an easy-positive
+            # result: performance drops past a group size of 16 for easy-positive
+            # mining, while the same experiments show hard-positive mining
+            # behaving the OPPOSITE way. So the cap applies under
+            # "easy_positive" and "easy_pos_semihard_neg", and must NOT be
+            # applied under "hard", where it would import a constraint the source
+            # gives no support for.
+            # Enforcement therefore lives at sampler construction; see
+            # data_pipeline. ExperimentConfig.validate() is not the place either:
+            # it is documented as soft cross-field validation, warnings only.
+            # Not silently ignored: D1-section 9 established that inconsistent
+            # config values in this codebase fail quietly, which is why this
+            # raises instead of overwriting n_positives to 0 on the user's behalf.
+            if int(self.augmentation.n_positives) != 0:
+                raise ValueError(
+                    "positives_mode='cross_culture' requires "
+                    "augmentation.n_positives == 0, because positives now come "
+                    "from other cultures rather than from warps of the anchor's "
+                    "own window; got %d. Set it to 0 explicitly."
+                    % (self.augmentation.n_positives,))
+        if self.split_mode == "trace" and self.min_train_cultures_per_class < 2:
             warnings.warn(
                 "split_mode='trace' with min_train_cultures_per_class = %d: "
                 "cross-culture positives need at least 2 training cultures per "

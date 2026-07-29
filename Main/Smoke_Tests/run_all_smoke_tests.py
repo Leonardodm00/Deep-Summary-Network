@@ -68,16 +68,42 @@ import time
 from pathlib import Path
 
 # The CANONICAL order, foundational -> compositional (see module docstring).
-# Sixteen suites now exist. Three of them (data_splits, metrics, end_to_end)
-# were written and passing but had never been committed to the repository; they
-# were recovered and are included here. smoke_test_synthetic_config.py was
-# added later (configurable burst-generator params + per-run saved traces) and
-# is placed after smoke_test_run_optimization.py because it imports
-# run_optimization directly (R._resolved_synthetic_params,
-# R.save_synthetic_artifacts), so it depends on that suite's import chain
-# already working. Any suite listed but absent on disk is reported as a GAP at
-# the end of the run rather than silently skipped.
+# Nineteen suites are listed now. Three of them (data_splits, metrics,
+# end_to_end) were written and passing but had never been committed to the
+# repository; they were recovered and are included here.
+# smoke_test_synthetic_config.py was added later (configurable burst-generator
+# params + per-run saved traces) and is placed after
+# smoke_test_run_optimization.py because it imports run_optimization directly
+# (R._resolved_synthetic_params, R.save_synthetic_artifacts), so it depends on
+# that suite's import chain already working.
+# smoke_test_removed_modules.py runs FIRST: it needs no torch, no data and no
+# import from the package, it takes milliseconds, and it is a pure regression
+# guard against a deleted module reappearing (Change 2). Any suite listed but
+# absent on disk is reported as a GAP at the end of the run rather than
+# silently skipped.
+# Four suites that existed on disk but had never been registered here were added
+# on 29 July 2026, taking the count to twenty-three. They were placed by the same
+# two rules the list already followed -- cheapest and most depended-upon first,
+# and anything importing run_optimization after that suite's import chain is
+# known to work:
+#   objective_wiring  SECOND, right behind removed_modules: it needs no torch and
+#                     no data either, and it checks the selection rule and the
+#                     tie-break math that metrics, train and search all rest on,
+#                     so a broken rule fails here in seconds instead of inside
+#                     search much later.
+#   selected_epoch    directly AFTER train and BEFORE search: it trains for real
+#                     and asserts that objective_utils recomputes the same e*
+#                     train.py recorded, which is the assumption search makes.
+#   latent_wiring     AFTER run_optimization, which it imports. Guards the
+#                     preprocessing cache FINGERPRINT: the spec list is identical
+#                     for every tau, so without it a changed tau silently reuses
+#                     old traces.
+#   inspect_latent    likewise imports run_optimization; guards the duplicated
+#                     config -> LatentSpec mapping against the driver's copy.
 ORDER = [
+    "smoke_test_removed_modules.py",        # Change 2 deletion guard (no torch)
+    "smoke_test_objective_wiring.py",       # selection rule + tie-break MATH (no torch)
+    "smoke_test_batch_geometry.py",         # [C4] Eq. (2)/(3) + the caps (no torch)
     "smoke_test_config.py",
     "smoke_test_backbone.py",
     "smoke_test_augmentation.py",
@@ -91,9 +117,12 @@ ORDER = [
     "smoke_test_burst_pipeline.py",
     "smoke_test_adaptive_patience.py",      # growing patience + silhouette floor
     "smoke_test_train.py",
+    "smoke_test_selected_epoch.py",         # train.py vs objective_utils: NO DRIFT
     "smoke_test_search.py",
     "smoke_test_end_to_end.py",             # full pipeline + REAL resume
     "smoke_test_run_optimization.py",
+    "smoke_test_latent_wiring.py",          # latent cache FINGERPRINT + stale refusal
+    "smoke_test_inspect_latent.py",         # inspection tool vs driver: NO DRIFT
     "smoke_test_synthetic_config.py",       # configurable burst params + saved artifacts
     "smoke_test_run_optimization_colab.py",
 ]
@@ -112,6 +141,24 @@ MISSING = {
     "smoke_test_adaptive_patience.py":
         "growing-patience termination bound and the label-shuffled silhouette "
         "floor that sets its threshold",
+    "smoke_test_removed_modules.py":
+        "the Change 2 deletion guard: the removed retention module, its suite "
+        "and its references must stay removed",
+    "smoke_test_batch_geometry.py":
+        "[C4] batch geometry: Eq. (2) n_g and M, the Eq. (3) availability "
+        "clamp, and the miner-gated group-size, degeneracy and resource caps",
+    "smoke_test_objective_wiring.py":
+        "the selection rule and tie-break MATH: lexicographic e*, Delta_min(y), "
+        "role-ordered (u, v), and the tie-break dispatch on selection_primary",
+    "smoke_test_selected_epoch.py":
+        "the DRIFT TEST: on real training runs, objective_utils must recompute "
+        "the same e* train.py itself recorded",
+    "smoke_test_latent_wiring.py":
+        "the latent cache FINGERPRINT: it must change with tau, label_axes and "
+        "seed, and a stale cache must raise rather than be silently reused",
+    "smoke_test_inspect_latent.py":
+        "the inspection tool's config -> LatentSpec mapping must agree field by "
+        "field with run_optimization's copy",
 }
 
 

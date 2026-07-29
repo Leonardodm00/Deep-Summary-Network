@@ -237,7 +237,7 @@ def build_loss_and_miner(train_cfg):
         # Easy positives, SEMIHARD negatives. The intended middle ground between
         # the two strategies above: easy positives avoid the collapse pressure of
         # dragging every same-class window to one point (which is what would
-        # destroy the label-irrelevant latent factors the C5 metric measures),
+        # destroy the label-irrelevant latent factors of the benchmark),
         # while semihard negatives -- those FARTHER than the positive but still
         # inside the margin -- avoid both the vanishing gradients of easy
         # negatives and the noise-amplifying instability of the hardest ones.

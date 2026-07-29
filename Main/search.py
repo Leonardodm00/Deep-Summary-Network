@@ -136,9 +136,11 @@ from config import ExperimentConfig
 from objective_utils import (
     adaptive_epsilon,
     composite_objective,
+    primary_secondary_scores,   # [C3] role-ordered (u, v); see evaluate_candidate
     resolve_n_initial_points,
     selected_epoch_index,       # [C2] re-exported below; lives in objective_utils
     selected_epoch_scores,      #      so it is testable without torch
+    tie_break_applicable,       # [C3] the dispatch policy, testable without torch
 )
 from train import train
 
@@ -400,6 +402,10 @@ def resolve_tie_break_epsilon(cfg, splits, verbose=False):
     reproduces the pre-C2 objective (primary metric only). Returns
     (epsilon or None, info dict).
 
+    [C3] It is ALSO disabled, whatever gamma is, when cfg.train.selection_primary
+    is not "ari", because Eq. (4) presumes a discrete primary. See the inline
+    note at the dispatch. info["reason"] distinguishes the two disabled cases.
+
     COST. min_ari_gap is O(N_eval * C) ARI evaluations, each O(N_eval), i.e.
     O(N_eval^2 * C) overall, computed ONCE per phase (not per trial). MEASURED
     by Main/Smoke_Tests/smoke_test_objective_wiring.py [J], which prints the
@@ -410,8 +416,24 @@ def resolve_tie_break_epsilon(cfg, splits, verbose=False):
     discovering the cost in a cluster job.
     """
     gamma = float(getattr(cfg.search, "tie_break_gamma", 0.0))
-    if gamma <= 0.0:
-        return None, {"enabled": False, "gamma": gamma}
+    primary = str(getattr(cfg.train, "selection_primary", "ari"))
+    # [C3] The policy lives in objective_utils so it is testable without torch;
+    # this function keeps only the parts that need cfg and splits.
+    applicable, reason = tie_break_applicable(primary, gamma)
+    if not applicable:
+        if reason == "continuous primary":
+            # Not silently: a config value that is quietly ignored is the
+            # failure mode this codebase has already been bitten by.
+            warnings.warn(
+                "search.tie_break_gamma = %g is INERT under "
+                "train.selection_primary = %r: the tie-break of Eq. (4) "
+                "requires a primary with a smallest expressible gap "
+                "(Delta_min(y)), which a continuous metric does not have. The "
+                "search will minimise the primary alone and the secondary "
+                "metric will not influence trial ranking. Set tie_break_gamma "
+                "= 0 to silence this." % (gamma, primary), RuntimeWarning)
+        return None, {"enabled": False, "gamma": gamma, "reason": reason,
+                      "selection_primary": primary}
     y = np.asarray(splits.val.conditions_per_item, dtype=int).ravel()
     info = adaptive_epsilon(
         y,
@@ -439,15 +461,25 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
     [C2] With epsilon = None (the default) the objective is the pre-C2 one,
     -mean(primary metric at e*). With epsilon > 0 it is
 
-        J_epsilon(t) = -(1/S) * sum_sigma [ ARI(t,sigma,e*) + epsilon * Sil(t,sigma,e*) ]
+        J_epsilon(t) = -(1/S) * sum_sigma [ u(t,sigma,e*) + epsilon * v(t,sigma,e*) ]
 
     with BOTH metrics read at the SAME selected epoch e*(t, sigma).
+
+    [C3] (u, v) are the primary and secondary BY ROLE, i.e. (ARI, Sil) under
+    cfg.train.selection_primary == "ari" and (Sil, ARI) under "silhouette".
+    Before C3 this function read the pair ordered by NAME, so switching
+    selection_primary changed which EPOCH was read but left the search still
+    ranking trials by ARI. epsilon is None whenever the primary is continuous
+    (see resolve_tie_break_epsilon), so under "silhouette" the objective is
+    -mean(Sil at e*) and ARI does not enter the ranking at all.
 
     NOTE on what is reported vs what is optimized: record["mean"] / ["std"] /
     ["scores"] always carry the PRIMARY metric, so they remain comparable across
     runs with and without the tie-break, and so the per-seed std stays the honest
     GP noise level of the primary signal. record["objective"] is what
-    gp_minimize actually minimizes.
+    gp_minimize actually minimizes. record["ari_*"] and record["sil_*"] carry
+    each metric under its OWN name whatever the roles are, and
+    record["selection_primary"] says which of them "mean" duplicates.
 
     Returns
     -------
@@ -457,6 +489,7 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
     base_seed = int(cfg.runtime.seed)
     scores = []
     sil_scores = []
+    ari_scores = []          # [C3] ARI at e*, ALWAYS, whatever the roles are
     objectives = []
     epochs = []
     eff_ranks = []
@@ -474,15 +507,20 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
                 % (trial_number, seed, type(ex).__name__, ex), RuntimeWarning)
             continue
         # [C2] both signals at the SAME selected epoch e*
-        s, sil, e_star = selected_epoch_scores(history, cfg.train.selection_primary)
-        if np.isfinite(s):
-            scores.append(float(s))
-            sil_scores.append(float(sil) if np.isfinite(sil) else float("nan"))
+        # [C3] ordered by ROLE: u is whatever cfg.train.selection_primary names
+        # as primary. ari and sil come back under their own names as well, so
+        # the record can carry both without any field meaning two things.
+        u, v, ari_e, sil_e, e_star = primary_secondary_scores(
+            history, cfg.train.selection_primary)
+        if np.isfinite(u):
+            scores.append(float(u))
+            sil_scores.append(float(sil_e) if np.isfinite(sil_e) else float("nan"))
+            ari_scores.append(float(ari_e) if np.isfinite(ari_e) else float("nan"))
             epochs.append(int(e_star))
             if epsilon is None:
-                objectives.append(float(-s))
+                objectives.append(float(-u))
             else:
-                objectives.append(float(composite_objective(s, sil, float(epsilon))))
+                objectives.append(float(composite_objective(u, v, float(epsilon))))
         # eff_rank is the collapse tripwire (mean_pairwise_cos is NOT a reliable
         # absolute signal on non-negative inputs -- it sits near 1 by construction)
         finite_er = [h["health"]["eff_rank"] for h in history
@@ -515,6 +553,9 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
                   "objective": FAILED_OBJECTIVE, "eff_rank": float("nan"),
                   "sil_scores": [float(v) for v in sil_scores],
                   "sil_mean": float("nan"),
+                  "ari_scores": [float(v) for v in ari_scores],
+                  "ari_mean": float("nan"),
+                  "selection_primary": str(cfg.train.selection_primary),
                   "selected_epochs": [int(e) for e in epochs],
                   "epsilon": (None if epsilon is None else float(epsilon)),
                   "n_seeds_ok": int(n_ok), "n_seeds": int(n_seeds), "failed": True}
@@ -527,6 +568,7 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
     std = float(arr.std())                        # population std across seeds
     objective = float(np.mean(np.asarray(objectives, dtype=float)))
     sil_arr = np.asarray(sil_scores, dtype=float)
+    ari_arr = np.asarray(ari_scores, dtype=float)
     record = {
         "trial": int(trial_number),
         "scores": [float(v) for v in arr],
@@ -537,6 +579,10 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
         "sil_scores": [float(v) for v in sil_arr],
         "sil_mean": (float(np.nanmean(sil_arr))
                      if np.any(np.isfinite(sil_arr)) else float("nan")),
+        "ari_scores": [float(v) for v in ari_arr],
+        "ari_mean": (float(np.nanmean(ari_arr))
+                     if np.any(np.isfinite(ari_arr)) else float("nan")),
+        "selection_primary": str(cfg.train.selection_primary),
         "selected_epochs": [int(e) for e in epochs],
         "epsilon": (None if epsilon is None else float(epsilon)),
         "n_seeds_ok": int(n_ok),

@@ -638,7 +638,21 @@ def check_JKLPQ():
                            n_clusters=int(disk["n_classes"]),
                            n_init=int(cfg_best.eval.kmeans_n_init),
                            silhouette_metric=cfg_best.eval.silhouette_metric)
-    winner = max(disk["test"]["per_seed"], key=lambda s: s["best_val_ari"])
+    # [C3] Recompute the winner by the rule run_optimization actually applies:
+    # the PRIMARY read at e*, ties broken on the secondary at the same e*. Using
+    # best_val_ari here would keep passing while silently asserting the rule the
+    # pipeline no longer uses -- and under selection_primary = "silhouette" it
+    # would identify a different seed from the one whose checkpoint was copied.
+    _ps = [s for s in disk["test"]["per_seed"]
+           if np.isfinite(s["val_primary_at_estar"])]
+    assert _ps, "no seed reported a finite primary at e*"
+    winner = max(_ps, key=lambda s: (
+        float(s["val_primary_at_estar"]),
+        (float(s["val_secondary_at_estar"])
+         if np.isfinite(s["val_secondary_at_estar"]) else float("-inf")),
+    ))
+    assert disk["test"]["best_model_selected_on"].startswith("validation"), \
+        "the provenance string must still record selection on VALIDATION"
     assert abs(float(m["ari"]) - float(winner["test_ari"])) < 1e-9, \
         ("the rebuilt best_model.pt scores ARI %.6f but results.json reports "
          "%.6f for that seed" % (m["ari"], winner["test_ari"]))
