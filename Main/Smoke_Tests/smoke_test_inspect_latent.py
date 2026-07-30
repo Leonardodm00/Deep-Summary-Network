@@ -28,8 +28,8 @@ Checks:
   C. synthesize_dataset returns the right count, shape, ordering and labels;
      traces are finite and non-negative; every trace shares one f_s.
   D. The latent coordinates it reports are the SAME ones latent_ground_truth_table
-     records for those traces -- i.e. the figure and the C5 ground truth cannot
-     disagree.
+     records for those traces -- i.e. the figure and the latent ground truth
+     cannot disagree.
   E. The label axes track the class and the free axes do not, computed on the
      returned Phi. This is the property the right-hand panel of
      latent_factors.png exists to show, asserted numerically so a broken axis
@@ -179,16 +179,16 @@ def check_synthesis():
           "all finite and non-negative, phi in [0,1]^%d OK"
           % (len(traces), K, fs, spec.n_latent))
 
-    # [D] the coordinates must match the C5 ground-truth table exactly
+    # [D] the coordinates must match the latent ground-truth table exactly
     table = latent_ground_truth_table(spec)
     by_key = {(int(r["condition"]), int(r["trace_id"])): np.asarray(r["phi"])
               for r in table["rows"]}
     for t, (c, r) in enumerate(zip(conditions, trace_ids)):
         assert np.allclose(Phi[t], by_key[(c, r)]), (
             "trace (c=%d, r=%d): the inspected phi differs from the ground-truth "
-            "table the factor-retention analysis will use" % (c, r))
+            "table written as latent_ground_truth.json" % (c, r))
     print("  [D] every reported phi matches latent_ground_truth_table exactly -- "
-          "the figure and the C5 ground truth cannot disagree OK")
+          "the figure and the latent ground truth cannot disagree OK")
 
     # [E] label axes track the class; free axes do not
     y = np.asarray(conditions, dtype=float)
@@ -202,8 +202,8 @@ def check_synthesis():
     assert min(lab) > 0.8, "label axes should track the class; got %r" % (lab,)
     assert max(free) < 0.6, (
         "a FREE axis tracks the class (|rho| = %.3f): the axis assignment is "
-        "wrong and the factor-retention measurement would be meaningless"
-        % max(free))
+        "wrong, so the axis is not label-irrelevant and nothing computed on "
+        "the free axes would mean what it claims" % max(free))
     print("  [E] |rho| with the class: label axes %s vs free axes max %.3f -- "
           "separated, as the right-hand figure panel should show OK"
           % (["%.3f" % v for v in lab], max(free)))

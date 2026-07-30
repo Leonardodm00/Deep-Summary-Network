@@ -34,6 +34,21 @@ Checks:
   C. The same with selection_primary = "silhouette", which swaps (u, v).
   D. The metrics the search reads are the ones recorded AT e*, not each signal's
      independent maximum over epochs -- asserted directly against history.
+  E. HARNESS guard: the checkpoint directory is keyed by the full configuration
+     that produced it (here: selection_primary AND seed), so a second
+     check_agreement call cannot RESUME from the first one's last.pt.
+
+The bug check [E] exists to prevent (28 July 2026)
+--------------------------------------------------
+_run_one used to key the checkpoint directory on the seed ALONE, while main()
+passed the same temporary directory to both check_agreement calls. train()
+resumes from an existing last.pt, so the "silhouette" pass resumed from the
+"ari" pass's checkpoint and inherited a best_epoch computed under the ARI rule;
+check [C] then compared it against a recomputation under the silhouette rule and
+reported DRIFT. Both numbers were correct -- they answered different questions.
+The two rule implementations were never out of step. Any smoke test that hands
+train() a checkpoint directory reachable by a second call is exposed to the same
+silent resume: key such directories by the whole configuration, not by the seed.
 """
 
 import os
@@ -98,9 +113,27 @@ def _splits(cfg):
                                     base_seed=int(cfg.runtime.seed))
 
 
+def _ckpt_dir(tmp, selection_primary, seed):
+    """[E] The checkpoint path for ONE (selection_primary, seed) combination.
+
+    Keyed by the full configuration under test, NOT by the seed alone. train()
+    resumes from an existing last.pt, so two calls that differ in ANY setting
+    which changes best_epoch must not be able to reach the same directory.
+    """
+    return os.path.join(tmp, "ckpt_%s_seed%d" % (str(selection_primary), int(seed)))
+
+
 def _run_one(cfg, splits, seed, tmp):
-    ckpt = os.path.join(tmp, "ckpt_seed%d" % seed)
+    ckpt = _ckpt_dir(tmp, cfg.train.selection_primary, seed)
     os.makedirs(ckpt, exist_ok=True)
+    # [E] Fail loudly rather than resuming. If this fires, two calls collided on
+    # one checkpoint directory and every epoch number downstream is suspect.
+    resume_from = os.path.join(ckpt, "last.pt")
+    assert not os.path.exists(resume_from), (
+        "HARNESS BUG: %s already exists, so train() would RESUME instead of "
+        "starting fresh, and best_epoch would be inherited from a previous run "
+        "(possibly under a different selection_primary). Key the checkpoint "
+        "directory by the full configuration." % resume_from)
     model, history = train(cfg, splits.train, splits.val, "cpu", seed=seed,
                            ckpt_dir=ckpt)
     ck = load_checkpoint(os.path.join(ckpt, "last.pt"), map_location="cpu")
@@ -158,6 +191,42 @@ def check_reads_are_paired(tmp):
               "construction (checked in smoke_test_objective_wiring.py [A])")
 
 
+def check_ckpt_keying(tmp, done_primary, done_seeds, next_primary):
+    """[E] The regression guard for the 28 July 2026 harness bug.
+
+    Called AFTER the `done_primary` pass and BEFORE the `next_primary` pass, so
+    the resume hazard it rules out is a real one rather than a hypothetical: the
+    completed pass has genuinely left a last.pt on disk for each of its seeds.
+    Asserts three things, in increasing strength:
+
+      1. the completed pass really wrote a checkpoint (otherwise 2 and 3 pass
+         vacuously and the guard proves nothing);
+      2. the two passes map the SAME seed to DIFFERENT directories;
+      3. no directory the next pass will use already holds a last.pt, i.e. it
+         cannot resume across a change of selection rule.
+    """
+    n_written = 0
+    for seed in done_seeds:
+        done_dir = _ckpt_dir(tmp, done_primary, seed)
+        next_dir = _ckpt_dir(tmp, next_primary, seed)
+        last = os.path.join(done_dir, "last.pt")
+        assert os.path.exists(last), (
+            "the %r pass left no last.pt at %s, so this guard would pass "
+            "vacuously; the resume hazard it tests for could not be observed."
+            % (done_primary, last))
+        n_written += 1
+        assert done_dir != next_dir, (
+            "checkpoint directories for selection_primary=%r and %r collide at "
+            "%s on seed %d: the second pass would resume from the first and "
+            "inherit its best_epoch." % (done_primary, next_primary, done_dir, seed))
+        assert not os.path.exists(os.path.join(next_dir, "last.pt")), (
+            "%s already holds a last.pt before the %r pass has run."
+            % (next_dir, next_primary))
+    print("      %d checkpoint(s) written under selection_primary=%r; the %r "
+          "pass maps every seed to a fresh directory"
+          % (n_written, done_primary, next_primary))
+
+
 def main():
     print("smoke_test_selected_epoch.py [C2 drift test]  torch %s" % torch.__version__)
     tmp = tempfile.mkdtemp(prefix="sel_epoch_")
@@ -165,6 +234,9 @@ def main():
         print("  [A][B] selection_primary = 'ari', several seeds:")
         check_agreement(tmp, "ari", seeds=(0, 1, 2))
         print("  [A][B] recomputed e* == train.py's own best_epoch on every seed OK")
+        print("  [E] checkpoint dirs are keyed by selection_primary, not by seed:")
+        check_ckpt_keying(tmp, "ari", (0, 1, 2), "silhouette")
+        print("  [E] the next pass cannot resume from the previous one OK")
         print("  [C] selection_primary = 'silhouette':")
         check_agreement(tmp, "silhouette", seeds=(0, 1))
         print("  [C] the rule still agrees when (u, v) are swapped OK")

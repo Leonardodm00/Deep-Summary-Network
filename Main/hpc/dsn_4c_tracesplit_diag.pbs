@@ -20,7 +20,7 @@
 #   Change 3   selection_primary = "silhouette"                  YES (see note)
 #   Change 1   n_g cap (n_g <= 14)                               NO -- unimplemented
 #   Change 4   cross-culture positives, rho instrumentation      NO -- unimplemented
-#   Change 2   factor_retention removal                          NO -- unimplemented
+#   Change 2   removal of the C5 retention metric                YES (deleted in this branch)
 #
 # Because Change 4 is not in, rho (frac_neg_surrogate) DOES NOT EXIST YET and
 # this run cannot report it. n_g is still B_c * (1 + P_b) = 4 * (1 + 8) = 36,

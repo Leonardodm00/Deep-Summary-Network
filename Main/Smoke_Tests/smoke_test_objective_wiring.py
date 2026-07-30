@@ -49,8 +49,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from objective_utils import (                                    # noqa: E402
     adaptive_epsilon,
+    tie_break_applicable,
     composite_objective,
     min_ari_gap,
+    primary_secondary_scores,
     resolve_n_initial_points,
     selected_epoch_index,
     selected_epoch_scores,
@@ -281,9 +283,161 @@ def check_cost():
         print("        N_eval = %4d  ->  %7.1f ms" % (3 * n_per, 1e3 * dt))
 
 
+def check_role_ordering():
+    """[K] primary_secondary_scores orders (u, v) by ROLE, not by name."""
+    # An epoch grid on which the two metrics DISAGREE about the best epoch, so
+    # "which one is primary" is observable rather than incidental.
+    history = [
+        {"epoch": 1, "ari": 0.90, "silhouette": 0.10},
+        {"epoch": 2, "ari": 0.40, "silhouette": 0.80},
+        {"epoch": 3, "ari": 0.20, "silhouette": 0.05},
+    ]
+    u, v, ari, sil, ep = primary_secondary_scores(history, "ari")
+    assert ep == 1, "ARI primary must select epoch 1; got %d" % ep
+    assert (u, v) == (0.90, 0.10), "ARI primary must return (ARI, Sil); got %r" % ((u, v),)
+    assert (ari, sil) == (0.90, 0.10)
+    print("      [K] primary 'ari': e* = 1, (u, v) = (ARI, Sil) = (%.2f, %.2f) OK"
+          % (u, v))
+
+    u, v, ari, sil, ep = primary_secondary_scores(history, "silhouette")
+    assert ep == 2, "silhouette primary must select epoch 2; got %d" % ep
+    assert (u, v) == (0.80, 0.40), (
+        "silhouette primary must return (Sil, ARI); got %r. If this returns "
+        "(ARI, Sil) the search is ranking trials by the SECONDARY metric."
+        % ((u, v),))
+    assert (ari, sil) == (0.40, 0.80), (
+        "ari and sil must come back under their OWN names whatever the roles "
+        "are; got ari=%r sil=%r" % (ari, sil))
+    print("      [K] primary 'silhouette': e* = 2, (u, v) = (Sil, ARI) = "
+          "(%.2f, %.2f), and (ari, sil) still name-true OK" % (u, v))
+
+    # The two orderings must agree on e* and on the named metrics with
+    # selected_epoch_scores, or the role wrapper has drifted from the rule.
+    for primary in ("ari", "silhouette"):
+        a2, s2, e2 = selected_epoch_scores(history, primary)
+        _u, _v, a1, s1, e1 = primary_secondary_scores(history, primary)
+        assert (a1, s1, e1) == (a2, s2, e2), (
+            "primary_secondary_scores disagrees with selected_epoch_scores at "
+            "primary=%r: %r vs %r" % (primary, (a1, s1, e1), (a2, s2, e2)))
+    print("      [K] agrees with selected_epoch_scores on e*, ARI and Sil for "
+          "both primaries OK")
+
+    # The PRIMARY must carry the -inf convention under either role, so a
+    # degenerate embedding can never win. Under 'silhouette' that convention has
+    # to be applied to the silhouette, which selected_epoch_scores does not do.
+    #
+    # NOTE, and it is not obvious: this epoch IS selected. The rule compares
+    # (u_e, v_e) = (-inf, 0.5) against the initial (u*, v*) = (-inf, -inf) and
+    # the SECONDARY breaks the tie, so i* = 0 rather than None. That is train.py's
+    # behaviour too (the rules are mirrored), and it is harmless only because the
+    # -inf primary is what the caller gates on: search.evaluate_candidate tests
+    # np.isfinite(u) and drops the seed, which makes the trial FAILED. Assert the
+    # gate, not a sentinel epoch that this history does not produce.
+    nan = float("nan")
+    degenerate = [{"epoch": 1, "ari": 0.5, "silhouette": nan}]
+    u, v, ari, sil, ep = primary_secondary_scores(degenerate, "silhouette")
+    assert u == float("-inf"), (
+        "a non-finite PRIMARY must become -inf; got %r" % (u,))
+    assert not np.isfinite(u), (
+        "search.evaluate_candidate gates on np.isfinite(u); if this passes, a "
+        "degenerate embedding would be scored as a valid trial")
+    assert composite_objective(u, v, 0.02) == float("inf"), (
+        "a degenerate primary must map to the worst attainable objective")
+    assert ep == 1 and v == 0.5, (
+        "expected the epoch to be selected on the secondary alone; got e*=%r "
+        "v=%r" % (ep, v))
+    print("      [K] non-finite primary -> -inf under EITHER role; the epoch is "
+          "still selected on the secondary, but isfinite(u) is False so the "
+          "seed is dropped and the composite is +inf OK")
+
+    # An all-NaN history selects nothing under either role.
+    empty = [{"epoch": 1, "ari": nan, "silhouette": nan}]
+    for primary in ("ari", "silhouette"):
+        u, v, ari, sil, ep = primary_secondary_scores(empty, primary)
+        assert u == float("-inf") and ep == 0, (
+            "all-NaN history at primary=%r must select nothing" % (primary,))
+    print("      [K] all-NaN history selects nothing under either role OK")
+
+    try:
+        primary_secondary_scores(history, "eff_rank")
+    except ValueError:
+        print("      [K] an unknown selection_primary raises OK")
+    else:
+        raise AssertionError("an unknown selection_primary must raise")
+
+
+def check_tie_break_dispatch():
+    """[L] The tie-break is formed only when its premise holds."""
+    ok, why = tie_break_applicable("ari", 0.5)
+    assert ok and why == "", "ARI primary with gamma > 0 must form the tie-break"
+    print("      [L] primary 'ari', gamma = 0.5 -> tie-break APPLICABLE OK")
+
+    ok, why = tie_break_applicable("silhouette", 0.5)
+    assert (not ok) and why == "continuous primary", (
+        "a continuous primary must disable the tie-break, not merely rescale "
+        "it; got (%r, %r)" % (ok, why))
+    print("      [L] primary 'silhouette', gamma = 0.5 -> DISABLED, reason %r OK"
+          % (why,))
+
+    # H-section 6.4 [F]: the answer must change when ONLY selection_primary does.
+    a = tie_break_applicable("ari", 0.5)
+    b = tie_break_applicable("silhouette", 0.5)
+    assert a != b, (
+        "the dispatch must depend on selection_primary; identical answers mean "
+        "epsilon is still bound to the metric NAMED 'sil' rather than to its "
+        "ROLE, which is the defect H-section 6.3 identified")
+    print("      [L] changing ONLY selection_primary changes the answer OK")
+
+    # The gamma test comes first, so a study that had already switched the
+    # tie-break off is told the reason it actually chose.
+    for primary in ("ari", "silhouette"):
+        ok, why = tie_break_applicable(primary, 0.0)
+        assert (not ok) and why == "gamma <= 0", (
+            "gamma = 0 must report its own reason at primary=%r; got %r"
+            % (primary, why))
+        ok, why = tie_break_applicable(primary, -1.0)
+        assert (not ok) and why == "gamma <= 0"
+    ok, why = tie_break_applicable("ari", float("nan"))
+    assert (not ok) and why == "gamma <= 0", (
+        "a non-finite gamma must disable rather than propagate a NaN epsilon")
+    print("      [L] gamma <= 0, negative and NaN all disable, and that reason "
+          "takes precedence over the primary OK")
+
+    # H-section 6.4 [G], restated for option A: under 'silhouette' no epsilon is
+    # produced AT ALL, so in particular it cannot depend on min_ari_gap. Assert
+    # that by making min_ari_gap explode if it is ever consulted.
+    import objective_utils as _ou
+    original = _ou.min_ari_gap
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError(
+            "min_ari_gap was called while the primary is continuous: epsilon "
+            "must not be derived from ARI's resolution under a silhouette "
+            "primary.")
+
+    _ou.min_ari_gap = _forbidden
+    try:
+        ok, why = tie_break_applicable("silhouette", 0.5)
+        assert not ok
+    finally:
+        _ou.min_ari_gap = original
+    print("      [L] under a continuous primary min_ari_gap is never consulted OK")
+
+    try:
+        tie_break_applicable("eff_rank", 0.5)
+    except ValueError:
+        print("      [L] an unknown selection_primary raises OK")
+    else:
+        raise AssertionError("an unknown selection_primary must raise")
+
+
 def main():
     print("smoke_test_objective_wiring.py [C2 + C3]")
     check_epoch_rule()
+    print("  [K] role-ordered scores for the search objective:")
+    check_role_ordering()
+    print("  [L] tie-break dispatch on selection_primary:")
+    check_tie_break_dispatch()
     check_resolution()
     check_guarantee()
     check_conventions()

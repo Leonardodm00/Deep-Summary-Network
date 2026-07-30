@@ -276,8 +276,9 @@ sh run_wiring_checks.sh
 1. **Rung 0** -- byte scan of every `.py`/`.json` file, then `py_compile` over the whole
    import chain.
 2. **Rung 1** -- `smoke_test_latent_and_objective.py` (the handoff's own 21 checks),
-   `smoke_test_objective_wiring.py` (C2/C3), `smoke_test_factor_retention.py` (C5,
-   including the grouping test).
+   `smoke_test_objective_wiring.py` (C2/C3), `smoke_test_removed_modules.py` (the
+   Change 2 deletion guard; it replaced the C5 rung, whose module and suite were
+   deleted).
 3. **Rung 2** -- every pre-existing smoke test against **real** torch (nothing here may
    newly fail), then `smoke_test_latent_wiring.py` (C1, this time against real torch
    rather than this session's sandbox stub), then **`smoke_test_selected_epoch.py`**
@@ -365,11 +366,14 @@ killed mid-way must restart, but the trace cache survives (fingerprinted, sectio
 Each run writes `out/<experiment_name>/results.json`, with a `"test"` block reporting
 `mean +/- std` over seeds for `ari` and `eff_rank`, plus `per_seed[*].epochs_run` (check
 this against `train.max_epochs` first -- if it equals the ceiling, the runs never
-converged). The decisive comparison the handoff's C6 section asked for is the
-**factor-retention** numbers, not written to `results.json` automatically -- run
-`factor_retention.py` on each run's saved `latent_ground_truth.json` and held-out
-embeddings, as `Smoke_Tests/smoke_test_factor_retention.py` section G demonstrates
-end to end.
+converged).
+
+**The C5 retention metric no longer exists (Change 2).** The C6 miner comparison as
+originally posed rested on it, so as of this branch that comparison is available only
+through `ari` and `eff_rank`. Each run still saves `latent_ground_truth.json`, so the
+retention numbers remain *recoverable offline* by anyone who reimplements the
+regression; nothing in this repository computes them. See
+`CHANGES_change2_remove_retention_metric.md` for what was removed and why.
 
 ### 3.8 If something goes wrong
 
@@ -383,7 +387,6 @@ end to end.
 | `ValueError: infeasible window / split geometry` | the pre-flight is working correctly | it names the fix directly in the message |
 | `STALE TRACE CACHE` | a latent parameter changed but the cache dir did not | pass `--overwrite-cache` or point at a fresh `cache_dir` |
 | the search seems to score a different epoch than `train.py`'s own log | C2's recomputed e* has drifted | `smoke_test_selected_epoch.py` (3.5) exists to catch this before a real job does |
-| unexpectedly low or high R^2_k in a C5 result | check `n_c` before drawing a conclusion | with `n_c = 3` the free-axis effective sample size is 9, not `N_eval` |
 | a range set in `config_input.json` doesn't seem to take effect | `config.py` defaults vs the JSON file diverge | always check which one is actually in force |
 
 ---

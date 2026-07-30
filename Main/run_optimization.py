@@ -164,6 +164,7 @@ from latent_burst_generator import (        # [C1]
     latent_ground_truth_table,
 )
 from train import train, set_global_seed, resolve_device, derive_batches_per_epoch
+from objective_utils import primary_secondary_scores   # [C3] role-ordered read at e*
 from checkpoint import save_checkpoint
 from evaluate import evaluate_and_plot        # also forces the headless Agg backend
 
@@ -378,12 +379,20 @@ def latent_spec_from_config(cfg):
 def save_latent_artifacts(cfg, out_dir, verbose=False):
     """[C1] Write latent_ground_truth.json next to the run's other artifacts.
 
-    REQUIRED for the factor-retention analysis (C5): that metric regresses each
-    known latent coordinate phi_k on the learned embedding, and without this
-    table it has no ground truth to regress against. Cheap -- it enumerates the
-    latent vectors WITHOUT synthesizing any signal -- so it is written
-    unconditionally for latent runs, including --dry-run ones, rather than being
-    made contingent on a flag someone will forget to pass.
+    This table records, for every generated trace, the TRUE latent coordinates
+    phi_k the generator drew it from. It is the only record of what the
+    synthetic benchmark actually contained, so a run without it cannot be
+    re-analysed against its own ground truth after the fact.
+
+    KEPT DELIBERATELY (Change 2). The in-repo metric that consumed this table --
+    the latent-retention regression, module C5 -- was deleted; the ARTEFACT was
+    not, because it is the run's provenance record and because any later
+    analysis, in or out of this repository, needs it. If nothing ever consumes
+    it again, the cost is one small JSON per run.
+
+    Cheap -- it enumerates the latent vectors WITHOUT synthesizing any signal --
+    so it is written unconditionally for latent runs, including --dry-run ones,
+    rather than being made contingent on a flag someone will forget to pass.
 
     Returns the path written.
     """
@@ -1341,6 +1350,25 @@ def run_final(cfg_best, splits, device, n_classes, out_dir, resume=False,
         epochs_run = len(history)
         best_val_ari = _best_finite(history, "ari")
         best_val_sil = _best_finite(history, "silhouette")
+        # [C3] The key the deployable model is CHOSEN by, as distinct from the
+        # two above. Two defects are fixed here at once:
+        #   (a) best_val_* are each metric's independent MAXIMUM over epochs, so
+        #       neither need be attained by the checkpoint this loop saves --
+        #       train() restores the weights of e*, not of the epoch where a
+        #       metric happened to peak. Ranking candidate models by a number the
+        #       saved artefact does not have is the same "model that never
+        #       existed" defect C2 removed from the search; it survived here.
+        #   (b) the choice was hard-bound to ARI, so cfg.train.selection_primary
+        #       never reached it. Under "silhouette" the epoch rule and the
+        #       search both follow the role and this last step did not, leaving
+        #       the three selection layers of one run disagreeing.
+        # primary_secondary_scores returns (u, v) by ROLE and (ari, sil) by name,
+        # all read at the SAME e*, so both are fixed by one call.
+        sel_u, sel_v, ari_at_estar, sil_at_estar, estar = primary_secondary_scores(
+            history, cfg_best.train.selection_primary)
+        # best_val_* are RETAINED unchanged: they are reported quantities with
+        # existing consumers, and silently redefining a published key is worse
+        # than adding an honest one beside it.
 
         print("[run]   seed %d (%d): %d epoch(s) in %.1f s (%.2f s/epoch) | "
               "best val ARI %.4f"
@@ -1378,6 +1406,13 @@ def run_final(cfg_best, splits, device, n_classes, out_dir, resume=False,
             "seconds_per_epoch": float(secs / max(1, epochs_run)),
             "best_val_ari": float(best_val_ari),
             "best_val_silhouette": float(best_val_sil),
+            # [C3] read at e*, the epoch whose weights this checkpoint holds
+            "selected_epoch": int(estar),
+            "val_ari_at_estar": float(ari_at_estar),
+            "val_silhouette_at_estar": float(sil_at_estar),
+            "val_primary_at_estar": float(sel_u),
+            "val_secondary_at_estar": float(sel_v),
+            "selection_primary": str(cfg_best.train.selection_primary),
             "test_ari": float(ev["ari"]),
             "test_ami": float(ev["ami"]),
             "test_silhouette": float(ev["silhouette"]),
@@ -1391,16 +1426,32 @@ def run_final(cfg_best, splits, device, n_classes, out_dir, resume=False,
     # ---- [ADDED 2] the deployable model, SELECTED ON VALIDATION ------------
     # NOT on test_ari: choosing the model by its held-out score would fold the
     # test split into model selection, and the reported test number would stop
-    # being an out-of-sample estimate of anything.
-    finite = [s for s in per_seed if np.isfinite(s["best_val_ari"])]
+    # being an out-of-sample estimate of anything. THAT guarantee is unchanged by
+    # [C3]; only WHICH validation number is read changes.
+    #
+    # [C3] The key is the PRIMARY read at e*, so the number a seed is ranked by
+    # is one its saved checkpoint actually has, and so this step follows
+    # cfg.train.selection_primary like the two before it. Ties are broken on the
+    # secondary at the same e*, which is the lexicographic rule train.py and
+    # objective_utils already use over epochs, applied here over seeds. Under a
+    # continuous primary an exact tie has probability zero, so the tie-break is
+    # inert there and costs nothing; under "ari" it is reachable, because ARI on
+    # a fixed validation set takes finitely many values.
+    primary_name = str(cfg_best.train.selection_primary)
+    finite = [s for s in per_seed if np.isfinite(s["val_primary_at_estar"])]
     best_model_path = None
     if finite:
-        winner = max(finite, key=lambda s: s["best_val_ari"])
+        winner = max(finite, key=lambda s: (
+            float(s["val_primary_at_estar"]),
+            (float(s["val_secondary_at_estar"])
+             if np.isfinite(s["val_secondary_at_estar"]) else float("-inf")),
+        ))
         best_model_path = ckpt_root / "best_model.pt"
         shutil.copy2(winner["checkpoint"], best_model_path)
-        print("[run]   best_model.pt <- seed_index %d (best val ARI %.4f; "
-              "selected on VALIDATION, never on test)"
-              % (winner["seed_index"], winner["best_val_ari"]))
+        print("[run]   best_model.pt <- seed_index %d (validation %s = %.4f at "
+              "e* = %d; selected on VALIDATION, never on test)"
+              % (winner["seed_index"], primary_name,
+                 winner["val_primary_at_estar"], winner["selected_epoch"]))
 
     test = {
         "ari": _agg([s["test_ari"] for s in per_seed]),
@@ -1410,7 +1461,8 @@ def run_final(cfg_best, splits, device, n_classes, out_dir, resume=False,
         "per_seed": per_seed,
         "n_seeds": Ns,
         "best_model": str(best_model_path) if best_model_path else None,
-        "best_model_selected_on": "validation ARI (never on test)",
+        "best_model_selected_on": ("validation %s at the selected epoch e* "
+                                   "(never on test)" % primary_name),
     }
     print("[run] TEST  ARI %.4f +/- %.4f | AMI %.4f +/- %.4f | silhouette "
           "%.4f +/- %.4f  (over %d training seeds)"

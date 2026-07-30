@@ -29,14 +29,16 @@ Label constants
 
 from __future__ import annotations
 
+import logging
 import math
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
 from augmentation import AugmentationConfig, build_triplet_instance
+from batch_geometry import DEFAULT_Q_CAP_FRACTION, resolve_batch_geometry
 
 __all__ = [
     "CONTROL",
@@ -225,16 +227,61 @@ def seed_worker(worker_id: int) -> None:
 # Condition-balanced batch sampler (every batch has BOTH conditions)
 # --------------------------------------------------------------------------- #
 class ConditionBalancedBatchSampler(Sampler):
-    """Yield index batches with exactly `per_condition` windows from each
-    condition, so every batch supports cross-condition triplets.
+    """Yield index batches supporting the configured positive strategy.
+
+    Two modes, selected by ``positives_mode``:
+
+    * ``"augmentation"`` (default) -- the LEGACY behaviour, UNCHANGED. Each batch
+      carries exactly ``per_condition`` windows drawn (with replacement only when
+      a class is smaller than ``per_condition``) from every condition, so every
+      batch supports cross-condition triplets. Each window is later expanded by
+      the collator into (anchor + warp positives + surrogate negatives). This
+      path is kept byte-identical so Change 4 stays inert until switched on
+      (assertion [I]).
+
+    * ``"cross_culture"`` -- CULTURES-FIRST-THEN-WINDOWS. The batch geometry is
+      resolved ONCE at construction via ``resolve_batch_geometry`` (Eq. (2),
+      Eq. (3), the two caps, the easy-positive precondition, and the q <= W_min
+      guard), and ``geo.notes`` is logged ONCE. Every batch is then built by
+      drawing, for each class, ``U_eff`` DISTINCT cultures WITHOUT replacement
+      within the batch -- re-drawn independently across batches, never
+      partitioned (H-section 5.2: ``U_eff`` rarely divides the available count and
+      a partition would silently drop cultures) -- then ``q`` windows WITHOUT
+      replacement from each sampled culture. The anchor's positive is then a real
+      same-class window of a DIFFERENT culture, found by the miner, rather than a
+      warp of the anchor's own window.
+
+    Culture key
+    -----------
+    In ``"cross_culture"`` mode the caller passes ``trace_of_window``, an int
+    array parallel to ``conditions`` giving each window's culture. The pipeline's
+    natural value is the dataset-local trace index (``MEAWindowDataset.index[i][0]``:
+    windows sharing a trace index are the same culture), which is sufficient for
+    the census and the two-level draw -- both need only same-vs-different-culture
+    grouping -- and avoids threading the global ``trace_of_window`` through
+    ``train_model``.
 
     Ecosystem alternative (directive 1): pytorch_metric_learning.samplers
-    .MPerClassSampler(labels, m=per_condition, batch_size=...). A tiny custom
-    sampler is used here to keep this module dependency-free and testable.
+    .MPerClassSampler / .HierarchicalSampler. A small custom sampler is used to
+    keep this module dependency-free and testable, and because neither ecosystem
+    sampler implements the two-level cultures-then-windows draw with the Eq. (3)
+    availability clamp.
     """
 
     def __init__(self, conditions: Sequence[int], per_condition: int,
-                 n_batches: int, seed: int = 0):
+                 n_batches: int, seed: int = 0,
+                 positives_mode: str = "augmentation",
+                 trace_of_window: Optional[Sequence[int]] = None,
+                 mining_strategy: Optional[str] = None,
+                 cultures_per_class_per_batch: Optional[int] = None,
+                 windows_per_culture_per_batch: Optional[int] = None,
+                 n_surrogates: Optional[int] = None,
+                 max_group_size: Optional[int] = None,
+                 exclude_same_culture_positives: Optional[bool] = None,
+                 min_train_cultures_per_class: int = 2,
+                 max_batch_rows: Optional[int] = None,
+                 q_cap_fraction: float = DEFAULT_Q_CAP_FRACTION):
+        # by_cond built EXACTLY as before, so the augmentation path is unchanged.
         self.by_cond: Dict[int, List[int]] = {}
         for idx, c in enumerate(conditions):
             self.by_cond.setdefault(int(c), []).append(idx)
@@ -243,10 +290,99 @@ class ConditionBalancedBatchSampler(Sampler):
         self.seed = int(seed)
         self.epoch = 0
 
+        self.positives_mode = str(positives_mode)
+        if self.positives_mode not in ("augmentation", "cross_culture"):
+            raise ValueError(
+                "positives_mode must be 'augmentation' or 'cross_culture'; "
+                "got %r" % (positives_mode,))
+
+        # cross-culture state (None/empty under augmentation, so the change is
+        # inert by default)
+        self.geometry = None
+        self.geo_notes: List[str] = []
+        self._cultures_by_class: Dict[int, List[int]] = {}
+        self._windows_by_culture: Dict[int, List[int]] = {}
+
+        if self.positives_mode == "cross_culture":
+            self._init_cross_culture(
+                conditions=conditions,
+                trace_of_window=trace_of_window,
+                mining_strategy=mining_strategy,
+                cultures_per_class_per_batch=cultures_per_class_per_batch,
+                windows_per_culture_per_batch=windows_per_culture_per_batch,
+                n_surrogates=n_surrogates,
+                max_group_size=max_group_size,
+                exclude_same_culture_positives=exclude_same_culture_positives,
+                min_train_cultures_per_class=min_train_cultures_per_class,
+                max_batch_rows=max_batch_rows,
+                q_cap_fraction=q_cap_fraction,
+            )
+
+    def _init_cross_culture(self, conditions, trace_of_window, mining_strategy,
+                            cultures_per_class_per_batch,
+                            windows_per_culture_per_batch, n_surrogates,
+                            max_group_size, exclude_same_culture_positives,
+                            min_train_cultures_per_class, max_batch_rows,
+                            q_cap_fraction):
+        if trace_of_window is None:
+            raise ValueError(
+                "positives_mode='cross_culture' requires trace_of_window, the "
+                "per-window culture array g (parallel to conditions).")
+        y = np.asarray(conditions, dtype=int).ravel()
+        g = np.asarray(trace_of_window, dtype=int).ravel()
+        if g.size != y.size:
+            raise ValueError(
+                "trace_of_window has %d entries but conditions has %d; they must "
+                "be parallel arrays over the SAME windows." % (g.size, y.size))
+
+        # Resolve and CHECK the geometry ONCE. This raises on every inadmissible
+        # combination (Eq. (3) starvation, the easy-positive precondition, both
+        # caps, and q > W_min) rather than silently repairing it.
+        geo = resolve_batch_geometry(
+            trace_of_window=g,
+            conditions=y,
+            positives_mode="cross_culture",
+            mining_strategy=mining_strategy,
+            cultures_per_class_per_batch=cultures_per_class_per_batch,
+            windows_per_culture_per_batch=windows_per_culture_per_batch,
+            n_surrogates=n_surrogates,
+            max_group_size=max_group_size,
+            exclude_same_culture_positives=exclude_same_culture_positives,
+            min_train_cultures_per_class=min_train_cultures_per_class,
+            max_batch_rows=max_batch_rows,
+            q_cap_fraction=q_cap_fraction,
+        )
+        self.geometry = geo
+        self.geo_notes = list(geo.notes)
+
+        # windows of each culture, and cultures of each class, for the draw
+        for idx, u in enumerate(g.tolist()):
+            self._windows_by_culture.setdefault(int(u), []).append(idx)
+        seen_pairs = set()
+        for c_raw, u_raw in zip(y.tolist(), g.tolist()):
+            key = (int(c_raw), int(u_raw))
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                self._cultures_by_class.setdefault(int(c_raw), []).append(int(u_raw))
+        for c in self._cultures_by_class:
+            self._cultures_by_class[c] = sorted(self._cultures_by_class[c])
+
+        # log the resolved geometry ONCE at construction (H-section 7.2)
+        logger = logging.getLogger(__name__)
+        for line in self.geo_notes:
+            logger.info("[cross_culture geometry] %s", line)
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __iter__(self):
+        if self.positives_mode == "cross_culture":
+            yield from self._iter_cross_culture()
+        else:
+            yield from self._iter_augmentation()
+
+    def _iter_augmentation(self):
+        # UNCHANGED legacy draw (assertion [I]): identical RNG call sequence.
         rng = np.random.default_rng(self.seed + self.epoch)
         for _ in range(self.n_batches):
             batch: List[int] = []
@@ -254,6 +390,27 @@ class ConditionBalancedBatchSampler(Sampler):
                 replace = len(idxs) < self.per_condition
                 pick = rng.choice(idxs, size=self.per_condition, replace=replace)
                 batch.extend(int(j) for j in pick)
+            rng.shuffle(batch)
+            yield batch
+
+    def _iter_cross_culture(self):
+        geo = self.geometry
+        u_eff = int(geo.cultures_effective)
+        q = int(geo.windows_per_culture_per_batch)
+        rng = np.random.default_rng(self.seed + self.epoch)
+        for _ in range(self.n_batches):
+            batch: List[int] = []
+            for c in sorted(self._cultures_by_class.keys()):
+                cultures = np.asarray(self._cultures_by_class[c], dtype=int)
+                # U_eff DISTINCT cultures, WITHOUT replacement WITHIN this batch;
+                # re-drawn independently next batch (never a fixed partition).
+                chosen = rng.choice(cultures, size=u_eff, replace=False)
+                for u in chosen.tolist():
+                    wins = np.asarray(self._windows_by_culture[int(u)], dtype=int)
+                    # q windows WITHOUT replacement (q <= W_min guaranteed by geo,
+                    # so this never falls back to sampling with replacement).
+                    pick = rng.choice(wins, size=q, replace=False)
+                    batch.extend(int(j) for j in pick)
             rng.shuffle(batch)
             yield batch
 
@@ -290,22 +447,34 @@ class TripletCollator:
         next_uniq = self.unique_label_base
 
         for item in batch:
-            pos = item["positives"]            # (1+P, T)
-            neg = item["negatives"]            # (N, T)
+            pos = item["positives"]            # (1+P, T), P may be 0
+            neg = item["negatives"]            # (N, T),   N may be 0
             cond = int(item["condition"])
 
-            emb.append(pos)
-            lab.append(torch.full((pos.shape[0],), cond, dtype=torch.long))
+            # A block is appended ONLY when it has rows, so an empty pool (P_b = 0
+            # under cross-culture positives, or N_s = 0) is dropped rather than
+            # concatenated as a (0, T) tensor. Under "augmentation" both pools are
+            # non-empty, so this is byte-identical to the pre-Change-4 collator.
+            if pos.shape[0] > 0:
+                emb.append(pos)
+                lab.append(torch.full((pos.shape[0],), cond, dtype=torch.long))
 
-            emb.append(neg)
             n = neg.shape[0]
-            if self.destroyed_label_mode == "unique":
-                lab.append(torch.arange(next_uniq, next_uniq + n, dtype=torch.long))
-                next_uniq += n
-            else:
-                lab.append(torch.full((n,), self.shared_destroyed_label, dtype=torch.long))
+            if n > 0:
+                emb.append(neg)
+                if self.destroyed_label_mode == "unique":
+                    lab.append(torch.arange(next_uniq, next_uniq + n, dtype=torch.long))
+                    next_uniq += n
+                else:
+                    lab.append(torch.full((n,), self.shared_destroyed_label, dtype=torch.long))
 
             metas.append(item["meta"])
+
+        if not emb:
+            raise ValueError(
+                "TripletCollator produced no rows to embed: every window in the "
+                "batch had empty positive AND negative pools. Check n_positives / "
+                "n_negatives.")
 
         X = torch.cat(emb, dim=0).to(torch.float32)
         y = torch.cat(lab, dim=0).to(torch.long)

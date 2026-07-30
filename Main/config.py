@@ -454,6 +454,27 @@ class DataConfig:
                                             # cross-culture positives exist
     trace_alloc_rule: str = "largest_remainder"   # | "floor" (see apportion())
 
+    # --- [C4] cross-culture positives ---------------------------------------
+    # Default "augmentation" keeps this change INERT until switched on, matching
+    # the posture of every other change on this branch (D1-R12).
+    positives_mode: str = "augmentation"    # "augmentation" | "cross_culture"
+    # U_c, the number of DISTINCT training cultures of each class drawn per
+    # batch, BEFORE the availability clamp of Eq. (3). The clamp is applied at
+    # sampler construction, where the actual culture counts are known; this
+    # field is only the request.
+    cultures_per_class_per_batch: int = 12
+    windows_per_culture_per_batch: int = 1  # q
+    # Forbid g_i == g_j for an anchor-positive pair. With U_c = 2 and q = 1 every
+    # same-class pair is already cross-culture and this is vacuous; it bites for
+    # q > 1, which is exactly when within-culture pairs reappear.
+    exclude_same_culture_positives: bool = True
+    # n_g^max, the cap on rows sharing a class label per class per batch. NOTE
+    # the source cited for a cap of 14 supports 16, and its MECHANISM does not
+    # transfer to this setting -- do not re-derive 14 from that paper. The cap's
+    # value here is as a REGRESSION GUARD: it turns a later config edit that
+    # reintroduces a large degenerate group into an immediate exception.
+    max_group_size: int = 16
+
     # --- augmentation (fs is a PLACEHOLDER; resolved at build time) ---
     augmentation: AugmentationConfig = field(
         default_factory=lambda: AugmentationConfig(fs=_PLACEHOLDER_FS))
@@ -493,8 +514,46 @@ class DataConfig:
             raise ValueError("trace_split_fold must be >= 0")
         if self.min_train_cultures_per_class < 1:
             raise ValueError("min_train_cultures_per_class must be >= 1")
-        if (self.split_mode == "trace"
-                and self.min_train_cultures_per_class < 2):
+        # --- [C4] cross-culture positives: validation ----------------------
+        if self.positives_mode not in ("augmentation", "cross_culture"):
+            raise ValueError(
+                "positives_mode must be 'augmentation' or 'cross_culture'; "
+                "got %r" % (self.positives_mode,))
+        if self.cultures_per_class_per_batch < 1:
+            raise ValueError("cultures_per_class_per_batch (U_c) must be >= 1")
+        if self.windows_per_culture_per_batch < 1:
+            raise ValueError("windows_per_culture_per_batch (q) must be >= 1")
+        if self.max_group_size < 2:
+            raise ValueError(
+                "max_group_size must be >= 2: a group of one row per class "
+                "contains no positive pair at all")
+        if self.positives_mode == "cross_culture":
+            # The group-size cap is NOT enforced here. It needs two things this
+            # dataclass cannot see:
+            #   - U_eff, the culture count after the Eq. (3) availability clamp,
+            #     which depends on the split;
+            #   - train.mining_strategy, which lives in TrainConfig.
+            # The second is what gates it. The cap traces to an easy-positive
+            # result: performance drops past a group size of 16 for easy-positive
+            # mining, while the same experiments show hard-positive mining
+            # behaving the OPPOSITE way. So the cap applies under
+            # "easy_positive" and "easy_pos_semihard_neg", and must NOT be
+            # applied under "hard", where it would import a constraint the source
+            # gives no support for.
+            # Enforcement therefore lives at sampler construction; see
+            # data_pipeline. ExperimentConfig.validate() is not the place either:
+            # it is documented as soft cross-field validation, warnings only.
+            # Not silently ignored: D1-section 9 established that inconsistent
+            # config values in this codebase fail quietly, which is why this
+            # raises instead of overwriting n_positives to 0 on the user's behalf.
+            if int(self.augmentation.n_positives) != 0:
+                raise ValueError(
+                    "positives_mode='cross_culture' requires "
+                    "augmentation.n_positives == 0, because positives now come "
+                    "from other cultures rather than from warps of the anchor's "
+                    "own window; got %d. Set it to 0 explicitly."
+                    % (self.augmentation.n_positives,))
+        if self.split_mode == "trace" and self.min_train_cultures_per_class < 2:
             warnings.warn(
                 "split_mode='trace' with min_train_cultures_per_class = %d: "
                 "cross-culture positives need at least 2 training cultures per "
@@ -560,20 +619,6 @@ class TrainConfig:
     selection_primary: str = "ari"          # "ari" (default) | "silhouette"; the other breaks ties
     n_seeds: int = 3                        # trainings per config; objective returns mean val metric
 
-    # --- growing patience (adaptive_patience.py). The DEFAULTS BELOW REPRODUCE
-    # --- the fixed-patience rule EXACTLY, so this block is inert until
-    # --- patience_growth > 0. See adaptive_patience for the derivation.
-    # g: budget added to P per plateau epoch. Effective patience becomes
-    #    ceil(P / (1 - g)), so g = 0.5 doubles it and g = 0.75 quadruples it.
-    #    MUST be < 1 unless max_patience is set, or training never stops itself.
-    patience_growth: float = 0.0
-    # P_max: hard cap on the grown budget. 0 means uncapped.
-    max_patience: int = 0
-    # if False, an improvement KEEPS the budget earned so far instead of
-    # returning it to P. Recommended for selection_primary = "silhouette": a run
-    # that has already shown itself to be a slow improver stays patient. Left at
-    # True by default because that is the classic rule and the conservative one.
-    patience_reset_on_improvement: bool = True
     # how min_delta_sil is obtained:
     #   "absolute"       -- use min_delta_sil verbatim (current behaviour)
     #   "floor_scale"    -- kappa * sigma of the label-shuffled silhouette null
@@ -615,22 +660,6 @@ class TrainConfig:
                 "batches_per_epoch must be >= 0 (0 -> derive from the training set size)")
         if self.selection_primary not in ("ari", "silhouette"):
             raise ValueError("selection_primary must be 'ari' or 'silhouette'")
-        if self.patience_growth < 0.0:
-            raise ValueError("patience_growth must be >= 0")
-        if self.max_patience < 0:
-            raise ValueError("max_patience must be >= 0 (0 -> uncapped)")
-        if self.max_patience and self.max_patience < self.patience:
-            raise ValueError(
-                "max_patience (%d) must be >= patience (%d) or 0 for uncapped"
-                % (self.max_patience, self.patience))
-        if self.patience_growth >= 1.0 and not self.max_patience:
-            raise ValueError(
-                "patience_growth = %r with max_patience = 0 never terminates: "
-                "the budget grows by %r per plateau epoch while the wait counter "
-                "grows by 1, so only max_epochs could end the run. Use "
-                "patience_growth < 1 (effective patience = patience / "
-                "(1 - patience_growth)) or set max_patience."
-                % (self.patience_growth, self.patience_growth))
         if self.min_delta_sil_mode not in ("absolute", "floor_scale",
                                            "floor_location"):
             raise ValueError(
@@ -650,37 +679,13 @@ class TrainConfig:
             raise ValueError("scheduler_type must be 'cosine', 'step', or 'none'")
         if self.log_every_epochs < 1 or self.checkpoint_every_epochs < 1:
             raise ValueError("log / checkpoint cadences must be >= 1")
-        if self.max_epochs <= self.effective_patience():
+        if self.max_epochs <= self.patience:
             warnings.warn(
-                "max_epochs (%d) <= effective patience (%g): early stopping can "
-                "never fire, so training is effectively fixed-length at "
-                "max_epochs. With patience_growth = %g the effective patience is "
-                "ceil(patience / (1 - patience_growth)), NOT patience itself."
-                % (self.max_epochs, self.effective_patience(),
-                   self.patience_growth),
+                "max_epochs (%d) <= patience (%d): early stopping can never fire, "
+                "so training is effectively fixed-length at max_epochs."
+                % (self.max_epochs, self.patience),
                 RuntimeWarning,
             )
-
-    def effective_patience(self):
-        """Consecutive plateau epochs the early-stopping rule actually allows.
-
-        ceil(patience / (1 - patience_growth)), capped by max_patience. With
-        patience_growth = 0 this is `patience` itself, so nothing changes for a
-        config that does not opt in.
-
-        The formula is NOT duplicated here: it is imported from
-        adaptive_patience, which is the module the trainer uses, so the two can
-        never disagree. The import is LAZY because adaptive_patience pulls in
-        sklearn and config.py must stay importable in environments that only
-        parse configuration (the PBS pre-flight does exactly that).
-        """
-        from adaptive_patience import effective_patience_bound
-        return effective_patience_bound(
-            patience=int(self.patience),
-            growth=float(self.patience_growth),
-            max_patience=(int(self.max_patience) if self.max_patience else None),
-            wait=0,
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -962,15 +967,11 @@ class ExperimentConfig:
     # ----- cross-field soft validation (warnings, not errors) -----
     def validate(self):
         msgs = []
-        eff_P = self.train.effective_patience()
-        if self.train.max_epochs <= eff_P:
+        if self.train.max_epochs <= self.train.patience:
             msgs.append(
-                "train.max_epochs (%d) <= effective patience (%g) (early "
-                "stopping cannot fire). Effective patience is "
-                "ceil(patience / (1 - patience_growth)) = ceil(%d / (1 - %g)), "
-                "capped by max_patience."
-                % (self.train.max_epochs, eff_P, self.train.patience,
-                   self.train.patience_growth))
+                "train.max_epochs (%d) <= patience (%d): early stopping cannot "
+                "fire, so training is fixed-length at max_epochs."
+                % (self.train.max_epochs, self.train.patience))
         if self.data.eval_stride_s < self.data.window_s:
             msgs.append("data.eval_stride_s < data.window_s (eval windows overlap).")
         lo, hi = self.search.embedding_size_range

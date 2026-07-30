@@ -6,6 +6,14 @@
 **Status:** all six changes wired. Rung 0 and Rung 1 pass here. **Rung 2, the stated
 acceptance gate, has NOT been run** -- see section 4.
 
+> **Status update, 28 July 2026 -- C5 was DELETED (Change 2 of the v3 handoff).**
+> The retention module and its smoke test no longer exist in the repository; the
+> ground-truth artefact `latent_ground_truth.json` is still written. This report is
+> left **unamended** on purpose: it is the dated record of what was built and what was
+> measured on 25 July 2026, and erasing the C5 material would erase measurements that
+> were really made. Read every C5 statement below as historical. What was removed, why,
+> and what is lost by removing it are in `CHANGES_change2_remove_retention_metric.md`.
+
 ## Abstract
 
 The handoff specified six changes (C1-C6) restoring discriminative power to the
@@ -216,8 +224,12 @@ diff, section 4.1).
 
 ### 2.5 C5 -- factor retention (new module)
 
-`factor_retention.py`. For each axis $k$, with predictions pooled across folds and the
-denominator taken about the **global** mean $\bar\phi_k$:
+> **DELETED in Change 2 (28 July 2026).** The module described in this subsection is no
+> longer in the repository. The specification below is retained as the record of what it
+> computed, and is the starting point for anyone reimplementing it offline.
+
+For each axis $k$, with predictions pooled across folds and the denominator taken about
+the **global** mean $\bar\phi_k$:
 
 $$
 R^2_k=1-\frac{\sum_i\big(\phi_k^{(i)}-\hat\phi_k^{(i)}(Z)\big)^2}
@@ -356,6 +368,8 @@ as stipulated.
     export and its smoke test are complete, but wiring it into `run_final` /
     `evaluate.py` as a reported metric was not part of the six changes and was not
     done. It is currently an analysis you run on a finished run's embeddings.
+    **[28 July 2026] This observation is precisely the ground on which Change 2
+    deleted it: three days later it still had no production consumer.**
 12. $\Delta_{\min}(y)$ is recomputed once per phase rather than once per study
     (up to four times per run). At the archived $N_{\mathrm{eval}} = 36$ this is
     $43$ ms; the growth is quadratic.
@@ -381,5 +395,5 @@ paper -- every number is either a measurement from this session, a re-reproduced
 measurement from the prior session, or a definition.
 
 **Stated from reasoning rather than a checked source:** the design deviations in
-section 6 items 1-5, and the interpretation of $R^2_k$ in `factor_retention.py`'s
-docstring.
+section 6 items 1-5, and the interpretation of $R^2_k$ in the retention module's
+docstring (that module was deleted in Change 2; see the status banner above).

@@ -1,6 +1,12 @@
 #!/bin/sh
 # run_wiring_checks.sh -- the verification ladder for the C1-C6 wiring.
 #
+# NOTE: the C5 rung (the latent-factor retention metric) was DELETED in
+# Change 2 of the v3 handoff. Its module and its suite are gone; what runs
+# in its place is the deletion guard, which asserts they stay gone. The
+# latent ground-truth artefact is still written (see Rung 2) -- only its
+# consumer was removed.
+#
 # Run from the repository's Main/ directory:
 #     cd Main && sh run_wiring_checks.sh
 #
@@ -52,8 +58,8 @@ echo ""
 echo "--- C2 + C3: epoch selection, epsilon guarantee, budget split ---"
 $PY Smoke_Tests/smoke_test_objective_wiring.py
 echo ""
-echo "--- C5: factor retention, incl. the grouping test ---"
-$PY Smoke_Tests/smoke_test_factor_retention.py
+echo "--- the deletion guard: removed modules must stay removed ---"
+$PY Smoke_Tests/smoke_test_removed_modules.py
 echo ""
 
 echo "=================================================================="
@@ -84,7 +90,7 @@ $PY run_optimization.py --config hpc/config_latent_3class_hard.json \
     --dry-run --verbose \
     --out-dir /tmp/dsn_dryrun --cache-dir /tmp/dsn_dryrun_cache
 echo ""
-echo "--- the dry run must have written the C5 ground truth ---"
+echo "--- the dry run must have written the latent ground truth ---"
 ls -l /tmp/dsn_dryrun/latent_3class_hard/latent_ground_truth.json
 echo ""
 
@@ -95,4 +101,4 @@ echo "Rung 3 (cluster only, NOT run here):"
 echo "  qsub the two C6 ablation configs, which differ in exactly one field:"
 echo "    hpc/config_latent_3class_hard.json      (mining_strategy = hard)"
 echo "    hpc/config_latent_3class_easypos.json   (mining_strategy = easy_positive)"
-echo "  Then compare ARI, eff_rank, and the C5 R^2_k on the FREE axes."
+echo "  Then compare ARI and eff_rank on the held-out split."
