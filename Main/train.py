@@ -149,8 +149,7 @@ from data_pipeline import (
     ConditionBalancedBatchSampler, TripletCollator, seed_worker,
 )
 from inference import embed_clean_windows
-from adaptive_patience import (
-    AdaptivePatience,
+from silhouette_floor import (
     resolve_min_delta_sil,
     silhouette_floor,
 )
@@ -440,13 +439,42 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         windows_per_condition=tcfg.windows_per_condition,
         batches_per_epoch=tcfg.batches_per_epoch)
 
-    sampler = ConditionBalancedBatchSampler(
-        conditions=conditions,
-        per_condition=int(tcfg.windows_per_condition),
-        n_batches=n_batches,
-        seed=int(seed),
-    )
+    dcfg = cfg.data
+    if dcfg.positives_mode == "cross_culture":
+        # [C4] culture id per training window = the dataset-local trace index
+        # (windows sharing a trace index are one culture), aligned with
+        # `conditions` by construction. N_s (surrogates per window) is
+        # augmentation.n_negatives. The geometry (Eq. (3) clamp + the caps) is
+        # resolved and CHECKED once inside the sampler, which raises on any
+        # inadmissible combination.
+        trace_of_window = np.asarray(
+            [int(ti) for (ti, _s, _c) in train_ds.index], dtype=int)
+        sampler = ConditionBalancedBatchSampler(
+            conditions=conditions,
+            per_condition=int(tcfg.windows_per_condition),  # unused in this mode
+            n_batches=n_batches,
+            seed=int(seed),
+            positives_mode="cross_culture",
+            trace_of_window=trace_of_window,
+            mining_strategy=tcfg.mining_strategy,
+            cultures_per_class_per_batch=int(dcfg.cultures_per_class_per_batch),
+            windows_per_culture_per_batch=int(dcfg.windows_per_culture_per_batch),
+            n_surrogates=int(dcfg.augmentation.n_negatives),
+            max_group_size=int(dcfg.max_group_size),
+            exclude_same_culture_positives=bool(dcfg.exclude_same_culture_positives),
+            min_train_cultures_per_class=int(dcfg.min_train_cultures_per_class),
+        )
+    else:
+        sampler = ConditionBalancedBatchSampler(
+            conditions=conditions,
+            per_condition=int(tcfg.windows_per_condition),
+            n_batches=n_batches,
+            seed=int(seed),
+        )
     collate = TripletCollator()
+    # [C4] label boundary for rho: a mined negative is a SURROGATE iff its label
+    # is a unique destroyed-surrogate label (>= unique_label_base).
+    unique_label_base = int(collate.unique_label_base)
 
     loader = DataLoader(
         train_ds,
@@ -494,17 +522,18 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
     history = []
     sil_floor = None                # measured once, at the first finite silhouette
 
-    # The early-stopping counter. With tcfg.patience_growth = 0.0 (the default)
-    # this is EXACTLY the previous fixed-patience rule; see
-    # Smoke_Tests/smoke_test_adaptive_patience.py [A], which asserts step-for-step
-    # agreement over 200 random improvement sequences.
-    stopper = AdaptivePatience(
-        patience=int(tcfg.patience),
-        growth=float(tcfg.patience_growth),
-        max_patience=(int(tcfg.max_patience) if tcfg.max_patience else None),
-        reset_on_improvement=bool(tcfg.patience_reset_on_improvement),
-        delta=None,                 # armed below, once the threshold is known
-    )
+    # The silhouette-floor threshold delta_sil, measured ONCE (at the first finite
+    # silhouette) and then frozen; None until then. Change 6 reverted growing
+    # patience to a fixed integer P, so the two concerns the old AdaptivePatience
+    # conflated -- the improvement THRESHOLD and the patience COUNTER -- are now
+    # separate: this variable is the threshold, `patience_counter` below is the
+    # counter, and neither influences the other.
+    sil_delta = None                # armed below, once the threshold is known
+
+    # FIXED patience P (Change 6): the counter advances on a plateau epoch and
+    # resets to 0 on any improvement; training stops when it reaches P.
+    patience = int(tcfg.patience)
+    patience_counter = 0
 
     if ckpt_dir is not None:
         manager = CheckpointManager(
@@ -523,13 +552,13 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             extra = ck.get("extra") or {}
             history = list(extra.get("history", []))
             best_epoch = int(extra.get("best_epoch", 0))
-            if extra.get("stopper_state") is not None:
-                stopper.load_state_dict(extra["stopper_state"])
+            stopper_state = extra.get("stopper_state")
+            if stopper_state is not None:
+                # a checkpoint from the growing-patience era: its wait counter is
+                # the whole fixed-patience state (at g = 0, wait == the counter).
+                patience_counter = int(stopper_state.get("wait", 0))
             else:
-                # checkpoint written before growing patience existed: the bare
-                # counter is all there is, and it IS the whole state at g = 0
-                stopper.wait = int(extra.get("patience_counter", 0))
-                stopper._counter = stopper.wait
+                patience_counter = int(extra.get("patience_counter", 0))
             sil_floor = extra.get("sil_floor", None)
             u_best = float(extra.get("u_best", _NEG_INF))
             v_best = float(extra.get("v_best", _NEG_INF))
@@ -556,6 +585,11 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         # the loop (decision 13: one GPU sync per epoch, not per batch).
         loss_accum = torch.zeros((), device=device, dtype=torch.float32)
         triplets_epoch = 0
+        # [C4] rho accumulators. The surrogate-negative COUNT is accumulated
+        # ON-DEVICE (decision 13: one GPU sync per epoch, not per batch); the
+        # total negative count comes from numel() as a CPU int and needs no sync.
+        surrogate_neg_accum = torch.zeros((), device=device, dtype=torch.long)
+        total_neg_epoch = 0
 
         for X, y, _metas in loader:
             X = X.to(device, non_blocking=True)
@@ -577,6 +611,26 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
                 loss_val.backward()
                 optimizer.step()
 
+            # [C4] one miner(Z, y) call per batch. pytorch_metric_learning returns
+            # EITHER a 3-tuple (anchor, positive, negative) from a TRIPLET miner
+            # (TripletMarginMiner, "hard") OR a 4-tuple (a1, p, a2, negative) from a
+            # PAIR miner (BatchEasyHardMiner, the easy-positive strategies). In BOTH
+            # the MINED NEGATIVES are the LAST element. This CORRECTS H-section 7.4,
+            # which assumed arity 3 only -- under the easy-positive miners a
+            # len==3 assertion would fire on every batch. Assert the arity so an
+            # unexpected shape fails LOUDLY rather than yielding a silently wrong rho.
+            if len(pairs) not in (3, 4):
+                raise RuntimeError(
+                    "miner(Z, y) returned %d index tensors, expected 3 (triplet "
+                    "miner) or 4 (pair miner); rho cannot be computed against the "
+                    "wrong indices." % (len(pairs),))
+            neg_idx = pairs[-1]                         # MINED negatives (last in both)
+            total_neg_epoch += int(neg_idx.numel())
+            # a surrogate carries a UNIQUE label >= unique_label_base and can ONLY
+            # ever be a negative; rho counts surrogates among MINED negatives, not
+            # those merely present in the batch.
+            surrogate_neg_accum += (y[neg_idx] >= unique_label_base).sum()
+
             loss_accum += loss_val.detach().to(torch.float32)
             triplets_epoch += int(pairs[0].numel())    # |T_mined| this batch
 
@@ -585,6 +639,16 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
 
         # the ONE .item() of the epoch
         train_loss = float(loss_accum.item()) / max(1, n_batches)   # L_epoch
+
+        # [C4] rho = fraction of MINED negatives that are surrogates. The surrogate
+        # count is read ONCE PER EPOCH via int() -- a device->host read, but NOT an
+        # .item() call and NOT per-batch, so the single-.item()-per-epoch discipline
+        # (decision 13, guarded by smoke_test_train [D-strict]) is preserved and no
+        # per-batch sync is introduced. rho = 0 when nothing was mined, or when
+        # surrogates were present in the batch but never selected as negatives.
+        surrogate_neg_epoch = int(surrogate_neg_accum)
+        frac_neg_surrogate = (surrogate_neg_epoch / total_neg_epoch
+                              if total_neg_epoch > 0 else 0.0)
 
         # ---- validation: clean, DISTINCT windows -> metrics ---------------
         Z_val, y_val = embed_clean_windows(model, val_ds, device)
@@ -626,22 +690,24 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
                     % (epoch, ex, tcfg.min_delta_sil), RuntimeWarning)
                 sil_floor = None
 
-        # Arm the counter as soon as a threshold can be formed. Until then the
-        # configured constant is used, so the run is never left without one.
-        if not stopper.is_armed and (tcfg.min_delta_sil_mode == "absolute"
-                                     or sil_floor is not None):
-            stopper.arm(resolve_min_delta_sil(
+        # Arm the threshold as soon as one can be formed. Until then the
+        # configured constant is used, so the run is never left without one. This
+        # is the silhouette-floor block Change 6 KEEPS; only the patience counter
+        # reverted to fixed.
+        if sil_delta is None and (tcfg.min_delta_sil_mode == "absolute"
+                                  or sil_floor is not None):
+            sil_delta = resolve_min_delta_sil(
                 floor=sil_floor,
                 kappa=float(tcfg.min_delta_sil_kappa),
                 mode=tcfg.min_delta_sil_mode,
                 absolute=float(tcfg.min_delta_sil),
-            ))
+            )
             if verbose and tcfg.min_delta_sil_mode != "absolute":
                 print("[train] min_delta_sil = %.6g (mode %r, kappa %g), "
                       "replacing the configured %.6g"
-                      % (stopper.delta, tcfg.min_delta_sil_mode,
+                      % (sil_delta, tcfg.min_delta_sil_mode,
                          tcfg.min_delta_sil_kappa, tcfg.min_delta_sil))
-        min_delta_sil_eff = (float(stopper.delta) if stopper.is_armed
+        min_delta_sil_eff = (float(sil_delta) if sil_delta is not None
                              else float(tcfg.min_delta_sil))
 
         u_e, v_e, delta, epsilon = _primary_secondary(
@@ -654,6 +720,8 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             "ami": float(m["ami"]),
             "silhouette": float(m["silhouette"]),
             "n_triplets": int(triplets_epoch),
+            "n_mined_triplets": int(triplets_epoch),      # [C4] |T_mined| this epoch
+            "frac_neg_surrogate": float(frac_neg_surrogate),  # [C4] rho
             "min_delta_sil_eff": float(min_delta_sil_eff),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "seconds": float(time.time() - t0),
@@ -677,24 +745,27 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         u_best = max(u_best, u_e)
         v_best = max(v_best, v_e)
 
-        stop_now = stopper.update(improved)
-        record["patience_wait"] = int(stopper.wait)
-        record["patience_budget"] = float(stopper.budget)
+        # FIXED patience (Change 6): advance the counter on a plateau epoch, reset
+        # it to 0 on any improvement, and stop when it reaches P.
+        if improved:
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        stop_now = patience_counter >= patience
+        record["patience_wait"] = int(patience_counter)
 
         if verbose and (epoch % int(tcfg.log_every_epochs) == 0):
             print("[train] epoch %3d | loss %8.5f | ARI %6.3f | AMI %6.3f | "
-                  "sil %6.3f | triplets %6d | eff_rank %5.2f | patience %d/%.4g"
+                  "sil %6.3f | triplets %6d | eff_rank %5.2f | patience %d/%d"
                   % (epoch, train_loss, record["ari"], record["ami"],
                      record["silhouette"], triplets_epoch,
-                     record["health"]["eff_rank"], stopper.wait,
-                     stopper.budget))
+                     record["health"]["eff_rank"], patience_counter, patience))
 
         # ---- checkpoints --------------------------------------------------
         if manager is not None:
             extra = {
                 "best_epoch": best_epoch,
-                "patience_counter": int(stopper.wait),   # legacy key, kept
-                "stopper_state": stopper.state_dict(),
+                "patience_counter": int(patience_counter),
                 "sil_floor": sil_floor,
                 "u_best": u_best,
                 "v_best": v_best,
@@ -715,10 +786,9 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         # E_stop = min(e_patience, E_max): stop as soon as the counter reaches P
         if stop_now:
             if verbose:
-                print("[train] early stop at epoch %d (wait %d reached budget "
-                      "%.4g; P_0 = %d, growth = %g); best epoch %d"
-                      % (epoch, stopper.wait, stopper.budget, stopper.patience_0,
-                         stopper.growth, best_epoch))
+                print("[train] early stop at epoch %d (patience counter %d "
+                      "reached P = %d); best epoch %d"
+                      % (epoch, patience_counter, patience, best_epoch))
             break
 
     # ---- restore the BEST-EPOCH weights (never the last) -------------------

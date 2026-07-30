@@ -619,20 +619,6 @@ class TrainConfig:
     selection_primary: str = "ari"          # "ari" (default) | "silhouette"; the other breaks ties
     n_seeds: int = 3                        # trainings per config; objective returns mean val metric
 
-    # --- growing patience (adaptive_patience.py). The DEFAULTS BELOW REPRODUCE
-    # --- the fixed-patience rule EXACTLY, so this block is inert until
-    # --- patience_growth > 0. See adaptive_patience for the derivation.
-    # g: budget added to P per plateau epoch. Effective patience becomes
-    #    ceil(P / (1 - g)), so g = 0.5 doubles it and g = 0.75 quadruples it.
-    #    MUST be < 1 unless max_patience is set, or training never stops itself.
-    patience_growth: float = 0.0
-    # P_max: hard cap on the grown budget. 0 means uncapped.
-    max_patience: int = 0
-    # if False, an improvement KEEPS the budget earned so far instead of
-    # returning it to P. Recommended for selection_primary = "silhouette": a run
-    # that has already shown itself to be a slow improver stays patient. Left at
-    # True by default because that is the classic rule and the conservative one.
-    patience_reset_on_improvement: bool = True
     # how min_delta_sil is obtained:
     #   "absolute"       -- use min_delta_sil verbatim (current behaviour)
     #   "floor_scale"    -- kappa * sigma of the label-shuffled silhouette null
@@ -674,22 +660,6 @@ class TrainConfig:
                 "batches_per_epoch must be >= 0 (0 -> derive from the training set size)")
         if self.selection_primary not in ("ari", "silhouette"):
             raise ValueError("selection_primary must be 'ari' or 'silhouette'")
-        if self.patience_growth < 0.0:
-            raise ValueError("patience_growth must be >= 0")
-        if self.max_patience < 0:
-            raise ValueError("max_patience must be >= 0 (0 -> uncapped)")
-        if self.max_patience and self.max_patience < self.patience:
-            raise ValueError(
-                "max_patience (%d) must be >= patience (%d) or 0 for uncapped"
-                % (self.max_patience, self.patience))
-        if self.patience_growth >= 1.0 and not self.max_patience:
-            raise ValueError(
-                "patience_growth = %r with max_patience = 0 never terminates: "
-                "the budget grows by %r per plateau epoch while the wait counter "
-                "grows by 1, so only max_epochs could end the run. Use "
-                "patience_growth < 1 (effective patience = patience / "
-                "(1 - patience_growth)) or set max_patience."
-                % (self.patience_growth, self.patience_growth))
         if self.min_delta_sil_mode not in ("absolute", "floor_scale",
                                            "floor_location"):
             raise ValueError(
@@ -709,37 +679,13 @@ class TrainConfig:
             raise ValueError("scheduler_type must be 'cosine', 'step', or 'none'")
         if self.log_every_epochs < 1 or self.checkpoint_every_epochs < 1:
             raise ValueError("log / checkpoint cadences must be >= 1")
-        if self.max_epochs <= self.effective_patience():
+        if self.max_epochs <= self.patience:
             warnings.warn(
-                "max_epochs (%d) <= effective patience (%g): early stopping can "
-                "never fire, so training is effectively fixed-length at "
-                "max_epochs. With patience_growth = %g the effective patience is "
-                "ceil(patience / (1 - patience_growth)), NOT patience itself."
-                % (self.max_epochs, self.effective_patience(),
-                   self.patience_growth),
+                "max_epochs (%d) <= patience (%d): early stopping can never fire, "
+                "so training is effectively fixed-length at max_epochs."
+                % (self.max_epochs, self.patience),
                 RuntimeWarning,
             )
-
-    def effective_patience(self):
-        """Consecutive plateau epochs the early-stopping rule actually allows.
-
-        ceil(patience / (1 - patience_growth)), capped by max_patience. With
-        patience_growth = 0 this is `patience` itself, so nothing changes for a
-        config that does not opt in.
-
-        The formula is NOT duplicated here: it is imported from
-        adaptive_patience, which is the module the trainer uses, so the two can
-        never disagree. The import is LAZY because adaptive_patience pulls in
-        sklearn and config.py must stay importable in environments that only
-        parse configuration (the PBS pre-flight does exactly that).
-        """
-        from adaptive_patience import effective_patience_bound
-        return effective_patience_bound(
-            patience=int(self.patience),
-            growth=float(self.patience_growth),
-            max_patience=(int(self.max_patience) if self.max_patience else None),
-            wait=0,
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1021,15 +967,11 @@ class ExperimentConfig:
     # ----- cross-field soft validation (warnings, not errors) -----
     def validate(self):
         msgs = []
-        eff_P = self.train.effective_patience()
-        if self.train.max_epochs <= eff_P:
+        if self.train.max_epochs <= self.train.patience:
             msgs.append(
-                "train.max_epochs (%d) <= effective patience (%g) (early "
-                "stopping cannot fire). Effective patience is "
-                "ceil(patience / (1 - patience_growth)) = ceil(%d / (1 - %g)), "
-                "capped by max_patience."
-                % (self.train.max_epochs, eff_P, self.train.patience,
-                   self.train.patience_growth))
+                "train.max_epochs (%d) <= patience (%d): early stopping cannot "
+                "fire, so training is fixed-length at max_epochs."
+                % (self.train.max_epochs, self.train.patience))
         if self.data.eval_stride_s < self.data.window_s:
             msgs.append("data.eval_stride_s < data.window_s (eval windows overlap).")
         lo, hi = self.search.embedding_size_range

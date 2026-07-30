@@ -128,8 +128,18 @@ class AugmentationConfig:
     shift_magnitude_s: float = 30.0            # max |shift| in seconds
 
     # --- counts --------------------------------------------------------------
-    n_positives: int = 30                      # exact for "warp_bands"; pool=pos+neg for "percentile_mse"
-    n_negatives: int = 30
+    # These are the AUGMENTATION-mode warp counts, and they stay 30/30 because
+    # positives_mode defaults to "augmentation" (Change 4 is INERT by default):
+    # the default config must remain a valid augmentation config, which the
+    # end-to-end pre-flight guards (1 + 30 + 30 = 61 rows per source window).
+    # Under "cross_culture" the SAME n_negatives field is REPURPOSED as N_s (the
+    # surrogates per window) and config.py additionally requires n_positives == 0;
+    # a cross_culture config therefore sets 0 / N_s (N_s = 2 at the operating
+    # point) explicitly rather than inheriting these augmentation defaults.
+    #   * "warp_bands"     : exact per-class counts (0 allowed, e.g. P_b = 0).
+    #   * "percentile_mse" : n_positives + n_negatives is the pool size to split.
+    n_positives: int = 30                      # warp positives (augmentation mode)
+    n_negatives: int = 30                      # warp negatives; == N_s under cross-culture
 
     # --- split method --------------------------------------------------------
     split_method: str = "warp_bands"           # "warp_bands" (opt 3) | "percentile_mse" (opt 2)
@@ -262,7 +272,18 @@ def _make_surrogate(window, cfg, rng, sigma_mag_range, sigma_time_range) -> torc
 
 
 def _generate_pool(window, cfg, rng, n, sigma_mag_range, sigma_time_range) -> torch.Tensor:
-    rows = [_make_surrogate(window, cfg, rng, sigma_mag_range, sigma_time_range) for _ in range(n)]
+    """n surrogates stacked as (n, T).
+
+    n == 0 yields a well-formed (0, T) tensor rather than crashing torch.stack on
+    an empty list. This is the deliberate-empty path: P_b = 0 (positives now come
+    from OTHER cultures, not warps of the anchor's own window) and N_s = 0 (no
+    surrogate negatives at all).
+    """
+    T = int(_to_tensor(window).reshape(-1).shape[0])
+    if int(n) <= 0:
+        return torch.zeros((0, T), dtype=_TORCH_DTYPE)
+    rows = [_make_surrogate(window, cfg, rng, sigma_mag_range, sigma_time_range)
+            for _ in range(int(n))]
     return torch.stack(rows, dim=0)    # (n, T)
 
 
@@ -289,8 +310,13 @@ def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Gener
     Returns
     -------
     anchor    : (1, T)  clean, UNSHIFTED window (also embedded at inference)
-    positives : (1+P, T) clean anchor + profile-preserving surrogates, shifted
-    negatives : (N, T)   profile-destroying surrogates, shifted
+    positives : (1+P, T) clean anchor + P profile-preserving surrogates, shifted.
+                P == cfg.n_positives; under cross-culture positives P = 0, so this
+                is exactly the (1, T) anchor and the positive is found by the miner
+                among OTHER cultures' same-class windows in the batch.
+    negatives : (N, T)   N == cfg.n_negatives profile-destroying surrogates,
+                shifted. N may be 0 (no surrogate negatives), giving a (0, T)
+                tensor that the collator drops rather than concatenating.
 
     The split (per cfg.split_method) is computed BEFORE the shift; the circular
     shift is then applied to both classes (label-preserving). Empty classes
@@ -300,51 +326,63 @@ def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Gener
     pathological) is attached downstream by the batch sampler.
     """
     window = _to_tensor(window).reshape(-1)        # (T,)
-    pos = neg = None
 
-    for attempt in range(cfg.max_retries):
-        if cfg.split_method == "warp_bands":               # option 3
-            pos = _generate_pool(window, cfg, rng, cfg.n_positives,
-                                 cfg.sigma_mag_pos, cfg.sigma_time_pos_s)
-            neg = _generate_pool(window, cfg, rng, cfg.n_negatives,
-                                 cfg.sigma_mag_neg, cfg.sigma_time_neg_s)
+    if cfg.split_method == "warp_bands":                   # option 3
+        # Explicit counts: each pool has EXACTLY n_positives / n_negatives rows
+        # with no split randomness, so 0 is a valid DELIBERATE count -- P_b = 0
+        # under cross-culture positives, and N_s = 0 for no surrogates -- and
+        # needs no retry. An empty pool here is intended, not a failure.
+        pos = _generate_pool(window, cfg, rng, cfg.n_positives,
+                             cfg.sigma_mag_pos, cfg.sigma_time_pos_s)
+        neg = _generate_pool(window, cfg, rng, cfg.n_negatives,
+                             cfg.sigma_mag_neg, cfg.sigma_time_neg_s)
 
-        elif cfg.split_method == "percentile_mse":         # option 2
-            n_pool = cfg.n_positives + cfg.n_negatives
-            broad_mag = (cfg.sigma_mag_pos[0], cfg.sigma_mag_neg[1])
-            broad_time = (cfg.sigma_time_pos_s[0], cfg.sigma_time_neg_s[1])
+    elif cfg.split_method == "percentile_mse":             # option 2
+        # The quantile split CAN be degenerate (an empty class), which IS a
+        # failure worth re-drawing. This path is NOT used under cross-culture
+        # positives (that mode forces n_positives = 0 and generates surrogates
+        # directly through "warp_bands"), so its non-empty requirement stands.
+        pos = neg = None
+        n_pool = int(cfg.n_positives) + int(cfg.n_negatives)
+        broad_mag = (cfg.sigma_mag_pos[0], cfg.sigma_mag_neg[1])
+        broad_time = (cfg.sigma_time_pos_s[0], cfg.sigma_time_neg_s[1])
+        for attempt in range(cfg.max_retries):
             pool = _generate_pool(window, cfg, rng, n_pool, broad_mag, broad_time)
             pos, neg = _split_percentile_mse(pool, window, cfg.percentile_q)
-
+            if pos.shape[0] >= 1 and neg.shape[0] >= 1:
+                break
+            warnings.warn(
+                f"build_triplet_instance: empty positive/negative class "
+                f"(attempt {attempt + 1}/{cfg.max_retries}) -> re-drawing.",
+                RuntimeWarning,
+            )
         else:
-            raise ValueError(f"Unknown split_method: {cfg.split_method!r}")
+            raise RuntimeError(
+                "build_triplet_instance: could not obtain non-empty positive AND "
+                "negative classes after retries; check sigma bands / percentile_q."
+            )
 
-        if pos.shape[0] >= 1 and neg.shape[0] >= 1:
-            break
-        warnings.warn(
-            f"build_triplet_instance: empty positive/negative class "
-            f"(attempt {attempt + 1}/{cfg.max_retries}) -> re-drawing.",
-            RuntimeWarning,
-        )
     else:
-        raise RuntimeError(
-            "build_triplet_instance: could not obtain non-empty positive AND "
-            "negative classes after retries; check sigma bands / percentile_q."
-        )
+        raise ValueError(f"Unknown split_method: {cfg.split_method!r}")
 
     # anchor: always clean and unshifted (matches the inference distribution)
     anchor = window.reshape(1, -1)
 
     # PRE-SHIFT: capture surrogates before translation so the plotter can
-    # show the pure warp effect with no circular-shift confound.
-    pos_pre_shift = torch.cat([anchor, pos], dim=0)
+    # show the pure warp effect with no circular-shift confound. Guarded so an
+    # empty pool (P_b = 0 or N_s = 0) never reaches torch.cat as an empty tensor.
+    pos_pre_shift = torch.cat([anchor, pos], dim=0) if pos.shape[0] > 0 else anchor.clone()
     neg_pre_shift = neg.clone()
 
-    # apply label-preserving circular shift to both surrogate classes
-    pos = random_circular_shift(pos, cfg.shift_magnitude_s, cfg.fs, rng)
-    neg = random_circular_shift(neg, cfg.shift_magnitude_s, cfg.fs, rng)
+    # apply label-preserving circular shift to each NON-EMPTY surrogate class
+    # (an empty pool has nothing to shift, and skipping it keeps the augmentation
+    # RNG stream byte-identical whenever both pools are non-empty)
+    if pos.shape[0] > 0:
+        pos = random_circular_shift(pos, cfg.shift_magnitude_s, cfg.fs, rng)
+    if neg.shape[0] > 0:
+        neg = random_circular_shift(neg, cfg.shift_magnitude_s, cfg.fs, rng)
 
-    positives = torch.cat([anchor, pos], dim=0)
+    positives = torch.cat([anchor, pos], dim=0) if pos.shape[0] > 0 else anchor
 
     if return_pre_shift:
         return anchor, positives, neg, pos_pre_shift, neg_pre_shift

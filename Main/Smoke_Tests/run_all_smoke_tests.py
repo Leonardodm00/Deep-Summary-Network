@@ -108,6 +108,7 @@ ORDER = [
     "smoke_test_backbone.py",
     "smoke_test_augmentation.py",
     "smoke_test_data_pipeline.py",
+    "smoke_test_cross_culture_batches.py",  # [C4] cross-culture sampler/collator/rho
     "smoke_test_data_splits.py",            # the LEAKAGE GUARANTEE
     "smoke_test_trace_splits.py",           # WHOLE-CULTURE leakage guarantee
     "smoke_test_metrics.py",                # the SEARCH OBJECTIVE
@@ -115,7 +116,7 @@ ORDER = [
     "smoke_test_checkpoint.py",
     "smoke_test_evaluate.py",
     "smoke_test_burst_pipeline.py",
-    "smoke_test_adaptive_patience.py",      # growing patience + silhouette floor
+    "smoke_test_silhouette_floor.py",      # label-shuffled silhouette floor + threshold
     "smoke_test_train.py",
     "smoke_test_selected_epoch.py",         # train.py vs objective_utils: NO DRIFT
     "smoke_test_search.py",
@@ -138,15 +139,18 @@ MISSING = {
     "smoke_test_trace_splits.py":
         "the WHOLE-CULTURE leakage guarantee (make_trace_splits): disjointness, "
         "stratification, tiling, trace_of_window, determinism",
-    "smoke_test_adaptive_patience.py":
-        "growing-patience termination bound and the label-shuffled silhouette "
-        "floor that sets its threshold",
+    "smoke_test_silhouette_floor.py":
+        "the label-shuffled silhouette floor and the improvement threshold it "
+        "calibrates (fixed patience now lives inline in train.py)",
     "smoke_test_removed_modules.py":
         "the Change 2 deletion guard: the removed retention module, its suite "
         "and its references must stay removed",
     "smoke_test_batch_geometry.py":
         "[C4] batch geometry: Eq. (2) n_g and M, the Eq. (3) availability "
         "clamp, and the miner-gated group-size, degeneracy and resource caps",
+    "smoke_test_cross_culture_batches.py":
+        "[C4] the cross-culture SAMPLER (cultures-first-then-windows), the "
+        "collator under P_b=0/N_s=0, and rho over mined negatives: [A]-[J]",
     "smoke_test_objective_wiring.py":
         "the selection rule and tie-break MATH: lexicographic e*, Delta_min(y), "
         "role-ordered (u, v), and the tie-break dispatch on selection_primary",
