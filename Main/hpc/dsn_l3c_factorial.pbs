@@ -1,0 +1,214 @@
+#!/bin/bash
+#PBS -N dsn_l3c_fact
+#PBS -l select=1:ncpus=48
+#PBS -l walltime=42:00:00
+#PBS -J 0-5
+#PBS -j oe
+#PBS -o dsn_l3c_fact_^array_index^.out
+
+# ======================================================================
+# l3c 3 x 2 factorial: head geometry x triplet miner
+# ======================================================================
+#
+#   factor A (head geometry), 3 levels
+#     singlemean : head_fusion=false, head_pool_ops=["mean"]
+#     multimean  : head_fusion=true,  head_pool_ops=["mean"]
+#     multiall   : head_fusion=true,  head_pool_ops=["mean","max","std"]
+#
+#   factor B (miner), 2 levels
+#     hard : mining_strategy="hard"
+#     epsh : mining_strategy="easy_pos_semihard_neg"
+#
+# Array index -> cell (see CONFIGS below):
+#     0 h_singlemean   1 h_multimean   2 h_multiall
+#     3 epsh_singlemean 4 epsh_multimean 5 epsh_multiall
+#
+# Verified before writing this script (audit_factorial.py + preflight_config.py
+# on all six): the only fields that differ across the six configs are
+# backbone.head_fusion, backbone.head_pool_ops, train.mining_strategy and
+# runtime.experiment_name. Every other field is identical, so the contrast is
+# clean. All six pass preflight with no gate violations and no warnings.
+#
+# ----------------------------------------------------------------------
+# GEOMETRY (identical in all six cells; from hpc/preflight_config.py)
+# ----------------------------------------------------------------------
+#   C = 3 classes, 15 traces/class, 600 s at 50 Hz
+#   window 100 s -> T = 5000 samples; train stride 50 s, eval stride 100 s
+#   trace split 9/3/3 cultures per class; W_min = 11; N_train = 297 windows
+#   U_eff = 9, q = 1, N_s = 2  ->  n_g = 9, M = 81 rows/batch
+#   forward-pass proxy M*T = 405,000 sample-values; 25 batches/epoch
+#   budget: 60 + 60 + 20 = 140 trials x 2 seeds + final = 282 train() runs
+#
+# ----------------------------------------------------------------------
+# WALLTIME -- read this before changing it
+# ----------------------------------------------------------------------
+# 42 h is a PROJECTION, not a measurement on this benchmark. It is scaled from
+# the only measurement recorded in this repo (hpc/dsn_4c_*.pbs: 8.28 s/epoch at
+# 30 threads on the 4-class benchmark) by the ratio of per-epoch work:
+#
+#     l3c : M*T*batches = 405,000 * 25 = 10.13e6 sample-values/epoch
+#     4c  : M*T*batches = 816,000 * 12 =  9.79e6 sample-values/epoch
+#     ratio = 1.034
+#
+#     282 runs x 50 epochs x 8.28 s x 1.034 = 1.21e5 s ~= 33.5 h worst case
+#     (worst case = nothing early-stops; 42 h is that plus ~25% margin)
+#
+# Budget for the FULL 50 epochs, not the mean: min_delta_ari = 0.0 and
+# min_delta_sil = 0.0 with patience = 10 make early stopping fire rarely.
+# THE SEARCH PHASES DO NOT RESUME -- an overrun loses the whole subjob, so
+# margin here is cheap and an overrun is not. Confirm on a real node with:
+#
+#     python3 hpc/estimate_walltime.py \
+#         --config hpc/Config/config_l3c_h_multiall_005.json --device cpu
+#
+# and use the multiall cell for the estimate: it is the widest head, so it is
+# the slowest of the six.
+#
+# ----------------------------------------------------------------------
+# THREADS
+# ----------------------------------------------------------------------
+# torch.set_num_threads() does NOT bind the BLAS library underneath, which
+# otherwise grabs every visible core and contends with PyTorch's own pool.
+# OMP/MKL must be exported in the shell BEFORE python starts.
+#
+# There is no CLI override for runtime.torch_threads (checked: run_optimization
+# .py exposes no --torch-threads flag; the value is read from the JSON and
+# passed to set_global_seed). So ncpus and runtime.torch_threads must agree,
+# and this script ABORTS if they do not rather than silently oversubscribing.
+# If you change ncpus above, change torch_threads in ALL SIX configs to match.
+#
+# NOTE: measured parallel efficiency on the 4c benchmark was only 43% at 30
+# threads. Six 48-core subjobs is 288 cores of demand for ~2.5x the throughput
+# of six 16-core subjobs. If the queue is contended, 6 x 16 cpus (with
+# torch_threads=16 in the configs) will very likely finish the whole factorial
+# sooner in wall-clock terms. Measure with hpc/sweep_threads.sh before deciding.
+# ======================================================================
+
+set -e
+set -o pipefail
+
+# ---- cell selection ---------------------------------------------------
+CONFIGS=(
+    "config_l3c_h_singlemean_005.json"
+    "config_l3c_h_multimean_005.json"
+    "config_l3c_h_multiall_005.json"
+    "config_l3c_epsh_singlemean_005.json"
+    "config_l3c_epsh_multimean_005.json"
+    "config_l3c_epsh_multiall_005.json"
+)
+
+# PBS_ARRAY_INDEX when submitted as an array; DSN_INDEX lets you re-run one
+# cell by hand (DSN_INDEX=2 bash dsn_l3c_factorial.pbs) without editing this.
+IDX="${PBS_ARRAY_INDEX:-${DSN_INDEX:-}}"
+if [ -z "$IDX" ]; then
+    echo "ERROR: neither PBS_ARRAY_INDEX nor DSN_INDEX is set." >&2
+    echo "       Submit with 'qsub dsn_l3c_factorial.pbs' (array 0-5), or" >&2
+    echo "       run one cell with 'DSN_INDEX=<0-5> bash dsn_l3c_factorial.pbs'." >&2
+    exit 2
+fi
+if [ "$IDX" -lt 0 ] || [ "$IDX" -ge "${#CONFIGS[@]}" ]; then
+    echo "ERROR: index $IDX out of range 0-$(( ${#CONFIGS[@]} - 1 ))." >&2
+    exit 2
+fi
+
+# ---- settings you may need to change ----------------------------------
+CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"     # your env name (Step 1 of README_HPC)
+NCPUS=48                                     # MUST match '#PBS -l ncpus=' above
+CONFIG_SUBDIR="${DSN_CONFIG_SUBDIR:-hpc/Config}"   # relative to WORKDIR
+
+# ---- locate the working directory -------------------------------------
+# The pipeline modules import each other by bare name, so python must run from
+# the directory that holds run_optimization.py.
+WORKDIR="${PBS_O_WORKDIR:-$(pwd)}"
+cd "$WORKDIR"
+if [ ! -f "run_optimization.py" ]; then
+    echo "ERROR: run_optimization.py not found in '$WORKDIR'." >&2
+    echo "       Submit from the directory that holds the pipeline modules." >&2
+    exit 2
+fi
+
+# ---- locate the config ------------------------------------------------
+CFG_NAME="${CONFIGS[$IDX]}"
+CFG=""
+for cand in "$CONFIG_SUBDIR" "hpc/Config" "Config" "hpc" "."; do
+    if [ -f "$cand/$CFG_NAME" ]; then
+        CFG="$cand/$CFG_NAME"
+        break
+    fi
+done
+if [ -z "$CFG" ]; then
+    echo "ERROR: '$CFG_NAME' not found under '$WORKDIR'." >&2
+    echo "       Set DSN_CONFIG_SUBDIR to the directory that holds it." >&2
+    exit 2
+fi
+
+# ---- environment ------------------------------------------------------
+if command -v module >/dev/null 2>&1; then
+    module load miniconda3 || echo "WARN: 'module load miniconda3' failed; \
+assuming conda is already on PATH."
+fi
+if ! command -v conda >/dev/null 2>&1; then
+    echo "ERROR: conda not found. Load the conda module first." >&2
+    exit 2
+fi
+eval "$(conda shell.bash hook)"
+conda activate "$CONDA_ENV"
+
+export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
+export OMP_NUM_THREADS="$NCPUS"
+export MKL_NUM_THREADS="$NCPUS"
+export OPENBLAS_NUM_THREADS="$NCPUS"
+export NUMEXPR_NUM_THREADS="$NCPUS"
+
+# ---- guard: ncpus must equal runtime.torch_threads --------------------
+CFG_THREADS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['runtime']['torch_threads'])" "$CFG")
+if [ "$CFG_THREADS" != "$NCPUS" ]; then
+    echo "ERROR: runtime.torch_threads=$CFG_THREADS in $CFG_NAME but the job" >&2
+    echo "       was granted NCPUS=$NCPUS. There is no CLI override for" >&2
+    echo "       torch_threads, so this would oversubscribe (or waste) cores." >&2
+    echo "       Fix the JSON or the '#PBS -l select' line, not just one." >&2
+    exit 2
+fi
+
+EXP_NAME=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['runtime']['experiment_name'])" "$CFG")
+
+# ---- fast pre-flight (arithmetic only; generates no traces) ------------
+if [ -f "hpc/preflight_config.py" ]; then
+    python3 hpc/preflight_config.py "$CFG"
+else
+    echo "WARN: hpc/preflight_config.py not found; skipping the geometry check."
+fi
+
+# ---- run --------------------------------------------------------------
+echo "======================================================================"
+echo "cell         : $IDX  ($CFG_NAME)"
+echo "experiment   : $EXP_NAME"
+echo "workdir      : $WORKDIR"
+echo "conda env    : $CONDA_ENV"
+echo "threads      : ncpus=$NCPUS  torch_threads=$CFG_THREADS  OMP=$OMP_NUM_THREADS"
+echo "host         : $(hostname)"
+echo "started      : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo "======================================================================"
+
+# -u keeps stdout unbuffered so 'tail -f' shows progress live.
+# Add --resume (DSN_RESUME=1) only to restart a died FINAL TRAINING stage;
+# the search phases are not resumable and will start over regardless.
+RESUME_FLAG=""
+if [ "${DSN_RESUME:-0}" = "1" ]; then
+    RESUME_FLAG="--resume"
+    echo "NOTE: --resume requested. Only the FINAL TRAINING stage resumes; the"
+    echo "      search phases restart from the beginning."
+fi
+
+python3 -u run_optimization.py \
+    --config "$CFG" \
+    --verbose \
+    --trial-verbose \
+    $RESUME_FLAG
+
+STATUS=$?
+echo "======================================================================"
+echo "finished     : $(date -u '+%Y-%m-%dT%H:%M:%SZ')  exit=$STATUS"
+echo "results      : <out_dir>/$EXP_NAME/results.json"
+echo "======================================================================"
+exit $STATUS
