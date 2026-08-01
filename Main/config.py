@@ -402,6 +402,18 @@ class DataConfig:
     specs_json: str = ""                    # real mode: path to specs list
     npz_specs: str = ""                     # numpy mode: path to burst_specs.json
 
+    # --- channels (multichannel) ---
+    # n_channels is the SINGLE source of truth for the trace channel axis
+    # (the C in the shape contract  trace (C, T) -> window (C, W) -> (M, C, W)).
+    # This is DISTINCT from the number of phenotype classes
+    # (len(synthetic_n_per_class)); do NOT conflate the two.
+    #   n_channels == 1 : single-channel population IFR (default, fully backward
+    #                     compatible; windows are (W,) and the 1-D path is used).
+    #   n_channels >  1 : per-region / per-channel IFRs; windows are (C, W).
+    # ExperimentConfig.__post_init__ propagates this into
+    # backbone.in_channels, so the backbone stem and the data always agree.
+    n_channels: int = 1
+
     # --- synthetic generation (multi-class capable) ---
     # one entry per phenotype class: number of synthetic traces for that class;
     # length of this tuple == number of classes C (labels 0..C-1).
@@ -421,6 +433,8 @@ class DataConfig:
     # its semantics would silently alter what those tests mean. A new mode is
     # additive and leaves every existing test meaningful.
     latent: "LatentConfig" = field(default_factory=lambda: LatentConfig())
+    # data_mode == "synthetic". Ignored for real/numpy modes.
+    synthetic: "SyntheticConfig" = field(default_factory=lambda: SyntheticConfig())
 
     # --- windowing ---
     window_s: float = 200.0
@@ -496,6 +510,8 @@ class DataConfig:
                 "synthetic.per_class has %d entries but there are only %d classes "
                 "(synthetic_n_per_class); per_class[c] maps to class c"
                 % (len(self.synthetic.per_class), n_classes))
+        if int(self.n_channels) < 1:
+            raise ValueError("n_channels must be >= 1")
         if self.window_s <= 0 or self.train_stride_s <= 0 or self.eval_stride_s <= 0:
             raise ValueError("window_s and strides must be > 0")
         if self.split_mode not in ("time_segment", "trace"):
@@ -939,6 +955,28 @@ class ExperimentConfig:
     eval: EvalConfig = field(default_factory=EvalConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
+    def __post_init__(self):
+        # Single source of truth for the trace channel axis: data.n_channels
+        # DRIVES backbone.in_channels, so the backbone stem input and the data
+        # windows can never silently disagree. A config therefore only ever sets
+        # data.n_channels; backbone.in_channels is derived here.
+        want = int(self.data.n_channels)
+        have = int(self.backbone.in_channels)
+        if have != want:
+            if have != 1:
+                # backbone.in_channels was given a non-default value that
+                # disagrees with data.n_channels -- flag it loudly (data wins).
+                warnings.warn(
+                    "ExperimentConfig: backbone.in_channels=%d conflicts with "
+                    "data.n_channels=%d. data.n_channels is authoritative; "
+                    "backbone.in_channels is being set to %d. Set the channel "
+                    "count via data.n_channels only." % (have, want, want),
+                    RuntimeWarning,
+                )
+            # replace() re-runs BackboneConfig.__post_init__ so the new value is
+            # validated (in_channels >= 1) rather than blindly assigned.
+            self.backbone = replace(self.backbone, in_channels=want)
+
     # ----- serialization -----
     def to_dict(self):
         return asdict(self)
@@ -967,6 +1005,13 @@ class ExperimentConfig:
     # ----- cross-field soft validation (warnings, not errors) -----
     def validate(self):
         msgs = []
+        if int(self.backbone.in_channels) != int(self.data.n_channels):
+            # Should never trip after __post_init__; guards against a caller
+            # mutating one field without the other.
+            msgs.append(
+                "backbone.in_channels=%d != data.n_channels=%d (channel-axis "
+                "mismatch; set data.n_channels only)."
+                % (int(self.backbone.in_channels), int(self.data.n_channels)))
         if self.train.max_epochs <= self.train.patience:
             msgs.append(
                 "train.max_epochs (%d) <= patience (%d): early stopping cannot "

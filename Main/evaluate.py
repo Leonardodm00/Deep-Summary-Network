@@ -142,7 +142,10 @@ def evaluate(model, dataset, device, seed=0, n_clusters=None, eval_cfg=None):
 
     Parameters
     ----------
-    model      : trained backbone (forward: (M, T) -> (M, E), rows L2-normalized)
+    model      : trained backbone (forward: (M, T) or (M, C, T) -> (M, E), rows
+                 L2-normalized). Multichannel windows flow through unchanged:
+                 evaluate() only calls embed_clean_windows, which builds the
+                 (N, C, W) clean-window batch and feeds (M, C, W) to the model.
     dataset    : MEAWindowDataset for the split being evaluated. For the final
                  report this MUST be the held-out TEST split (SplitBundle.test),
                  whose windows are DISJOINT from train and val by construction

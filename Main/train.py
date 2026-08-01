@@ -35,8 +35,17 @@ Data / batching
                  augmentation module for that window.
     M          : rows in one embedding batch, M = sum_b (1 + P_b + N_b), summed
                  over the C * B_c source windows b of the batch.
-    X          : (M, T) float32, the batch of windows fed to the network; T is the
-                 window length in samples.
+    X          : (M, n_channels, T) float32, the batch of windows fed to the
+                 network; T is the window length in samples and n_channels =
+                 cfg.data.n_channels = cfg.backbone.in_channels is the trace
+                 channel count (per-region IFRs). NOTE: n_channels is NOT the
+                 phenotype-class count C used above -- they are independent axes.
+                 For n_channels == 1 the collator emits (M, T) and the backbone
+                 stem unsqueezes it to (M, 1, T); for n_channels > 1 it emits
+                 (M, n_channels, T) directly. The training X -> model(X) path is
+                 shape-correct in both cases with no reshape, because the channel
+                 axis rides through the collator's torch.cat and the backbone
+                 forward accepts (M, n_channels, T).
     y          : (M,) int64 labels under the locked option-(b) scheme:
                  y_r = c_b in {0, ..., C-1} for every positive row r coming from a
                  source window b of phenotype c_b, and y_r = a UNIQUE integer

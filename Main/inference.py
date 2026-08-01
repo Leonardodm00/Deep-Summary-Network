@@ -78,14 +78,29 @@ def clean_windows(dataset) -> np.ndarray:
     Enumerates dataset.index exactly once, in order, so the rows are distinct by
     construction (one row per (trace_idx, start) pair).
 
+    Multichannel support
+    --------------------
+    Each trace is either 1-D of shape (K,) (single-channel population IFR) or
+    2-D of shape (C, K) (C = per-region / per-channel IFRs). The window is sliced
+    along the LAST (time) axis, exactly as MEAWindowDataset.__getitem__ does
+    (traces[ti][..., s:s + W]), so:
+        1-D trace (K,)   -> window (W,)    -> X of shape (N, W)
+        2-D trace (C, K) -> window (C, W)  -> X of shape (N, C, W)
+    The channel shape is taken from the first trace and every trace is required
+    to match it, so a ragged mix of channel counts is rejected. When C == 1-ness
+    is expressed as a 1-D trace, the returned array is (N, W), i.e. the
+    single-channel path is byte-for-byte what it was before multichannel support.
+
     Parameters
     ----------
     dataset : MEAWindowDataset -- needs .index (list of (trace_idx, start,
-              condition)), .traces (list of 1-D float arrays) and .window_length.
+              condition)), .traces (list of 1-D (K,) OR 2-D (C, K) float arrays)
+              and .window_length.
 
     Returns
     -------
-    X : (N, W) float32 numpy array, X[i] = traces[t_i][s_i : s_i + W]
+    X : float32 numpy array of shape (N, W) for 1-D traces or (N, C, W) for
+        (C, K) traces, with X[i] = traces[t_i][..., s_i : s_i + W]
     """
     index = dataset.index
     W = int(dataset.window_length)
@@ -93,13 +108,22 @@ def clean_windows(dataset) -> np.ndarray:
     if N == 0:
         raise ValueError("dataset has no windows (empty .index)")
 
-    X = np.empty((N, W), dtype=np.float32)
+    # channel shape (the axes BEFORE the time axis) is fixed by the first trace:
+    # ()  for a 1-D (K,) trace, (C,) for a 2-D (C, K) trace.
+    lead = tuple(np.asarray(dataset.traces[0]).shape[:-1])
+
+    X = np.empty((N,) + lead + (W,), dtype=np.float32)
     for i, (ti, s, _cond) in enumerate(index):
-        win = dataset.traces[ti][s:s + W]
-        if win.shape[0] != W:
+        win = dataset.traces[ti][..., s:s + W]        # (W,) or (C, W)
+        if win.shape[-1] != W:
             raise ValueError(
-                "window %d of trace %d has length %d, expected %d; the dataset "
-                "index and the traces disagree." % (i, ti, win.shape[0], W))
+                "window %d of trace %d has time length %d, expected %d; the "
+                "dataset index and the traces disagree." % (i, ti, win.shape[-1], W))
+        if tuple(win.shape[:-1]) != lead:
+            raise ValueError(
+                "window %d of trace %d has channel shape %s, expected %s; all "
+                "traces must share the same channel count."
+                % (i, ti, tuple(win.shape[:-1]), lead))
         X[i] = win
     return X
 
@@ -109,7 +133,10 @@ def embed_clean_windows(model, dataset, device, batch_size: int = 256):
 
     Parameters
     ----------
-    model      : the backbone (forward accepts (M, W) and returns (M, E))
+    model      : the backbone. Forward accepts (M, W) for single-channel data
+                 (auto-unsqueezed to (M, 1, W) by the stem) and (M, C, W) for
+                 multichannel data; returns (M, E) either way. The batch shape is
+                 whatever clean_windows produced, passed through unchanged.
     dataset    : MEAWindowDataset (see clean_windows)
     device     : torch.device (or a string accepted by torch.device)
     batch_size : M, forward-pass chunk size. Throughput knob only: the returned
@@ -133,7 +160,7 @@ def embed_clean_windows(model, dataset, device, batch_size: int = 256):
         raise ValueError("batch_size must be >= 1")
 
     device = torch.device(device)
-    X = clean_windows(dataset)                    # (N, W) float32, distinct rows
+    X = clean_windows(dataset)                    # (N, W) or (N, C, W) float32
     N = X.shape[0]
 
     y = np.asarray(dataset.conditions_per_item, dtype=np.int64).ravel()

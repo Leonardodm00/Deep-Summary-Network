@@ -46,6 +46,11 @@ if [ -d "$HERE/Main" ]; then
   MAIN="$HERE/Main"
 elif [ -f "$HERE/config.py" ] && [ -d "$HERE/Smoke_Tests" ]; then
   MAIN="$HERE"
+elif [ -f "$HERE/../config.py" ] && [ -d "$HERE/../Smoke_Tests" ]; then
+  # This script is COMMITTED at Main/hpc/run_all_smoke_tests.sh, so its own
+  # location is one level below Main/. Without this branch the script aborts
+  # when invoked from where it actually lives.
+  MAIN="$(cd "$HERE/.." && pwd)"
 else
   echo "ABORT: could not locate Main/ from $HERE. Run this from the repo root" >&2
   echo "       or from inside Main/ itself." >&2
