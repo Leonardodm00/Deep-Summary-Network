@@ -776,17 +776,18 @@ def check_NO():
 
     seen = {}
 
-    def fake_arch(c, sp, dev, space=None, verbose=False):
+    def fake_arch(c, sp, dev, space=None, verbose=False, train_verbose=False):
         seen["arch_dropout"] = float(c.backbone.dropout)
         return FakeRes([np.int64(4), np.float64(2.25), 1, np.int64(12)])
 
-    def fake_train_search(c, sp, dev, best_arch, verbose=False):
+    def fake_train_search(c, sp, dev, best_arch, verbose=False,
+                          train_verbose=False):
         seen["train_dropout"] = float(c.backbone.dropout)
         seen["train_arch"] = dict(best_arch)
         # margin, lr, u1 = 1-b1, u2 = 1-b2, wd
         return FakeRes([0.42, 0.005, 0.1, 0.001, 7e-4])
 
-    def fake_reg(c, sp, dev, verbose=False):
+    def fake_reg(c, sp, dev, verbose=False, train_verbose=False):
         seen["reg_dropout"] = float(c.backbone.dropout)
         seen["reg_wd_in"] = float(c.train.weight_decay)
         return FakeRes([0.15, 3e-3])          # dropout, weight_decay

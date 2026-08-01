@@ -756,11 +756,30 @@ def check_K():
 # --------------------------------------------------------------------------- #
 # [L] ASCII purity
 # --------------------------------------------------------------------------- #
-def check_L():
+def _locate(name):
+    """Resolve a shipped file across BOTH supported layouts.
+
+    Two layouts must work:
+      * repo checkout -- driver modules live in Main/, suites in
+        Main/Smoke_Tests/, so a sibling lookup misses by one directory;
+      * flat cluster runtime -- every package unpacks into one working
+        directory, so the file sits next to this one.
+    Searched own-dir -> parent -> cwd; first hit wins. Same idiom as
+    smoke_test_pipeline_mc.py check A6.
+    """
     here = Path(__file__).resolve().parent
+    for cand in (here / name, here.parent / name, Path.cwd() / name):
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError(
+        "%s not found in any supported layout (looked in %s, %s, %s)"
+        % (name, here, here.parent, Path.cwd()))
+
+
+def check_L():
     for name in ("run_optimization_colab.py",
                  "smoke_test_run_optimization_colab.py"):
-        p = here / name
+        p = _locate(name)
         data = p.read_bytes()
         bad = [(i, hex(b)) for i, b in enumerate(data) if b > 127]
         assert not bad, "%s has non-ASCII bytes: %r" % (name, bad[:5])
