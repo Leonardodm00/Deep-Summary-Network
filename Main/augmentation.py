@@ -2,8 +2,16 @@
 augmentation.py
 ===============
 
-Decoupled, CPU-side data-augmentation transforms for 1-D neuronal-activity
-windows (e.g. smoothed cumulative IFR traces), for the 1D-CNN summary network.
+Decoupled, CPU-side data-augmentation transforms for neuronal-activity windows
+(e.g. smoothed cumulative IFR traces), for the 1D-CNN summary network.
+
+Supports both a single-channel window x of shape (T,) and a MULTICHANNEL window
+X of shape (C, T) (e.g. C = 9 per-region IFRs). For multichannel input the SAME
+warp field (magnitude c(t) and time phi(t)) and the SAME circular shift are
+generated once per surrogate and applied IDENTICALLY to every channel, so
+inter-channel synchrony/propagation is preserved for positives and the whole
+multichannel bundle is warped together for negatives. The (T,) path is numerically
+identical to the previous single-channel implementation (same RNG draw order).
 
 Pipeline role (separation of concerns -- directive 2)
 -----------------------------------------------------
@@ -172,15 +180,15 @@ def magnitude_warp(
 
     Returns a (T,) CPU float32 tensor.
     """
-    x = _to_work_array(window).ravel()
-    T = x.shape[0]
+    x = _to_work_array(window)          # (T,) single channel OR (C, T) multichannel
+    T = x.shape[-1]
     K = _n_knots(T, fs, intra_knot_dist, k_min)
     t = np.arange(T, dtype=_NUMPY_WORK_DTYPE)
     t_knots = np.linspace(0.0, T - 1.0, K)
     g = rng.normal(loc=0.0, scale=sigma_mag, size=K)
     s = CubicSpline(t_knots, g)(t)
-    c = np.exp(s)                       # strictly positive by construction
-    return _to_tensor(x * c)
+    c = np.exp(s)                       # (T,) strictly positive; SHARED across channels
+    return _to_tensor(x * c)            # (C,T)*(T,) applies the same c to every channel
 
 
 def time_warp(
@@ -205,8 +213,8 @@ def time_warp(
 
     Returns a (T,) CPU float32 tensor.
     """
-    x = _to_work_array(window).ravel()
-    T = x.shape[0]
+    x = _to_work_array(window)          # (T,) single channel OR (C, T) multichannel
+    T = x.shape[-1]
     K = _n_knots(T, fs, intra_knot_dist, k_min)
     t = np.arange(T, dtype=_NUMPY_WORK_DTYPE)
     t_knots = np.linspace(0.0, T - 1.0, K)
@@ -215,10 +223,15 @@ def time_warp(
     delta = rng.normal(loc=0.0, scale=sigma_samples, size=K)
     delta[0] = 0.0
     delta[-1] = 0.0                     # pin endpoints
-    phi = t + CubicSpline(t_knots, delta)(t)
+    phi = t + CubicSpline(t_knots, delta)(t)   # (T,) SHARED warped index map
 
-    # resample the signal at the warped indices (extrapolate=True by default)
-    warped = CubicSpline(t, x)(phi)
+    # resample at the shared warped indices (extrapolate=True by default). For
+    # multichannel, one cubic per channel is evaluated at the SAME phi (axis=1),
+    # so every channel undergoes the identical time warp.
+    if x.ndim == 1:
+        warped = CubicSpline(t, x)(phi)            # (T,)
+    else:
+        warped = CubicSpline(t, x, axis=1)(phi)    # (C, T)
     return _to_tensor(warped)
 
 
@@ -229,16 +242,28 @@ def random_circular_shift(
     rng: np.random.Generator,
 ) -> torch.Tensor:
     """
-    Vectorized circular shift: each row is rolled by its own random integer
-    shift in [-S, S], S = int(shift_magnitude_s * fs). Equivalent to a per-row
-    torch.roll(row, shift) (out[i] = row[i - shift]).
+    Vectorized circular shift along TIME.
 
-    windows : (T,) or (B, T) float32 tensor.
-    Returns : same shape and dtype.
+    Supports:
+      (T,)       single window        -> its own random shift
+      (B, T)     B windows            -> per-row (per-window) shift
+      (B, C, T)  B multichannel windows -> ONE shift per window, SHARED across
+                 its C channels (preserves inter-channel alignment).
+
+    out[..., t] = row[..., t - shift]. Returns same shape and dtype. The number
+    of random draws is B for every case, so the (T,)/(B, T) paths are unchanged.
     """
-    single = windows.ndim == 1
-    w = windows.unsqueeze(0) if single else windows
-    B, T = w.shape
+    ndim = windows.ndim
+    if ndim == 1:
+        w = windows.unsqueeze(0)                 # (1, T)
+    elif ndim in (2, 3):
+        w = windows
+    else:
+        raise ValueError(
+            "random_circular_shift expects 1-D, 2-D or 3-D; got %dD" % ndim)
+
+    T = w.shape[-1]
+    B = w.shape[0]
 
     max_shift = int(shift_magnitude_s * fs)
     if max_shift <= 0:
@@ -249,12 +274,18 @@ def random_circular_shift(
         )
         return windows
 
-    shifts = rng.integers(-max_shift, max_shift + 1, size=B)          # (B,)
+    shifts = rng.integers(-max_shift, max_shift + 1, size=B)          # (B,) per window
     base = np.arange(T)[None, :]                                      # (1, T)
     idx = (base - shifts[:, None]) % T                               # (B, T) circular
-    idx_t = torch.as_tensor(idx, dtype=torch.long)
-    out = torch.gather(w, dim=1, index=idx_t)
-    return out.squeeze(0) if single else out
+    idx_t = torch.as_tensor(idx, dtype=torch.long)                   # (B, T)
+
+    if ndim == 3:
+        C = w.shape[1]
+        idx_t = idx_t.unsqueeze(1).expand(B, C, T)                   # shared over channels
+        out = torch.gather(w, dim=2, index=idx_t)                    # (B, C, T)
+    else:
+        out = torch.gather(w, dim=1, index=idx_t)                    # (1, T) or (B, T)
+    return out.squeeze(0) if ndim == 1 else out
 
 
 # --------------------------------------------------------------------------- #
@@ -279,9 +310,11 @@ def _generate_pool(window, cfg, rng, n, sigma_mag_range, sigma_time_range) -> to
     from OTHER cultures, not warps of the anchor's own window) and N_s = 0 (no
     surrogate negatives at all).
     """
-    T = int(_to_tensor(window).reshape(-1).shape[0])
+    w0 = _to_tensor(window)
+    T = int(w0.shape[-1])
     if int(n) <= 0:
-        return torch.zeros((0, T), dtype=_TORCH_DTYPE)
+        empty_shape = (0, T) if w0.ndim == 1 else (0, int(w0.shape[0]), T)
+        return torch.zeros(empty_shape, dtype=_TORCH_DTYPE)
     rows = [_make_surrogate(window, cfg, rng, sigma_mag_range, sigma_time_range)
             for _ in range(int(n))]
     return torch.stack(rows, dim=0)    # (n, T)
@@ -295,8 +328,8 @@ def _split_percentile_mse(pool: torch.Tensor, anchor: torch.Tensor, q: float):
         tau  = Q_q({d_m})                       (per-anchor q-quantile)
         pos  = {m : d_m <= tau},  neg = {m : d_m > tau}
     """
-    a = anchor.reshape(1, -1)
-    d = ((pool - a) ** 2).mean(dim=1)              # (n,)
+    a = anchor.unsqueeze(0)                        # (1, T) or (1, C, T)
+    d = (pool - a).pow(2).flatten(1).mean(dim=1)   # (n,)  MSE over channel(s) AND time
     tau = torch.quantile(d, q)
     pos_mask = d <= tau
     return pool[pos_mask], pool[~pos_mask]
@@ -325,7 +358,11 @@ def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Gener
     This function is condition-AGNOSTIC: the condition-level label (control vs
     pathological) is attached downstream by the batch sampler.
     """
-    window = _to_tensor(window).reshape(-1)        # (T,)
+    window = _to_tensor(window)                    # (T,) single OR (C, T) multichannel
+    if window.ndim not in (1, 2):
+        raise ValueError(
+            "build_triplet_instance expects a (T,) or (C, T) window; got shape %s"
+            % (tuple(window.shape),))
 
     if cfg.split_method == "warp_bands":                   # option 3
         # Explicit counts: each pool has EXACTLY n_positives / n_negatives rows
@@ -366,7 +403,7 @@ def build_triplet_instance(window, cfg: AugmentationConfig, rng: np.random.Gener
         raise ValueError(f"Unknown split_method: {cfg.split_method!r}")
 
     # anchor: always clean and unshifted (matches the inference distribution)
-    anchor = window.reshape(1, -1)
+    anchor = window.unsqueeze(0)                   # (1, T) or (1, C, T)
 
     # PRE-SHIFT: capture surrogates before translation so the plotter can
     # show the pure warp effect with no circular-shift confound. Guarded so an

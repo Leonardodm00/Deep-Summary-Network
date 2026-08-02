@@ -58,6 +58,12 @@ class BackboneConfig:
     depth_exponent: int = 4          # d in {3,4,5,6}; total blocks = 2 ** d
     width_multiplier: float = 2.0    # wm in [1.5, 3.0], continuous
     stem_width: int = 16             # w0 = wa = stem_width (simplified variant)
+    in_channels: int = 1             # C: input traces per window. 1 = single
+                                     # population IFR (default, backward compat);
+                                     # e.g. 9 = per-region / per-channel IFRs.
+                                     # Only the stem INPUT changes; the downstream
+                                     # width schedule (stem_width -> block widths)
+                                     # is unaffected.
 
     # --- block family ---
     block_family: int = 0            # 0 = ResNet, 1 = ResNeXt
@@ -90,6 +96,8 @@ class BackboneConfig:
             raise ValueError("width_multiplier must be > 1.0")
         if self.stem_width < 1:
             raise ValueError("stem_width must be >= 1")
+        if self.in_channels < 1:
+            raise ValueError("in_channels must be >= 1")
         if self.block_family not in (0, 1):
             raise ValueError("block_family must be 0 (ResNet) or 1 (ResNeXt)")
         if self.group_width < 1:
@@ -211,7 +219,7 @@ class Stem(nn.Module):
         super().__init__()
         self.kernel = cfg.stem_kernel
         self.stride = cfg.stem_stride
-        self.conv = nn.Conv1d(1, cfg.stem_width, self.kernel,
+        self.conv = nn.Conv1d(cfg.in_channels, cfg.stem_width, self.kernel,
                               stride=self.stride, padding=0, bias=False)
         self.norm = make_norm(cfg.stem_width, cfg)
         self.act = nn.ReLU(inplace=True)
@@ -438,11 +446,13 @@ class OneDCNNBackbone(nn.Module):
                 nn.init.zeros_(m.last_branch_norm.weight)
 
     def forward(self, x):
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        if x.dim() != 3 or x.shape[1] != 1:
-            raise ValueError("expected (M, T) or (M, 1, T); got shape %s"
-                             % (tuple(x.shape),))
+        C = self.cfg.in_channels
+        if x.dim() == 2 and C == 1:
+            x = x.unsqueeze(1)            # (M, T) -> (M, 1, T), single-channel only
+        if x.dim() != 3 or x.shape[1] != C:
+            raise ValueError(
+                "expected (M, %d, T)%s; got shape %s"
+                % (C, " or (M, T)" if C == 1 else "", tuple(x.shape)))
         x = self.stem(x)
         stage_outputs = []
         for stage in self.stages:

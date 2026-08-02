@@ -148,8 +148,33 @@ class NumpyTraceProvider:
 
     def __call__(self, npz_path: str) -> Tuple[np.ndarray, float]:
         data = np.load(npz_path, allow_pickle=True)
-        ifr  = np.ascontiguousarray(data["ifr_trace"], dtype=np.float32)
-        fs   = float(data["fs_ifr"])
+        if "ifr_trace" not in data.files:
+            raise KeyError(
+                "%s has no 'ifr_trace' key (found: %r). The channel-subset "
+                "extractor writes its array under 'X'; re-run "
+                "run_channel_subset_extraction.py, which now also writes the "
+                "'ifr_trace' alias this provider requires."
+                % (npz_path, sorted(data.files)))
+        ifr = np.ascontiguousarray(data["ifr_trace"], dtype=np.float32)
+        fs = float(data["fs_ifr"])
+        if ifr.ndim not in (1, 2):
+            raise ValueError(
+                "%s: ifr_trace must be (K,) or (C, K); got shape %r"
+                % (npz_path, ifr.shape))
+        # [multichannel] C is read from the archive's own metadata when present,
+        # NEVER inferred from ifr.shape[0]. The extractor emits (C, K) arrays in
+        # BOTH mode='multichannel' (rows are channels, in_channels = C) and
+        # mode='per_region_single' (rows are separate samples, in_channels = 1),
+        # so shape alone is ambiguous and would silently mislabel the latter.
+        if "in_channels" in data.files:
+            C_file = int(data["in_channels"])
+            C_arr = 1 if ifr.ndim == 1 else int(ifr.shape[0])
+            if C_file != C_arr:
+                raise ValueError(
+                    "%s: in_channels=%d disagrees with ifr_trace shape %r. A "
+                    "per_region_single archive holds independent SAMPLES, not "
+                    "channels; split it into one .npz per subregion before "
+                    "loading." % (npz_path, C_file, ifr.shape))
         return ifr, fs
 
 
@@ -182,7 +207,7 @@ class MEAWindowDataset(Dataset):
 
         self.index: List[Tuple[int, int, int]] = []   # (trace_idx, start, condition)
         for ti, (tr, cond) in enumerate(zip(self.traces, conditions)):
-            L = tr.shape[0]
+            L = tr.shape[-1]                           # time axis (works for (T,) and (C, T))
             if L < self.window_length:
                 continue
             s = 0
@@ -198,16 +223,16 @@ class MEAWindowDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict:
         ti, s, cond = self.index[i]
-        window = self.traces[ti][s:s + self.window_length]
+        window = self.traces[ti][..., s:s + self.window_length]   # (W,) or (C, W)
         window = torch.from_numpy(np.ascontiguousarray(window)).float()
         anchor, positives, negatives, pos_pre, neg_pre = build_triplet_instance(
             window, self.aug_cfg, self.rng, return_pre_shift=True)
         return {
-            "anchor":        anchor,     # (1, T)   clean unshifted window
-            "positives":     positives,  # (1+P, T) warp + shift (network input)
-            "negatives":     negatives,  # (N, T)   warp + shift (network input)
-            "pos_pre_shift": pos_pre,    # (1+P, T) warp only    (viz only)
-            "neg_pre_shift": neg_pre,    # (N, T)   warp only    (viz only)
+            "anchor":        anchor,     # (1, T)  or (1, C, T)   clean unshifted window
+            "positives":     positives,  # (1+P,T) or (1+P,C,T)   warp + shift (network input)
+            "negatives":     negatives,  # (N, T)  or (N, C, T)   warp + shift (network input)
+            "pos_pre_shift": pos_pre,    # (1+P,T) or (1+P,C,T)   warp only    (viz only)
+            "neg_pre_shift": neg_pre,    # (N, T)  or (N, C, T)   warp only    (viz only)
             "condition": int(cond),
             "meta": (ti, s),
         }
@@ -427,7 +452,9 @@ class TripletCollator:
 
     Returns
     -------
-    X     : (M, T) float32 -- all positives + negatives, M = sum_b (1+P_b+N_b)
+    X     : (M, T) or (M, C, T) float32 -- all positives + negatives,
+            M = sum_b (1+P_b+N_b); the channel axis (if present) rides through
+            torch.cat unchanged.
     y     : (M,)  long     -- condition for positives; unique >= base for negatives
     metas : list           -- per-source-window (trace_idx, start) for debugging
     """

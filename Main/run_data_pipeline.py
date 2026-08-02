@@ -58,6 +58,11 @@ class PipelineConfig:
     duration_s: float = 600.0
     fs: float = 50.0                      # synthetic fs (real fs comes from the loader)
 
+    # --- channels (synthetic multichannel; n_channels == 1 keeps the 1-D path) ---
+    n_channels: int = 1                   # >1 routes synthetic to generate_multichannel_traces
+    neurons_per_channel: int = 20         # per-channel neuron subset size (multichannel only)
+    channel_gain_spread: float = 0.0      # per-channel amplitude spread (multichannel only)
+
     # --- windowing ---
     window_s: float = 200.0
     stride_s: float = 100.0               # stride < window_s -> overlapping windows
@@ -116,6 +121,10 @@ def parse_args() -> PipelineConfig:
     p.add_argument("--no-deterministic", dest="deterministic", action="store_false", default=cfg.deterministic)
     p.add_argument("--torch-threads", type=int, default=cfg.torch_threads)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default=cfg.device)
+    p.add_argument("--n-channels", type=int, default=cfg.n_channels,
+                   help="synthetic: >1 generates multichannel (C, T) traces")
+    p.add_argument("--neurons-per-channel", type=int, default=cfg.neurons_per_channel)
+    p.add_argument("--channel-gain-spread", type=float, default=cfg.channel_gain_spread)
     p.add_argument("--out-dir", default=cfg.out_dir)
     p.add_argument("--n-debug-plots", type=int, default=cfg.n_debug_plots)
     a = p.parse_args()
@@ -143,6 +152,23 @@ def resolve_device(choice: str) -> torch.device:
 def load_traces(cfg: PipelineConfig):
     """Return (traces, conditions, fs). Synthetic or real (project loader)."""
     if cfg.data_mode == "synthetic":
+        if int(cfg.n_channels) > 1:
+            # Multichannel (C, T) synthetic: ONE shared burst schedule per
+            # recording, per-channel neuron subsets (Step 3). Distinct generative
+            # model from the single-channel provider below, so this is its own
+            # branch; the fs returned is the generator's IFR rate.
+            from generate_burst_data import generate_multichannel_traces
+            traces, conditions, fs = generate_multichannel_traces(
+                n_control=int(cfg.n_control),
+                n_patho=int(cfg.n_patho),
+                n_channels=int(cfg.n_channels),
+                neurons_per_channel=int(cfg.neurons_per_channel),
+                channel_gain_spread=float(cfg.channel_gain_spread),
+                duration_s=float(cfg.duration_s),
+                seed=int(cfg.seed),
+            )
+            return traces, conditions, float(fs)
+        # single-channel path (unchanged)
         provider = SyntheticTraceProvider(duration_s=cfg.duration_s, fs=cfg.fs, seed=cfg.seed)
         traces, conditions = [], []
         for tid in range(cfg.n_control):

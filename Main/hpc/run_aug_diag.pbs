@@ -1,0 +1,104 @@
+#!/bin/bash
+# =============================================================================
+# run_aug_diag.pbs -- augmentation diagnostic on davinci-1 (Leonardo, PBS), CPU.
+#
+# Trains nothing. Generates surrogates with the pipeline's OWN augmentation,
+# measures positive/negative separation in distortion space, checks how much of
+# the negative time band reaches tau_burst, runs health checks, and writes a
+# JSON summary + two PNGs + a text report (this log). Light: a few minutes.
+#
+# Submit with:   qsub run_aug_diag.pbs
+# Watch with:    qstat -u $USER      /      tail -f aug_diag.out
+#
+# HPC note (hpc-python-compat): pure ASCII, no non-ASCII bytes, safe across any
+# Windows / MobaXterm / scp transfer.
+#
+# PLACEMENT: drop augmentation_diagnostics.py into the SAME directory as
+# augmentation.py (the unzipped dsn_pipeline), and submit this script from there
+# (qsub uses the submit dir as $PBS_O_WORKDIR).
+# =============================================================================
+
+#PBS -N aug_diag
+#PBS -l select=1:ncpus=2
+#PBS -l walltime=00:30:00
+#PBS -o aug_diag.out
+#PBS -e aug_diag.err
+#PBS -j oe
+#                (merge stderr into stdout so there is one log to tail)
+
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# RUN configuration -- edit these
+# --------------------------------------------------------------------------- #
+CONFIG="config_search_3class_hpc.json"     # augmentation params read from here
+OUT_DIR="$PBS_O_WORKDIR/aug_diag_out"
+CONDA_ENV="REPLACE_WITH_YOUR_ENV_NAME"     # <-- name passed to
+                                           #     setup_env_davinci.sh --env-name
+
+# Data source: "synthetic" (uses generate_burst_data) or "npz".
+DATA_SOURCE="synthetic"
+N_CONTROL=3
+N_PATHO=3
+N_ANCHORS=64
+# For DATA_SOURCE="npz", point this at your pre-computed IFR archives:
+NPZ_GLOB="$PBS_O_WORKDIR/burst_data/*.npz"
+
+# --------------------------------------------------------------------------- #
+# 1. go to the submit directory (holds augmentation.py + the diagnostic)
+# --------------------------------------------------------------------------- #
+cd "$PBS_O_WORKDIR"
+echo "[job] host    : $(hostname)"
+echo "[job] workdir : $PBS_O_WORKDIR"
+echo "[job] started : $(date)"
+
+# --------------------------------------------------------------------------- #
+# 2. environment (same activation path as run_search_cpu.pbs)
+# --------------------------------------------------------------------------- #
+module load miniconda3
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$CONDA_ENV"
+# davinci-1 GLIBCXX_3.4.26 belt-and-suspenders (env's libstdc++ must win)
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+echo "[job] python  : $(which python)  ($(python --version 2>&1))"
+
+# --------------------------------------------------------------------------- #
+# 3. pre-flight: self-test the diagnostic itself (seconds; fails fast)
+# --------------------------------------------------------------------------- #
+echo "[job] self-test (augmentation_diagnostics --smoke) ..."
+python -u augmentation_diagnostics.py --smoke --pipeline-dir "$PBS_O_WORKDIR"
+
+# --------------------------------------------------------------------------- #
+# 4. the diagnostic
+# --------------------------------------------------------------------------- #
+echo "[job] running augmentation diagnostic ..."
+if [[ "$DATA_SOURCE" == "npz" ]]; then
+    python -u augmentation_diagnostics.py \
+        --pipeline-dir "$PBS_O_WORKDIR" \
+        --config "$CONFIG" \
+        --npz-glob "$NPZ_GLOB" \
+        --n-anchors "$N_ANCHORS" \
+        --out-dir "$OUT_DIR"
+else
+    python -u augmentation_diagnostics.py \
+        --pipeline-dir "$PBS_O_WORKDIR" \
+        --config "$CONFIG" \
+        --synthetic --n-control "$N_CONTROL" --n-patho "$N_PATHO" \
+        --n-anchors "$N_ANCHORS" \
+        --out-dir "$OUT_DIR"
+fi
+
+echo "[job] done : $(date)"
+echo "[job] outputs in: $OUT_DIR"
+
+# --------------------------------------------------------------------------- #
+# TUNING: to test a candidate fix for the under-reach warning WITHOUT touching
+# code, add an explicit negative time band (endpoints in seconds), e.g. set the
+# lower endpoint at or above the reported tau_burst:
+#
+#   python -u augmentation_diagnostics.py --pipeline-dir "$PBS_O_WORKDIR" \
+#       --config "$CONFIG" --synthetic --n-control 3 --n-patho 3 \
+#       --sigma-time-neg-s 0.40 0.90 --out-dir "$OUT_DIR/fix_candidate"
+#
+# The exit code is non-zero only on a FAIL (health failure); WARN exits 0.
+# =============================================================================

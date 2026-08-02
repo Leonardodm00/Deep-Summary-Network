@@ -1,0 +1,145 @@
+#!/bin/bash
+# =============================================================================
+# run_search_9ch.pbs -- 9-CHANNEL (multichannel) pipeline on davinci-1 (PBS).
+#                       Mirrors run_search_cpu.pbs. CPU by default.
+# =============================================================================
+#
+# Submit with:   qsub run_search_9ch.pbs
+# Watch with:    qstat -u $USER        /   tail -f search_9ch.out
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS SCRIPT DOES TODAY vs LATER  (READ THIS)
+# -----------------------------------------------------------------------------
+# The multichannel backbone / augmentation / dataset / windowing / eval /
+# inference paths all handle (C, T) now (Steps 1-5). What is NOT wired yet is
+# the REAL-DRIVER trace SOURCE: run_optimization.py -> build_traces still returns
+# single-channel (K,) traces per provider, and it RAISES on data.n_channels > 1
+# on purpose (fail loud, never mis-shape data). See PROGRESS.md "Step 5 fork".
+#
+# So this job, as shipped, runs a CLUSTER SANITY CHECK that IS runnable today:
+#   1. verify_env_hpc.py           (fail fast on a broken env)
+#   2. smoke_test_pipeline_mc.py   (end-to-end forward -> miner -> loss ->
+#                                   backward on synthetic (9, T); builds the
+#                                   (C, T) dataset directly, bypassing build_traces)
+# A green log here means the 9-channel pipeline trains on THIS cluster.
+#
+# The FULL 9-channel SEARCH block is present below but COMMENTED OUT. Enable it
+# (uncomment) once ONE of these is done (see the guard message in build_traces):
+#   (a) an N-class multichannel provider is wired into build_traces, or
+#   (b) per-channel IFRs are precomputed to (C, K) .npz and loaded via
+#       data_mode="numpy" (numpy provider extended to (C, K)).
+#
+# -----------------------------------------------------------------------------
+# HOW TO SWITCH TO GPU (three edits, all marked "GPU SWITCH" below):
+#   1. #PBS select line: add ":ngpus=1"
+#   2. uncomment the "module load cuda/12.1" line
+#   3. set DEVICE="cuda" in the RUN block
+# and set up a GPU env first:  bash setup_env_davinci.sh --env-name <env> --gpu
+#
+# HPC note (hpc-python-compat): pure ASCII, safe across any Windows/MobaXterm
+# transfer.
+# =============================================================================
+
+# --------------------------------------------------------------------------- #
+# PBS directives
+# --------------------------------------------------------------------------- #
+#PBS -N search_9ch
+#PBS -l select=1:ncpus=8
+#                          ^^^^^^^  GPU SWITCH: change to
+#                          select=1:ncpus=8:ngpus=1
+#PBS -l walltime=02:00:00
+#                ^^^^^^^^  sized for the sanity-check job. RAISE THIS (see the
+#                          run_search_cpu.pbs budget table) when you enable the
+#                          full search block below.
+#PBS -o search_9ch.out
+#PBS -e search_9ch.err
+#PBS -j oe
+
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# RUN configuration
+# --------------------------------------------------------------------------- #
+CONFIG="config_search_3class_9ch.json"     # data.n_channels=9 -> backbone.in_channels=9
+EXPERIMENT="search_3class_9ch"
+DEVICE="cpu"                               # GPU SWITCH: set to "cuda"
+N_CHANNELS=9
+CONDA_ENV="REPLACE_WITH_YOUR_ENV_NAME"     # the name passed to setup_env_davinci.sh
+
+# BUDGET (only used when the full-search block below is enabled)
+N_ARCH=15
+N_TRAIN=15
+N_REG=10
+N_SEEDS=2
+MAX_EPOCHS=50
+
+# --------------------------------------------------------------------------- #
+# 1. go to the submit directory
+# --------------------------------------------------------------------------- #
+cd "$PBS_O_WORKDIR"
+echo "[job] host        : $(hostname)"
+echo "[job] workdir     : $PBS_O_WORKDIR"
+echo "[job] started     : $(date)"
+echo "[job] n_channels  : $N_CHANNELS"
+
+# --------------------------------------------------------------------------- #
+# 2. environment
+# --------------------------------------------------------------------------- #
+module load miniconda3
+# GPU SWITCH: uncomment the next line when running on a GPU node
+# module load cuda/12.1
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$CONDA_ENV"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+echo "[job] python      : $(which python)  ($(python --version 2>&1))"
+
+# --------------------------------------------------------------------------- #
+# 3. pre-flight: fail fast on a broken env
+# --------------------------------------------------------------------------- #
+if [[ -f verify_env_hpc.py ]]; then
+    echo "[job] running verify_env_hpc.py ..."
+    python verify_env_hpc.py
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. 9-channel cluster sanity check (RUNNABLE TODAY)
+#    end-to-end forward -> miner -> loss -> backward on synthetic (9, T)
+# --------------------------------------------------------------------------- #
+echo "[job] 9-channel end-to-end smoke test ..."
+python -u smoke_test_pipeline_mc.py --n-channels "$N_CHANNELS"
+echo "[job] smoke test OK -- the 9-channel pipeline trains on this cluster."
+
+# --------------------------------------------------------------------------- #
+# 5. FULL 9-CHANNEL SEARCH  --  DISABLED until the multichannel trace source is
+#    wired (see header). Uncomment this block then, and RAISE the walltime above.
+# --------------------------------------------------------------------------- #
+# echo "[job] dry-run pre-flight ..."
+# python -u run_optimization.py \
+#     --config "$CONFIG" \
+#     --device "$DEVICE" \
+#     --n-calls-arch  "$N_ARCH" \
+#     --n-calls-train "$N_TRAIN" \
+#     --n-calls-reg   "$N_REG" \
+#     --n-seeds       "$N_SEEDS" \
+#     --max-epochs    "$MAX_EPOCHS" \
+#     --out-dir  "$PBS_O_WORKDIR/out_9ch" \
+#     --cache-dir "$PBS_O_WORKDIR/cache_9ch" \
+#     --experiment-name "$EXPERIMENT" \
+#     --dry-run
+#
+# echo "[job] launching full 9-channel search ..."
+# python -u run_optimization.py \
+#     --config "$CONFIG" \
+#     --device "$DEVICE" \
+#     --n-calls-arch  "$N_ARCH" \
+#     --n-calls-train "$N_TRAIN" \
+#     --n-calls-reg   "$N_REG" \
+#     --n-seeds       "$N_SEEDS" \
+#     --max-epochs    "$MAX_EPOCHS" \
+#     --out-dir  "$PBS_O_WORKDIR/out_9ch" \
+#     --cache-dir "$PBS_O_WORKDIR/cache_9ch" \
+#     --experiment-name "$EXPERIMENT" \
+#     --verbose
+
+echo "[job] finished    : $(date)"

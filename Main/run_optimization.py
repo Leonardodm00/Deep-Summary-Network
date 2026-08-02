@@ -556,6 +556,33 @@ def build_traces(cfg, overwrite_cache=False, engine_module=None,
     mode = cfg.data.data_mode
     cache_dir = Path(cfg.runtime.cache_dir)
 
+    # Multichannel guard (fail loud, do NOT silently mis-shape data).
+    # The providers below each return a SINGLE-channel (K,) trace. Producing
+    # (C, K) traces for n_channels > 1 requires a multichannel trace source that
+    # is intentionally NOT wired here yet (see PROGRESS.md, Step 5 fork):
+    #   - the real per-region IFR extractor (extract_channel_subsets) is a
+    #     deferred function the user supplies; and
+    #   - generate_multichannel_traces is 2-class (control/patho) and does not
+    #     map onto this N-class provider / manifest / caching abstraction.
+    # Until that decision is made, refuse rather than return 1-channel traces
+    # that would disagree with backbone.in_channels == n_channels.
+    # [multichannel] The blanket refusal is replaced by MODE-SPECIFIC validation.
+    # data.n_channels is the single source of truth for the channel axis C; it
+    # DRIVES backbone.in_channels (see config.ExperimentConfig.__post_init__).
+    C_want = int(cfg.data.n_channels)
+    if C_want > 1 and cfg.data.data_mode in ("synthetic", "latent"):
+        raise NotImplementedError(
+            "data_mode=%r with n_channels=%d: the %s provider emits a single "
+            "population IFR trace of shape (K,) and has no channel axis.\n"
+            "  * synthetic multichannel: use run_data_pipeline.py --n-channels %d "
+            "(routes to generate_multichannel_traces), or data_mode='numpy' with "
+            "pre-computed (C, K) .npz traces.\n"
+            "  * latent multichannel is deliberately NOT implemented: it needs a "
+            "generative decision (one shared latent vector phi per recording "
+            "with independent per-channel spike noise, vs. an independent phi "
+            "per subregion) that must not be guessed. Use n_channels=1."
+            % (cfg.data.data_mode, C_want, cfg.data.data_mode, C_want))
+
     if mode == "synthetic":
         n_per_class = tuple(int(n) for n in cfg.data.synthetic_n_per_class)
         syn = cfg.data.synthetic
@@ -1534,7 +1561,7 @@ def run(cfg, args, on_stage_complete=None):
         verbose=verbose,
     )
     n_classes = len(set(conditions))
-    trace_lengths = [int(t.shape[0]) for t in traces]
+    trace_lengths = [int(t.shape[-1]) for t in traces]
     _fire("data", cfg)          # the trace cache is populated; worth protecting
 
     # Snapshot the synthetic data this run trained on (params + figure), so an

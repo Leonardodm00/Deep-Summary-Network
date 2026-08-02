@@ -358,11 +358,11 @@ def make_time_segment_splits(traces: Sequence[np.ndarray],
 
     for ti, (tr, cond) in enumerate(zip(traces, conditions)):
         tr = np.ascontiguousarray(tr, dtype=np.float32)
-        L = tr.shape[0]
+        L = tr.shape[-1]          # time axis: works for (K,) and (C, K)
         bounds = segment_bounds(L, data_cfg.split_fractions)
         seg_bounds_per_trace.append(bounds)
         for name, (s, e) in zip(_SPLIT_NAMES, bounds):
-            sub = tr[s:e]
+            sub = tr[..., s:e]    # slice TIME, not channels
             seg_traces[name].append(sub)                 # keep even if too short:
             seg_conditions[name].append(int(cond))       # preserves ti alignment
             for rel in window_starts(e - s, W, stride_by_split[name]):
@@ -750,10 +750,10 @@ def make_trace_splits(traces: Sequence[np.ndarray],
         sub_conditions = [int(conditions[u]) for u in globals_here]
 
         for u in globals_here:
-            if arrays[u].shape[0] < W:
-                too_short.append((name, u, int(arrays[u].shape[0])))
+            if arrays[u].shape[-1] < W:
+                too_short.append((name, u, int(arrays[u].shape[-1])))
 
-        n_windows = sum(len(window_starts(arrays[u].shape[0], W, stride))
+        n_windows = sum(len(window_starts(arrays[u].shape[-1], W, stride))
                         for u in globals_here)
         if n_windows == 0:
             raise ValueError(

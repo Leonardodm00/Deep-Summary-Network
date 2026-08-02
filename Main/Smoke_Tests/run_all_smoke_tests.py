@@ -126,6 +126,16 @@ ORDER = [
     "smoke_test_inspect_latent.py",         # inspection tool vs driver: NO DRIFT
     "smoke_test_synthetic_config.py",       # configurable burst params + saved artifacts
     "smoke_test_run_optimization_colab.py",
+
+    # --- multichannel (C >= 1) suites -----------------------------------
+    # Ordered by dependency depth, same convention as above: the pure-shape
+    # backbone check first, then augmentation, then the generator, then the
+    # dataset/collator, then the full config-to-forward wiring test.
+    "smoke_test_in_channels.py",            # stem: Conv1d(C, ...) + (M,C,T) forward
+    "smoke_test_augmentation_mc.py",        # shared warp field / shared shift across C
+    "smoke_test_generate_mc.py",            # generate_multichannel_traces -> (C, K)
+    "smoke_test_data_pipeline_mc.py",       # (C,W) windows + (M,C,W) collation
+    "smoke_test_pipeline_mc.py",            # config wiring -> eval forward -> grads
 ]
 
 # Descriptions used only when a suite listed above is missing from disk.

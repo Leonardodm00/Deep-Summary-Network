@@ -115,9 +115,9 @@ def cache_traces(specs, provider, cache_dir, overwrite=False):
             trace, fs = provider(*args)
             trace = np.ascontiguousarray(trace, dtype=np.float32)
             fs = float(fs)
-            if trace.ndim != 1:
+            if trace.ndim not in (1, 2):
                 raise ValueError(
-                    "provider for %r returned shape %r; expected 1-D (K,)"
+                    "provider for %r returned shape %r; expected (K,) or (C, K)"
                     % (name, trace.shape))
             np.savez(
                 npz_file,
@@ -131,7 +131,7 @@ def cache_traces(specs, provider, cache_dir, overwrite=False):
             "name": name,
             "condition": condition,
             "fs": fs,
-            "length": int(trace.shape[0]),
+            "length": int(trace.shape[-1]),
             "file": npz_file.name,
         })
 

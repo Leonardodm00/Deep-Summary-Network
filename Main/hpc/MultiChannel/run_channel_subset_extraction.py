@@ -83,14 +83,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     center_mfr = np.array([s.center_mfr for s in diag.subregions], dtype=np.float64)
     discarded = np.array(diag.discarded, dtype=np.int64)
 
-    npz_path = os.path.join(args.out_dir, "traces.npz")
-    np.savez_compressed(
-        npz_path,
-        X=X, row_meaning=row_meaning, in_channels=in_channels, n_samples=n_samples,
+    meta = dict(
         fs_ifr=float(fs_ifr), mode=args.mode, index_base=int(diag.index_base),
         grid_width=int(diag.grid_width), T_rec=float(diag.T_rec),
         n_samples_raw=int(diag.n_samples), n_present=int(diag.n_present),
         centers=centers, center_mfr=center_mfr, discarded=discarded)
+
+    # The pipeline's NumpyTraceProvider reads the array under the key
+    # "ifr_trace"; "X" is kept as the extractor's own historical name so the
+    # viz code and the stage smoke tests keep working. Both name the SAME array.
+    npz_path = os.path.join(args.out_dir, "traces.npz")
+    np.savez_compressed(
+        npz_path, X=X, ifr_trace=X, row_meaning=row_meaning,
+        in_channels=in_channels, n_samples=n_samples, **meta)
+    written = [npz_path]
+
+    # mode == "per_region_single": the C rows are INDEPENDENT single-channel
+    # samples, not channels of one sample. Each becomes its own trace record,
+    # so one .npz per subregion is written alongside the combined file. Every
+    # sibling carries the SAME culture_id (the recording), which is what keeps
+    # them out of each other's positive pairs downstream.
+    if args.mode == "per_region_single":
+        culture_id = os.path.basename(os.path.normpath(args.folder))
+        for r in range(int(X.shape[0])):
+            row = np.ascontiguousarray(X[r], dtype=np.float32)      # (K,)
+            rp = os.path.join(args.out_dir, "trace_subregion_%02d.npz" % r)
+            np.savez_compressed(
+                rp, X=row, ifr_trace=row, row_meaning="samples",
+                in_channels=1, n_samples=1, subregion_index=int(r),
+                culture_id=culture_id, **meta)
+            written.append(rp)
 
     if (not args.no_plots) and diag.subregions:
         from channel_subset_viz import plot_subregion_ifrs, plot_subregion_map
