@@ -306,8 +306,20 @@ class LatentConfig:
                     holds only ~3-12 bursts and a duration CV cannot be estimated
                     from so few. Do not revert to one label axis without
                     re-running that calibration.
-    class_center_mode : where the class centres m_c sit along a label axis.
-                    "interior" (DEFAULT) places them at m_c = (c+1)/(C+1), so at
+    class_center_mode : where the class centres sit in the label subspace.
+                    "simplex" (DEFAULT) gives each class a DIFFERENT centre on
+                    EACH label axis, placed at the vertices of a regular
+                    simplex. The other two modes return ONE SCALAR per class and
+                    replicate it across every label axis, so all C centres lie
+                    on the diagonal and rank Cov({mu_c}) = 1 whatever C and L
+                    are -- the centres are collinear, and any objective asking
+                    for an ARRANGEMENT of centres (the NC2 separation term) is
+                    asking for a geometry the data does not contain. "simplex"
+                    reaches the maximum achievable rank min(L, C-1) with
+                    pairwise cosine -1/(C-1). NOTE the centre-to-centre spacing
+                    differs from "interior", so class_overlap (tau) should be
+                    re-measured rather than carried over.
+                    "interior" places them at m_c = (c+1)/(C+1), so at
                     C = 3 they are 0.25, 0.50, 0.75 and none touches a boundary
                     of [0, 1]. "endpoints" reproduces the original
                     m_c = c/(C-1) = 0, 0.5, 1, whose OUTER centres sit exactly
@@ -332,7 +344,7 @@ class LatentConfig:
         "intraburst_rate", "participation", "background")
     label_axes: Tuple[int, ...] = (0, 1)
     class_overlap: float = 0.10
-    class_center_mode: str = "interior"
+    class_center_mode: str = "simplex"
     n_neurons: int = 100
     gaussian_window: float = 0.04
     axis_overrides: Tuple[LatentAxisOverride, ...] = ()
@@ -364,10 +376,10 @@ class LatentConfig:
                 RuntimeWarning)
         if self.class_overlap < 0.0:
             raise ValueError("latent.class_overlap (tau) must be >= 0")
-        if self.class_center_mode not in ("interior", "endpoints"):
+        if self.class_center_mode not in ("simplex", "interior", "endpoints"):
             raise ValueError(
-                "latent.class_center_mode must be 'interior' or 'endpoints'; "
-                "got %r" % (self.class_center_mode,))
+                "latent.class_center_mode must be 'simplex', 'interior' or "
+                "'endpoints'; got %r" % (self.class_center_mode,))
         if int(self.n_neurons) < 1:
             raise ValueError("latent.n_neurons must be >= 1")
         if float(self.gaussian_window) <= 0.0:
@@ -648,7 +660,13 @@ class TrainConfig:
     # negative sits inside the margin band from BOTH the anchor and the
     # positive. Acts on WHICH triplets are used; swap acts on how they are
     # SCORED, so the two are not substitutes.
-    strict_semihard: bool = True
+    # DEFAULT FALSE, deliberately. The filter requires D_ap < D_an, which is
+    # the exact complement of what mining_strategy="hard" (the default miner)
+    # produces, so defaulting it True would make TrainConfig(loss_type="joint")
+    # an error out of the box -- and, before the guard below existed, a silent
+    # zero-gradient run. Enable it together with
+    # mining_strategy="easy_pos_semihard_neg".
+    strict_semihard: bool = False
     # weight on the centroid-separation term (loss_type = "joint_sep" only).
     # SCALE WARNING: L_sep has very different magnitudes either side of C = 3,
     # because at C = 2 it is computed on RAW class means and at C >= 3 on
@@ -740,6 +758,25 @@ class TrainConfig:
             raise ValueError(
                 "sep_gate_threshold is a silhouette and must lie in [-1, 1] "
                 "or be None; got %r" % (self.sep_gate_threshold,))
+        if (self.loss_type in ("joint", "joint_sep")
+                and self.strict_semihard
+                and self.mining_strategy == "hard"):
+            # PROVABLY EMPTY, and silently so. TripletMarginMiner with
+            # type_of_triplets="hard" returns exactly the triplets whose
+            # negative is CLOSER than the positive (D_an < D_ap); the strict
+            # semi-hard filter of Eq. (6) keeps only those with D_ap < D_an.
+            # The intersection is empty by construction, so every batch yields
+            # n_strict = 0, n_active = 0 and train_loss = 0.0: the network
+            # never receives a gradient and the run looks stable rather than
+            # broken. MEASURED: 16814 mined, 0 surviving.
+            raise ValueError(
+                "mining_strategy='hard' and strict_semihard=True are mutually "
+                "exclusive: 'hard' mines D_an < D_ap while the strict "
+                "semi-hard filter requires D_ap < D_an, so NO triplet ever "
+                "survives and the loss is identically zero. Use "
+                "mining_strategy='easy_pos_semihard_neg' (semi-hard negatives, "
+                "compatible with the filter) or set strict_semihard=False to "
+                "keep hard mining.")
         if self.loss_type != "joint_sep" and self.lambda_sep != 0.1:
             warnings.warn(
                 "lambda_sep=%g is INERT under loss_type=%r: the separation term "
