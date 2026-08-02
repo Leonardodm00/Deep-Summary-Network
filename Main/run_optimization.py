@@ -1212,7 +1212,7 @@ def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
     if getattr(cfg.search, "search_mode", "staged") == "joint":
         res_j = S.search_joint(work, splits, device, verbose=verbose,
                                train_verbose=trial_verbose)
-        best_j = S.best_joint_dict(res_j)
+        best_j = S.best_joint_dict(res_j, cfg.train)
         work = S.config_from_joint_point(work, res_j.x)
         report = {
             "search_mode": "joint",
@@ -1247,14 +1247,18 @@ def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
           % (work.search.n_calls_train, Ns))
     res2 = S.search_training(work, splits, device, best_arch, verbose=verbose,
                              train_verbose=trial_verbose)
-    best_train = S.best_train_dict(res2)        # betas already converted: b = 1 - u
+    best_train = S.best_train_dict(res2, cfg.train)        # betas already converted: b = 1 - u
+    # only the loss HPs this loss_type actually searched are written back;
+    # the others keep their configured (fixed) values
+    _loss_updates = {k: float(best_train[k])
+                     for k in S.loss_hp_names(cfg.train)}
     work.train = replace(
         work.train,
-        margin=float(best_train["margin"]),
         lr=float(best_train["lr"]),
         beta1=float(best_train["beta1"]),
         beta2=float(best_train["beta2"]),
         weight_decay=float(best_train["weight_decay"]),
+        **_loss_updates
     )
     work.validate()
     report["phase2_train"] = {

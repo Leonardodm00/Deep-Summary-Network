@@ -109,6 +109,96 @@ def preflight(path, verbose=True):
                      "split and geometry arithmetic below is SKIPPED."
                      % (d.data_mode,))
 
+    # ---- objective feasibility -------------------------------------------- #
+    # The margin demands that the closest class pair sit at least m_cos apart in
+    # cosine distance. The largest achievable MINIMUM pairwise cosine distance
+    # over C classes on the unit hypersphere is C/(C-1), so the margin implies
+    #
+    #     S >= m_cos * (C - 1) / C                                        (7)
+    #
+    # on the mean silhouette.
+    #
+    # NO PRACTICAL CEILING IS IMPOSED ON S. An earlier version of this guard
+    # refused any margin implying S >= 0.8, on the grounds that the archived
+    # cells only ever reached 0.424 to 0.556. That calibration is NOT a property
+    # of the geometry: every one of those runs used an ANTI-COLLAPSE mining
+    # strategy (easy positives, chosen precisely so that same-class windows are
+    # not dragged to a single point), so 0.556 describes what is reachable while
+    # actively resisting within-class collapse, not what is reachable at all.
+    # Under a collapse-SEEKING configuration -- hard mining, small alpha, the
+    # NC2 separation term -- a high S is the OBJECTIVE, not a red flag, and
+    # S -> 1 is the intended terminal state (NC1 in Papyan et al.'s decomposition,
+    # of which L_sep implements only NC2).
+    #
+    # What remains is the one bound that is arithmetic rather than judgement:
+    # S <= 1 always, so a margin demanding more than that cannot be met by any
+    # embedding whatsoever. That is the only case still refused.
+    lines.append("")
+    lines.append("OBJECTIVE")
+    lines.append("  loss_type=%s  mining=%s  swap=%s  strict_semihard=%s"
+                 % (t.loss_type, t.mining_strategy, t.swap, t.strict_semihard))
+    s_req = float(t.margin) * (C - 1) / float(C)
+    lines.append("  margin m_cos = %.4g at C = %d  ->  implies silhouette "
+                 ">= %.4g" % (t.margin, C, s_req))
+    if s_req > 1.0:
+        problems["raise"].append(
+            "margin %.3f implies silhouette >= %.3f at C = %d, and the "
+            "silhouette is bounded above by 1: no embedding can satisfy this "
+            "objective. Lower train.margin below %.3f."
+            % (t.margin, s_req, C, float(C) / (C - 1)))
+    if t.loss_type == "triplet":
+        # the FIXED margin is only the starting point: under "triplet" the
+        # margin is SEARCHED, so the binding number is the TOP of margin_range
+        m_hi = float(cfg.search.margin_range[1])
+        s_hi = m_hi * (C - 1) / float(C)
+        lines.append("  margin_range high = %.4g (SEARCHED)  ->  worst-case "
+                     "implied silhouette >= %.4g" % (m_hi, s_hi))
+        if s_hi > 1.0:
+            problems["raise"].append(
+                "search.margin_range high %.3f lets phase 2 sample a margin "
+                "implying silhouette >= %.3f at C = %d, which exceeds the "
+                "silhouette's upper bound of 1. Lower the range high below "
+                "%.3f." % (m_hi, s_hi, C, float(C) / (C - 1)))
+    if t.loss_type in ("joint", "joint_sep"):
+        # the angular hinge is exactly a silhouette floor: S >= 1 - 4 sin^2 alpha
+        floor = 1.0 - 4.0 * math.sin(math.radians(float(t.angular_alpha_deg))) ** 2
+        lines.append("  angular alpha = %.4g deg  ->  silhouette floor "
+                     "S >= %.4g  (tolerated a/b <= %.4g)"
+                     % (t.angular_alpha_deg, floor, 1.0 - floor))
+        if floor <= 0.0:
+            problems["warn"].append(
+                "angular_alpha_deg = %.4g gives a silhouette floor of %.3g: the "
+                "angular term is VACUOUS at this angle on L2-normalised "
+                "embeddings and will contribute no gradient. Lower alpha; "
+                "SMALL alpha is the collapse-forcing direction."
+                % (t.angular_alpha_deg, floor))
+        # alpha is the within-class collapse knob: the floor S >= 1 - 4 sin^2
+        # alpha rises monotonically as alpha falls, and alpha -> 0 demands
+        # a/b -> 0, i.e. exact within-class collapse (NC1).
+        if t.mining_strategy in ("easy_positive", "easy_pos_semihard_neg"):
+            problems["warn"].append(
+                "mining_strategy=%r is an ANTI-COLLAPSE strategy: easy "
+                "positives require only the CLOSEST same-class window to be "
+                "near, which is what lets a class spread over a manifold. It "
+                "works against the angular floor (S >= %.3g) and against the "
+                "NC2 separation term. Use mining_strategy='hard' for a "
+                "collapse-seeking run."
+                % (t.mining_strategy, floor))
+    if t.loss_type == "joint_sep":
+        lines.append("  lambda_sep = %.4g  gate_threshold = %s  "
+                     "(sep means: %s)"
+                     % (t.lambda_sep,
+                        "none (always on)" if t.sep_gate_threshold is None
+                        else "%.4g" % t.sep_gate_threshold,
+                        "raw" if C == 2 else "centred"))
+        if C == 2 and t.lambda_sep > 0.05:
+            problems["warn"].append(
+                "at C = 2 the separation term is computed on RAW class means "
+                "and its natural scale is roughly 30x larger than at C >= 3, so "
+                "lambda_sep = %.3g is likely far too strong. Search "
+                "search.lambda_sep_range rather than reusing a C = 3 value."
+                % (t.lambda_sep,))
+
     # ---- split arithmetic (trace mode only; time_segment cuts the time axis) --
     lines.append("")
     lines.append("SPLIT")

@@ -42,7 +42,7 @@ import json
 import warnings
 from dataclasses import dataclass, field, fields, is_dataclass, asdict, replace
 from pathlib import Path
-from typing import Tuple, get_type_hints, get_origin, get_args
+from typing import Optional, Tuple, get_type_hints, get_origin, get_args
 
 from backbone import BackboneConfig
 from augmentation import AugmentationConfig
@@ -602,13 +602,71 @@ class TrainConfig:
     """Trainer settings used identically by the HPO objective and the final run."""
 
     # --- loss / miner ---
-    margin: float = 0.3                     # loss margin m (searched in phase 2; default / fixed value)
+    # Which objective. ADDITIVE: "triplet" is the pre-existing behaviour and the
+    # default, so every archived config reproduces byte-identically.
+    #   "triplet"   : losses.TripletMarginLoss (margin searched, as before)
+    #   "joint"     : dsn_joint_loss.JointTripletLoss -- margin hinge PLUS the
+    #                 angular hinge, optionally on strict-semi-hard triplets.
+    #                 margin is FIXED and angular_alpha_deg is searched instead:
+    #                 both bind on the within/between ratio, so searching the
+    #                 pair moves along a ridge (see the loss handoff, S3.4).
+    #   "joint_sep" : the above PLUS the gated CentroidSeparationLoss.
+    loss_type: str = "triplet"
+    margin: float = 0.3                     # loss margin m, COSINE convention.
+                                            # Searched under "triplet"; FIXED
+                                            # under "joint" / "joint_sep".
     swap: bool = True                       # TripletMarginLoss swap
     # "hard"                  : TripletMarginMiner(type_of_triplets="hard") --
-    #                           positives FARTHER than negatives (violating triplets)
+    #                           positives FARTHER than negatives (violating
+    #                           triplets). The COLLAPSE-SEEKING choice: every
+    #                           same-class pair is pulled together, so within-
+    #                           class variance is driven down (NC1).
     # "easy_positive"         : BatchEasyHardMiner(pos=easy, neg=hard)
     # "easy_pos_semihard_neg" : BatchEasyHardMiner(pos=easy, neg=semihard)
+    #
+    # The two easy-positive strategies are ANTI-COLLAPSE by design: they require
+    # only the CLOSEST same-class window to be near the anchor, which is exactly
+    # what allows a class to spread over a manifold instead of contracting to a
+    # point. That is the right choice when within-class structure must be
+    # preserved and the WRONG one when collapse is the goal. preflight_config
+    # warns when an easy-positive strategy is paired with the composite loss.
     mining_strategy: str = "hard"
+
+    # --- composite objective (used only when loss_type != "triplet") ---
+    # angular constraint alpha, in DEGREES. Equivalent to a silhouette floor
+    # S >= 1 - 4 sin^2(alpha), which is why it is the parameter that is
+    # searched. Chung and Lee's {30, 45, 60, 75} are VACUOUS on L2-normalised
+    # embeddings: every one of them is already satisfied at this pipeline's
+    # operating point, so the term would contribute no gradient.
+    # SMALL alpha is the collapse-forcing direction: the floor rises
+    # monotonically as alpha falls (5 deg -> S >= 0.970, 2 deg -> S >= 0.995),
+    # and alpha -> 0 demands a/b -> 0, i.e. exact within-class collapse. Pair a
+    # small alpha with mining_strategy="hard"; an easy-positive miner will fight
+    # it.
+    angular_alpha_deg: float = 18.0
+    # strict semi-hard filter (Chung and Lee): keep a triplet only when the
+    # negative sits inside the margin band from BOTH the anchor and the
+    # positive. Acts on WHICH triplets are used; swap acts on how they are
+    # SCORED, so the two are not substitutes.
+    strict_semihard: bool = True
+    # weight on the centroid-separation term (loss_type = "joint_sep" only).
+    # SCALE WARNING: L_sep has very different magnitudes either side of C = 3,
+    # because at C = 2 it is computed on RAW class means and at C >= 3 on
+    # CENTRED ones. On random unit embeddings the median is ~0.98 at C = 2 and
+    # ~0.03 at C = 3. One fixed value cannot serve both, which is why
+    # lambda_sep is searched (search.lambda_sep_range) rather than pinned.
+    lambda_sep: float = 0.1
+    # the separation term is GATED on a running estimate of the TRAINING cosine
+    # silhouette, and switches on mid-epoch at the batch where the estimate
+    # first reaches this threshold. None means "no gate": the term is active
+    # from the first batch, which is the control arm.
+    sep_gate_threshold: Optional[float] = None
+    # EMA coefficient for that running estimate. 0.0 means a cumulative mean
+    # over every batch seen instead of an EMA.
+    sep_gate_momentum: float = 0.05
+    # batches that must be seen before the gate may latch. Guards against
+    # latching on one lucky early batch at 9 rows per class.
+    sep_gate_min_batches: int = 20
 
     # --- batching (ConditionBalancedBatchSampler; added in Stage 5) ---
     # windows_per_condition = B_c: windows drawn from EACH phenotype class per
@@ -661,6 +719,32 @@ class TrainConfig:
                 "'easy_pos_semihard_neg'; got %r" % (self.mining_strategy,))
         if self.margin <= 0.0:
             raise ValueError("margin must be > 0")
+        if self.loss_type not in ("triplet", "joint", "joint_sep"):
+            raise ValueError(
+                "loss_type must be 'triplet', 'joint' or 'joint_sep'; got %r"
+                % (self.loss_type,))
+        if not (0.0 < self.angular_alpha_deg < 90.0):
+            raise ValueError(
+                "angular_alpha_deg must lie in (0, 90); got %r"
+                % (self.angular_alpha_deg,))
+        if self.lambda_sep < 0.0:
+            raise ValueError("lambda_sep must be >= 0")
+        if not (0.0 <= self.sep_gate_momentum <= 1.0):
+            raise ValueError(
+                "sep_gate_momentum must lie in [0, 1] (0 = cumulative mean); "
+                "got %r" % (self.sep_gate_momentum,))
+        if self.sep_gate_min_batches < 1:
+            raise ValueError("sep_gate_min_batches must be >= 1")
+        if (self.sep_gate_threshold is not None
+                and not (-1.0 <= float(self.sep_gate_threshold) <= 1.0)):
+            raise ValueError(
+                "sep_gate_threshold is a silhouette and must lie in [-1, 1] "
+                "or be None; got %r" % (self.sep_gate_threshold,))
+        if self.loss_type != "joint_sep" and self.lambda_sep != 0.1:
+            warnings.warn(
+                "lambda_sep=%g is INERT under loss_type=%r: the separation term "
+                "is only built for 'joint_sep'."
+                % (self.lambda_sep, self.loss_type), RuntimeWarning)
         if self.lr <= 0.0:
             raise ValueError("lr must be > 0")
         if not (0.0 < self.beta1 < 1.0) or not (0.0 < self.beta2 < 1.0):
@@ -725,7 +809,25 @@ class SearchConfig:
     embedding_size_range: Tuple[int, int] = (8, 16)            # Integer es
 
     # --- phase 2: training HPs ---
+    # margin_range is used only when train.loss_type == "triplet". Under
+    # "joint"/"joint_sep" the margin is FIXED and angular_alpha_deg_range is
+    # searched in its place; the field is kept so archived configs still load
+    # and so the two loss types remain runnable from the same file.
     margin_range: Tuple[float, float] = (0.1, 1.0)             # Real m
+    # searched INSTEAD of margin_range under "joint"/"joint_sep". NOT Chung and
+    # Lee's {30, 45, 60, 75}: those were chosen for UNNORMALISED embeddings and
+    # are all vacuous on the unit hypersphere here (the floor goes non-positive
+    # at 30 deg). The LOW end is the collapse-forcing end -- the implied
+    # silhouette floor is 0.970 at 5 deg and 0.995 at 2 deg -- so the range
+    # extends to 2 deg to leave the search room to ask for near-total
+    # within-class collapse. Raise the low bound to 5.0 to reproduce the
+    # pre-collapse setting.
+    angular_alpha_deg_range: Tuple[float, float] = (2.0, 20.0)  # Real alpha
+    # searched ADDITIONALLY under "joint_sep". Log-uniform, and deliberately
+    # wide: the natural scale of L_sep differs by more than an order of
+    # magnitude between C = 2 (raw class means) and C >= 3 (centred), so a
+    # linear prior centred on the C >= 3 value would barely reach the C = 2 one.
+    lambda_sep_range: Tuple[float, float] = (1e-3, 1.0)        # log-uniform
     lr_range: Tuple[float, float] = (1e-4, 0.2)               # log-uniform
     one_minus_beta1_range: Tuple[float, float] = (1e-2, 1e-1)  # log-uniform -> b1 in [0.9, 0.99]
     one_minus_beta2_range: Tuple[float, float] = (1e-4, 1e-2)  # log-uniform -> b2 in [0.99, 0.9999]
@@ -819,6 +921,12 @@ class SearchConfig:
                 b not in (0, 1) for b in self.block_family_choices):
             raise ValueError("block_family_choices must be a non-empty subset of {0, 1}")
         _check("margin_range", self.margin_range, positive=True)
+        _check("angular_alpha_deg_range", self.angular_alpha_deg_range,
+               positive=True)
+        if self.angular_alpha_deg_range[1] >= 90.0:
+            raise ValueError(
+                "angular_alpha_deg_range high must be < 90 degrees")
+        _check("lambda_sep_range", self.lambda_sep_range, positive=True)
         _check("lr_range", self.lr_range, positive=True)
         _check("one_minus_beta1_range", self.one_minus_beta1_range, positive=True)
         _check("one_minus_beta2_range", self.one_minus_beta2_range, positive=True)

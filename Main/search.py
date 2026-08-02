@@ -150,6 +150,9 @@ __all__ = [
     "get_newspace",
     "best_arch_dict",
     "best_train_dict",
+    "loss_hp_names",
+    "train_names",
+    "joint_names",
     "config_from_arch_point",
     "config_from_train_point",
     "selected_epoch_index",
@@ -181,6 +184,69 @@ _ARCH_NAMES = ("depth_exponent", "width_multiplier", "block_family", "embedding_
 _TRAIN_NAMES = ("margin", "lr", "one_minus_beta1", "one_minus_beta2", "weight_decay")
 _REG_NAMES = ("dropout", "weight_decay")
 
+# the four optimizer HPs every loss type searches, in their fixed order
+_OPT_NAMES = ("lr", "one_minus_beta1", "one_minus_beta2", "weight_decay")
+
+
+def loss_hp_names(train_cfg=None):
+    """The LOSS hyper-parameters searched in phase 2, for a given loss type.
+
+    This is the single place that decides which loss HPs are searched, so the
+    space, the point->config writer and the winner reader can never disagree
+    about the meaning of a coordinate.
+
+        "triplet"   -> ("margin",)                 the pre-existing behaviour
+        "joint"     -> ("angular_alpha_deg",)      margin is FIXED instead
+        "joint_sep" -> ("angular_alpha_deg", "lambda_sep")
+
+    margin and angular_alpha_deg are never searched together: both bind on the
+    within/between distance ratio, so the pair is close to unidentifiable and
+    the search would spend trials moving along a ridge.
+    """
+    loss_type = "triplet" if train_cfg is None else \
+        str(getattr(train_cfg, "loss_type", "triplet"))
+    if loss_type == "triplet":
+        return ("margin",)
+    if loss_type == "joint":
+        return ("angular_alpha_deg",)
+    if loss_type == "joint_sep":
+        return ("angular_alpha_deg", "lambda_sep")
+    raise ValueError("unknown loss_type %r" % (loss_type,))
+
+
+def train_names(train_cfg=None):
+    """Names of the phase-2 dimensions, in the order train_space returns them."""
+    return tuple(loss_hp_names(train_cfg)) + _OPT_NAMES
+
+
+def _loss_dims(search_cfg, train_cfg):
+    """skopt dimensions for the loss HPs of the configured loss type."""
+    dims = []
+    for name in loss_hp_names(train_cfg):
+        if name == "margin":
+            lo, hi = search_cfg.margin_range
+            dims.append(Real(float(lo), float(hi), name="margin"))
+        elif name == "angular_alpha_deg":
+            lo, hi = search_cfg.angular_alpha_deg_range
+            dims.append(Real(float(lo), float(hi), name="angular_alpha_deg"))
+        elif name == "lambda_sep":
+            lo, hi = search_cfg.lambda_sep_range
+            dims.append(Real(float(lo), float(hi), prior="log-uniform",
+                             name="lambda_sep"))
+        else:
+            raise ValueError("unhandled loss HP %r" % (name,))
+    return dims
+
+
+def _write_loss_hps(cfg, p):
+    """Write whichever loss HPs the point carries into cfg.train."""
+    if "margin" in p:
+        cfg.train.margin = float(p["margin"])
+    if "angular_alpha_deg" in p:
+        cfg.train.angular_alpha_deg = float(p["angular_alpha_deg"])
+    if "lambda_sep" in p:
+        cfg.train.lambda_sep = float(p["lambda_sep"])
+
 
 # --------------------------------------------------------------------------- #
 # spaces
@@ -203,16 +269,19 @@ def arch_space(search_cfg):
     ]
 
 
-def train_space(search_cfg):
-    """The 5-HP training space (phase 2). The betas are searched as (1 - beta) in
-    LOG space and converted back with beta = 1 - u when the config is built."""
-    lo_m, hi_m = search_cfg.margin_range
+def train_space(search_cfg, train_cfg=None):
+    """The training space (phase 2). The betas are searched as (1 - beta) in
+    LOG space and converted back with beta = 1 - u when the config is built.
+
+    Dimensionality depends on train_cfg.loss_type: 5 dims for "triplet" (the
+    pre-existing space, unchanged), 5 for "joint" (alpha replaces margin), 6
+    for "joint_sep" (alpha and lambda_sep). train_cfg=None reproduces the
+    legacy 5-dim margin space exactly, so old callers are unaffected."""
     lo_lr, hi_lr = search_cfg.lr_range
     lo_b1, hi_b1 = search_cfg.one_minus_beta1_range
     lo_b2, hi_b2 = search_cfg.one_minus_beta2_range
     lo_wd, hi_wd = search_cfg.weight_decay_range
-    return [
-        Real(float(lo_m), float(hi_m), name="margin"),
+    return _loss_dims(search_cfg, train_cfg) + [
         Real(float(lo_lr), float(hi_lr), prior="log-uniform", name="lr"),
         Real(float(lo_b1), float(hi_b1), prior="log-uniform", name="one_minus_beta1"),
         Real(float(lo_b2), float(hi_b2), prior="log-uniform", name="one_minus_beta2"),
@@ -366,7 +435,7 @@ def config_from_train_point(base_cfg, point, arch=None):
 
     The beta conversion happens HERE and nowhere else: the search samples
     u = 1 - beta in log space, and the config stores beta = 1 - u."""
-    p = dict(zip(_TRAIN_NAMES, point))
+    p = dict(zip(train_names(base_cfg.train), point))
     cfg = _deep_copy_cfg(base_cfg)
     if arch is not None:
         cfg.backbone = replace(
@@ -376,7 +445,7 @@ def config_from_train_point(base_cfg, point, arch=None):
             block_family=int(arch["block_family"]),
             embedding_size=int(arch["embedding_size"]),
         )
-    cfg.train.margin = float(p["margin"])
+    _write_loss_hps(cfg, p)
     cfg.train.lr = float(p["lr"])
     cfg.train.beta1 = 1.0 - float(p["one_minus_beta1"])   # beta = 1 - u
     cfg.train.beta2 = 1.0 - float(p["one_minus_beta2"])
@@ -685,7 +754,7 @@ def best_arch_dict(res):
 def search_training(cfg, splits, device, best_arch, verbose=False,
                     train_verbose=False):
     """PHASE 2: fix the architecture to best_arch, search the 5 TRAINING HPs."""
-    space = train_space(cfg.search)
+    space = train_space(cfg.search, cfg.train)
 
     def build(base_cfg, point):
         return config_from_train_point(base_cfg, point, arch=best_arch)
@@ -701,16 +770,21 @@ def search_training(cfg, splits, device, best_arch, verbose=False,
         train_verbose=train_verbose)
 
 
-def best_train_dict(res):
-    """Name the winning training point, converting the betas back: beta = 1 - u."""
-    p = dict(zip(_TRAIN_NAMES, res.x))
-    return {
-        "margin": float(p["margin"]),
+def best_train_dict(res, train_cfg=None):
+    """Name the winning training point, converting the betas back: beta = 1 - u.
+
+    train_cfg selects which loss HPs the point carries; None reproduces the
+    legacy margin-only reading."""
+    p = dict(zip(train_names(train_cfg), res.x))
+    out = {
         "lr": float(p["lr"]),
         "beta1": 1.0 - float(p["one_minus_beta1"]),
         "beta2": 1.0 - float(p["one_minus_beta2"]),
         "weight_decay": float(p["weight_decay"]),
     }
+    for name in loss_hp_names(train_cfg):
+        out[name] = float(p[name])
+    return out
 
 
 def retune_architecture(cfg, splits, device, res_arch, verbose=False,
@@ -781,8 +855,14 @@ _JOINT_NAMES = ("depth_exponent", "width_multiplier", "block_family",
                 "one_minus_beta2", "weight_decay", "dropout")
 
 
-def joint_space(search_cfg, reg_cfg):
-    """ALL hyper-parameters in ONE 10-dimensional space.
+def joint_names(train_cfg=None):
+    """Names of the joint-space dimensions, in the order joint_space builds them."""
+    return (_ARCH_NAMES + tuple(loss_hp_names(train_cfg)) + _OPT_NAMES
+            + ("dropout",))
+
+
+def joint_space(search_cfg, reg_cfg, train_cfg=None):
+    """ALL hyper-parameters in ONE space (10 dims for the legacy triplet loss).
 
     The staged pipeline searches 4 dims (architecture), then 5 (training HPs) with
     the architecture frozen at the phase-1 winner, then 2 (regularization) with both
@@ -810,7 +890,6 @@ def joint_space(search_cfg, reg_cfg):
     lo_d, hi_d = search_cfg.depth_exponent_range
     lo_w, hi_w = search_cfg.width_multiplier_range
     lo_e, hi_e = search_cfg.embedding_size_range
-    lo_m, hi_m = search_cfg.margin_range
     lo_lr, hi_lr = search_cfg.lr_range
     lo_b1, hi_b1 = search_cfg.one_minus_beta1_range
     lo_b2, hi_b2 = search_cfg.one_minus_beta2_range
@@ -821,7 +900,7 @@ def joint_space(search_cfg, reg_cfg):
         Real(float(lo_w), float(hi_w), name="width_multiplier"),
         Categorical(list(search_cfg.block_family_choices), name="block_family"),
         Integer(int(lo_e), int(hi_e), name="embedding_size"),
-        Real(float(lo_m), float(hi_m), name="margin"),
+    ] + _loss_dims(search_cfg, train_cfg) + [
         Real(float(lo_lr), float(hi_lr), prior="log-uniform", name="lr"),
         Real(float(lo_b1), float(hi_b1), prior="log-uniform", name="one_minus_beta1"),
         Real(float(lo_b2), float(hi_b2), prior="log-uniform", name="one_minus_beta2"),
@@ -839,7 +918,7 @@ def config_from_joint_point(base_cfg, point):
     identity is what makes the two modes comparable at all, and the smoke test
     asserts it rather than trusting it.
     """
-    p = dict(zip(_JOINT_NAMES, point))
+    p = dict(zip(joint_names(base_cfg.train), point))
     cfg = _deep_copy_cfg(base_cfg)
     cfg.backbone = replace(
         cfg.backbone,
@@ -849,7 +928,7 @@ def config_from_joint_point(base_cfg, point):
         embedding_size=int(p["embedding_size"]),
         dropout=float(p["dropout"]),
     )
-    cfg.train.margin = float(p["margin"])
+    _write_loss_hps(cfg, p)
     cfg.train.lr = float(p["lr"])
     cfg.train.beta1 = 1.0 - float(p["one_minus_beta1"])
     cfg.train.beta2 = 1.0 - float(p["one_minus_beta2"])
@@ -869,9 +948,9 @@ def resolve_n_calls_joint(search_cfg, reg_cfg):
             + int(reg_cfg.n_calls))
 
 
-def best_joint_dict(res):
-    """The winning joint point as a dict of the 10 HP names."""
-    return dict(zip(_JOINT_NAMES, res.x))
+def best_joint_dict(res, train_cfg=None):
+    """The winning joint point as a dict of HP names, ordered by joint_names."""
+    return dict(zip(joint_names(train_cfg), res.x))
 
 
 def search_joint(cfg, splits, device, verbose=False, train_verbose=False):
@@ -886,12 +965,12 @@ def search_joint(cfg, splits, device, verbose=False, train_verbose=False):
     if verbose:
         print("[joint] single-stage search over %d dimensions, %d trials "
               "(staged total would be %d + %d + %d = %d)"
-              % (len(_JOINT_NAMES), n_calls, cfg.search.n_calls_arch,
+              % (len(joint_names(cfg.train)), n_calls, cfg.search.n_calls_arch,
                  cfg.search.n_calls_train, cfg.regularization.n_calls,
                  int(cfg.search.n_calls_arch) + int(cfg.search.n_calls_train)
                  + int(cfg.regularization.n_calls)))
     return _run_gp(
-        space=joint_space(cfg.search, cfg.regularization),
+        space=joint_space(cfg.search, cfg.regularization, cfg.train),
         base_cfg=cfg, splits=splits, device=device,
         n_calls=n_calls,
         random_state=int(cfg.search.gp_random_state),
