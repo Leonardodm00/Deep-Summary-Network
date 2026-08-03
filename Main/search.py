@@ -132,6 +132,14 @@ from skopt import gp_minimize
 from skopt.space import Categorical, Integer, Real
 from skopt.utils import use_named_args
 
+from condition_space import (
+    LOSS_HP_SUPERSET,
+    active_loss_hps,
+    cell_name,
+    decode_head_fusion,
+    decode_head_pool_ops,
+    project_condition,
+)
 from config import ExperimentConfig
 from objective_utils import (
     adaptive_epsilon,
@@ -168,6 +176,14 @@ __all__ = [
     "search_joint",
     "best_joint_dict",
     "resolve_n_calls_joint",
+    "joint_condition_names",
+    "joint_condition_space",
+    "project_joint_condition_point",
+    "config_from_joint_condition_point",
+    "best_joint_condition_dict",
+    "annotate_joint_condition_point",
+    "search_joint_conditions",
+    "resolve_n_initial_points_joint",
     "config_from_reg_point",
     "search_regularization",
     "best_reg_dict",
@@ -187,31 +203,53 @@ _REG_NAMES = ("dropout", "weight_decay")
 # the four optimizer HPs every loss type searches, in their fixed order
 _OPT_NAMES = ("lr", "one_minus_beta1", "one_minus_beta2", "weight_decay")
 
+# Loss HPs that belong to A(l) -- the composite loss READS them -- but that the
+# STAGED phase 2 never searched. Excluding them from the staged name list is
+# what keeps loss_hp_names(train_cfg) byte-compatible with every archived
+# staged run: phase 2 searched (angular_alpha_deg, lambda_sep) under
+# "joint_sep", and sep_centre_means postdates that pipeline entirely (before
+# this design it was not even reachable from a config file).
+_STAGED_EXCLUDED_LOSS_HPS = ("sep_centre_means",)
 
-def loss_hp_names(train_cfg=None):
-    """The LOSS hyper-parameters searched in phase 2, for a given loss type.
 
-    This is the single place that decides which loss HPs are searched, so the
-    space, the point->config writer and the winner reader can never disagree
-    about the meaning of a coordinate.
+def loss_hp_names(train_cfg=None, superset=False):
+    """The LOSS hyper-parameters of the space, for a given loss type.
+
+    This is the single place that decides which loss HPs a space carries, so
+    the space, the point->config writer and the winner reader can never
+    disagree about the meaning of a coordinate.
+
+    superset=False (DEFAULT, and every pre-existing caller) returns the names
+    the STAGED phase 2 searches, i.e. A(l) minus the axes that phase predates:
 
         "triplet"   -> ("margin",)                 the pre-existing behaviour
         "joint"     -> ("angular_alpha_deg",)      margin is FIXED instead
         "joint_sep" -> ("angular_alpha_deg", "lambda_sep")
 
-    margin and angular_alpha_deg are never searched together: both bind on the
-    within/between distance ratio, so the pair is close to unidentifiable and
-    the search would spend trials moving along a ridge.
+    margin and angular_alpha_deg are never BOTH active: both bind on the
+    within/between distance ratio, so a space carrying the pair would spend
+    trials moving along a ridge.
+
+    superset=True returns the STATIC superset, independent of train_cfg. It
+    exists because gp_minimize needs a fixed-length vector: once loss_type is
+    itself a searched coordinate, every point must carry every loss HP, and the
+    ones outside A(l) are INACTIVE for that trial (decision D1 -- see
+    _write_loss_hps, which is what keeps them from reaching the config).
+
+    NOTE ON THE DEFAULT. The handoff specifies "loss_hp_names becomes the
+    static superset". Making that unconditional would silently widen the STAGED
+    phase-2 space -- from 1 dimension to 4 under "triplet", from 2 to 4 under
+    "joint_sep" -- and change every archived staged run, so the superset is a
+    flag rather than the default. A(l) remains the single source of truth for
+    both branches; the staged branch only removes the axes that phase never
+    had.
     """
+    if superset:
+        return tuple(LOSS_HP_SUPERSET)
     loss_type = "triplet" if train_cfg is None else \
         str(getattr(train_cfg, "loss_type", "triplet"))
-    if loss_type == "triplet":
-        return ("margin",)
-    if loss_type == "joint":
-        return ("angular_alpha_deg",)
-    if loss_type == "joint_sep":
-        return ("angular_alpha_deg", "lambda_sep")
-    raise ValueError("unknown loss_type %r" % (loss_type,))
+    return tuple(n for n in active_loss_hps(loss_type)
+                 if n not in _STAGED_EXCLUDED_LOSS_HPS)
 
 
 def train_names(train_cfg=None):
@@ -219,10 +257,35 @@ def train_names(train_cfg=None):
     return tuple(loss_hp_names(train_cfg)) + _OPT_NAMES
 
 
-def _loss_dims(search_cfg, train_cfg):
-    """skopt dimensions for the loss HPs of the configured loss type."""
+def _binary_dim(name, choices):
+    """An Integer(0, 1) axis, or a pinned single-value Categorical.
+
+    Integer rather than a two-level Categorical: the one-hot of a binary is
+    exactly redundant (x2 = 1 - x1), so this is one surrogate column instead of
+    two, at no cost in expressiveness and with no false ordering imposed.
+
+    A one-element choice list FREEZES the factor. skopt rejects Integer(v, v)
+    (the same degenerate-range failure _guard_integer exists for), so a frozen
+    factor is pinned as a single-value Categorical, which skopt accepts.
+    """
+    vals = tuple(int(c) for c in choices)
+    if len(vals) < 1:
+        raise ValueError("%s: empty choice list" % name)
+    if len(vals) == 1:
+        return Categorical([vals[0]], name=name)
+    return Integer(min(vals), max(vals), name=name)
+
+
+def _loss_dims(search_cfg, train_cfg, superset=False):
+    """skopt dimensions for the loss HPs, in loss_hp_names order.
+
+    superset=False builds only the dimensions the configured loss type
+    searches (the staged phase-2 space, unchanged). superset=True builds ALL
+    of them, which is what the joint condition search needs: loss_type is a
+    searched coordinate there, so the vector length cannot depend on it.
+    """
     dims = []
-    for name in loss_hp_names(train_cfg):
+    for name in loss_hp_names(train_cfg, superset=superset):
         if name == "margin":
             lo, hi = search_cfg.margin_range
             dims.append(Real(float(lo), float(hi), name="margin"))
@@ -233,19 +296,49 @@ def _loss_dims(search_cfg, train_cfg):
             lo, hi = search_cfg.lambda_sep_range
             dims.append(Real(float(lo), float(hi), prior="log-uniform",
                              name="lambda_sep"))
+        elif name == "sep_centre_means":
+            dims.append(_binary_dim("sep_centre_means",
+                                    search_cfg.sep_centre_means_choices))
         else:
             raise ValueError("unhandled loss HP %r" % (name,))
     return dims
 
 
-def _write_loss_hps(cfg, p):
-    """Write whichever loss HPs the point carries into cfg.train."""
-    if "margin" in p:
+def _write_loss_hps(cfg, p, loss_type=None):
+    """Write the ACTIVE loss HPs of the point into cfg.train, and only those.
+
+    This is decision D1, and it is the whole reason the joint condition search
+    is well-posed. A point carries every loss HP whatever loss type it sampled;
+    the ones outside A(l) are INACTIVE and must not reach the config. Leaving
+    them out means cfg.train keeps the BASE CONFIG's value for each inactive
+    field, which is a fixed constant for the whole study, so two points
+    differing only in inactive coordinates build BYTE-IDENTICAL configs and the
+    GP sees one duplicated observation instead of two scattered ones. The
+    surrogate then sees genuinely flat directions, which ARD length-scales
+    absorb.
+
+    "Inactive" is not "unused". Under "joint"/"joint_sep" the margin is still
+    read -- JointTripletLoss takes margin = 2 * m_cos -- it is FIXED at the base
+    config's value rather than searched. The base config therefore DEFINES the
+    clamp constants; preflight should assert they are the intended ones (in
+    particular lambda_sep = 0.1, the TrainConfig default, or every non-joint_sep
+    trial fires the "INERT lambda_sep" RuntimeWarning).
+
+    loss_type=None reads cfg.train.loss_type, which under the joint condition
+    search MUST already have been written. Passing it explicitly removes that
+    ordering dependency, and the caller in config_from_joint_condition_point
+    does exactly that.
+    """
+    lt = str(cfg.train.loss_type) if loss_type is None else str(loss_type)
+    active = active_loss_hps(lt)
+    if "margin" in active and "margin" in p:
         cfg.train.margin = float(p["margin"])
-    if "angular_alpha_deg" in p:
+    if "angular_alpha_deg" in active and "angular_alpha_deg" in p:
         cfg.train.angular_alpha_deg = float(p["angular_alpha_deg"])
-    if "lambda_sep" in p:
+    if "lambda_sep" in active and "lambda_sep" in p:
         cfg.train.lambda_sep = float(p["lambda_sep"])
+    if "sep_centre_means" in active and "sep_centre_means" in p:
+        cfg.train.sep_centre_means = bool(int(p["sep_centre_means"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -665,7 +758,7 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
 
 def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
             verbose=False, tag="", n_initial_points=None, epsilon=None,
-            train_verbose=False):
+            train_verbose=False, annotate=None):
     """Shared gp_minimize driver: wires the objective, keeps a trial counter (so the
     seed blocks stay disjoint), and collects the per-trial log.
 
@@ -673,13 +766,30 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
         <= 0) reproduces the legacy hard-coded rule min(10, max(1, n_calls // 2))
         EXACTLY, so pre-C3 configs are unaffected.
     [C2] epsilon : tie-break weight, or None for the pre-C2 primary-only objective.
+    annotate : optional point -> dict, merged into the trial record BEFORE the
+        trial runs. This is how the legality projection Pi becomes visible: a
+        projected trial is recorded as projected rather than silently building
+        a different config than its coordinates suggest. It must be pure and
+        cheap; if it raises, the trial still runs and the error is recorded
+        instead, because a logging fault must never cost a training run.
     """
     trial_log = []
     counter = {"t": 0}
 
+    def _note(point):
+        if annotate is None:
+            return {}
+        try:
+            return dict(annotate(point))
+        except Exception as ex:
+            warnings.warn("%s: annotate() raised %s: %s -> trial still runs."
+                          % (tag, type(ex).__name__, ex), RuntimeWarning)
+            return {"annotate_error": "%s: %s" % (type(ex).__name__, ex)}
+
     def objective(point):
         t = counter["t"]
         counter["t"] += 1
+        note = _note(point)
         try:
             cfg = build_cfg(base_cfg, point)
         except Exception as ex:                   # an INVALID config (failed validate)
@@ -689,6 +799,7 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
             rec = {"trial": t, "scores": [], "mean": float("nan"),
                    "std": float("nan"), "objective": FAILED_OBJECTIVE,
                    "eff_rank": float("nan"), "failed": True}
+            rec.update(note)
             trial_log.append(rec)
             return FAILED_OBJECTIVE
         if train_verbose:
@@ -697,6 +808,7 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
         obj, rec = evaluate_candidate(cfg, splits, device, t, log=trial_log,
                                       epsilon=epsilon,
                                       train_verbose=train_verbose)
+        rec.update(note)          # rec IS the object already in trial_log
         if verbose:
             print("[%s] trial %3d  obj %+.4f  (val %s = %.4f +/- %.4f, eff_rank %.2f)"
                   % (tag, t, obj, base_cfg.train.selection_primary,
@@ -977,6 +1089,335 @@ def search_joint(cfg, splits, device, verbose=False, train_verbose=False):
         build_cfg=config_from_joint_point, verbose=verbose, tag="joint",
         n_initial_points=int(cfg.search.n_initial_points),   # [C3]
         epsilon=epsilon,                                     # [C2]
+        train_verbose=train_verbose)
+
+
+# --------------------------------------------------------------------------- #
+# JOINT CONDITION search -- the joint space PLUS the four categorical factors
+# --------------------------------------------------------------------------- #
+# Axis order is the specification of the design document, and it is load-bearing
+# twice over: gp_minimize's trial sequence is a function of it at fixed
+# random_state, and every name <-> coordinate mapping in this section is built
+# by zipping against it. Do not reorder without regenerating any study meant to
+# be compared with an earlier one.
+#
+#   1-4   architecture      depth_exponent, width_multiplier, block_family,
+#                           embedding_size
+#   5-8   optimizer         lr, one_minus_beta1, one_minus_beta2, weight_decay
+#   9     regularization    dropout        (free from trial 0, not a last stage)
+#   10-12 loss HPs          margin, angular_alpha_deg, lambda_sep
+#   13-15 objective factors mining_strategy, loss_type, strict_semihard
+#   16-17 head geometry     head_fusion, head_pool_ops
+#   18    loss HP           sep_centre_means
+#
+# sep_centre_means sits LAST rather than with the other loss HPs because that is
+# where the design document's table puts it; it is nonetheless a member of A(l)
+# and is written by _write_loss_hps like the rest.
+_JOINT_CONDITION_NAMES = (
+    "depth_exponent", "width_multiplier", "block_family", "embedding_size",
+    "lr", "one_minus_beta1", "one_minus_beta2", "weight_decay", "dropout",
+    "margin", "angular_alpha_deg", "lambda_sep",
+    "mining_strategy", "loss_type", "strict_semihard",
+    "head_fusion", "head_pool_ops", "sep_centre_means",
+)
+
+
+def joint_condition_names():
+    """Names of the joint CONDITION space, in the order the space builds them.
+
+    Takes no train_cfg, unlike joint_names: the whole point of this space is
+    that loss_type is a searched coordinate, so the vector length cannot depend
+    on the configured loss type.
+    """
+    return _JOINT_CONDITION_NAMES
+
+
+def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
+    """The 18-axis space: every HP AND every categorical factor at once.
+
+    This REPLACES the 52-cell factorial, in which each cell froze the four
+    categorical factors and ran its own Bayesian search. Those factors are
+    searched here instead, for a reason that is specific to this study rather
+    than general: the screening found that head geometries differ chiefly in
+    GENERALISATION GAP, and that the strict-filter x head interaction was the
+    largest effect measured. A staged search would have fixed the head before
+    the loss type existed as a variable at all.
+
+    train_cfg is accepted and ignored for the loss HPs (the superset is always
+    built); it is kept in the signature so this function is drop-in wherever
+    joint_space is called.
+
+    COLUMN ARITHMETIC. 18 declared axes, but the GP surrogate sees more,
+    because skopt one-hots every Categorical:
+
+        11 numeric  (1, 2, 4-12 minus block_family)   -> 11 columns
+         5 binaries as Integer(0, 1)                  ->  5 columns
+         2 three-level Categorical (13, 14)           ->  6 columns
+                                                        ---------
+                                                          22 columns
+
+    Encoding the five binaries as Integer rather than Categorical is what saves
+    5 columns: a two-level one-hot is exactly redundant (x2 = 1 - x1). This
+    includes block_family, which departs from the letter of the BUG 2 note
+    above but not its substance -- that warning is specifically that a REAL
+    block_family yields floats such as 0.37, so Block_array[0.37] raises
+    TypeError. Integer yields genuine Python ints. The smoke test ASSERTS the
+    int-ness rather than trusting this paragraph.
+
+    Up to 3 of the 22 columns are INACTIVE for any given trial (the loss HPs
+    outside A(l)). _write_loss_hps clamps them so they never reach the config,
+    which turns them into genuinely flat directions for the surrogate rather
+    than noise-injecting ones; ARD length-scales absorb flat directions. What
+    that costs in sample efficiency at this budget is not estimated anywhere.
+    """
+    lo_d, hi_d = search_cfg.depth_exponent_range
+    lo_w, hi_w = search_cfg.width_multiplier_range
+    lo_e, hi_e = search_cfg.embedding_size_range
+    lo_lr, hi_lr = search_cfg.lr_range
+    lo_b1, hi_b1 = search_cfg.one_minus_beta1_range
+    lo_b2, hi_b2 = search_cfg.one_minus_beta2_range
+    lo_wd, hi_wd = reg_cfg.weight_decay_range          # the wider of the two
+    lo_dr, hi_dr = reg_cfg.dropout_range
+    dims = [
+        Integer(int(lo_d), int(hi_d), name="depth_exponent"),
+        Real(float(lo_w), float(hi_w), name="width_multiplier"),
+        _binary_dim("block_family", search_cfg.block_family_choices),
+        Integer(int(lo_e), int(hi_e), name="embedding_size"),
+        Real(float(lo_lr), float(hi_lr), prior="log-uniform", name="lr"),
+        Real(float(lo_b1), float(hi_b1), prior="log-uniform", name="one_minus_beta1"),
+        Real(float(lo_b2), float(hi_b2), prior="log-uniform", name="one_minus_beta2"),
+        Real(float(lo_wd), float(hi_wd), prior="log-uniform", name="weight_decay"),
+        Real(float(lo_dr), float(hi_dr), name="dropout"),
+    ]
+    # the loss-HP superset, minus sep_centre_means, which the axis order puts
+    # last; _loss_dims builds them in LOSS_HP_SUPERSET order, so slice rather
+    # than rebuild, and let the assertion below catch any drift between the two
+    # orderings instead of letting it become a silent coordinate swap.
+    loss_dims = _loss_dims(search_cfg, train_cfg, superset=True)
+    by_name = dict((d.name, d) for d in loss_dims)
+    dims += [by_name["margin"], by_name["angular_alpha_deg"],
+             by_name["lambda_sep"]]
+    dims += [
+        Categorical(list(search_cfg.mining_strategy_choices),
+                    name="mining_strategy"),
+        Categorical(list(search_cfg.loss_type_choices), name="loss_type"),
+        _binary_dim("strict_semihard", search_cfg.strict_semihard_choices),
+        _binary_dim("head_fusion", search_cfg.head_fusion_choices),
+        _binary_dim("head_pool_ops", search_cfg.head_pool_ops_choices),
+        by_name["sep_centre_means"],
+    ]
+    built = tuple(d.name for d in dims)
+    if built != _JOINT_CONDITION_NAMES:
+        raise RuntimeError(
+            "joint_condition_space built axes %r but joint_condition_names "
+            "declares %r; the two MUST agree or every coordinate downstream "
+            "means the wrong thing." % (built, _JOINT_CONDITION_NAMES))
+    return dims
+
+
+def _to_native(v):
+    """A numpy scalar -> the equivalent Python scalar; anything else unchanged.
+
+    NOT cosmetic. skopt's Integer.rvs returns numpy.int64 and Real.rvs returns
+    numpy.float64, and those are NOT json-serialisable: json.dumps raises
+    "Object of type int64 is not JSON serializable". The per-trial log and the
+    winner report are both written as JSON, so the point is normalised ONCE,
+    here, at the boundary where a sampled point first becomes our data.
+
+    This also corrects a claim worth flagging: the design document justifies
+    encoding block_family as Integer rather than Categorical by asserting that
+    "Integer yields genuine Python ints". It does not -- it yields numpy ints.
+    The SUBSTANCE of the BUG 2 warning is nonetheless respected, because that
+    warning is about REAL dimensions yielding floats such as 0.37, and
+    Block_array[0.37] raises TypeError while Block_array[numpy.int64(1)] does
+    not. The smoke test asserts index-usability, which is the property that
+    actually matters, rather than the exact type.
+    """
+    item = getattr(v, "item", None)
+    return item() if callable(item) and getattr(v, "shape", None) == () else v
+
+
+def project_joint_condition_point(point):
+    """Pi at POINT level. Returns (projected_point, info).
+
+    Wraps condition_space.project_condition so the caller never has to know
+    which coordinates carry the condition. info is a small dict recording what
+    happened, so a projected trial is VISIBLE in the per-trial log rather than
+    silent:
+
+        {"projected": bool, "raw": (m, l, s), "condition": (m, l, s),
+         "cell": "<historical factorial cell name>"}
+
+    The projection is idempotent, so calling this on an already-projected point
+    returns it unchanged with projected=False.
+    """
+    out = [_to_native(v) for v in point]
+    p = dict(zip(_JOINT_CONDITION_NAMES, out))
+    raw = (str(p["mining_strategy"]), str(p["loss_type"]),
+           bool(int(p["strict_semihard"])))
+    cond = project_condition(*raw)
+    out[_JOINT_CONDITION_NAMES.index("strict_semihard")] = int(cond[2])
+    info = {
+        "projected": bool(cond != raw),
+        "raw": raw,
+        "condition": cond,
+        "cell": cell_name(cond[0], cond[1], cond[2],
+                          decode_head_fusion(p["head_fusion"]),
+                          decode_head_pool_ops(p["head_pool_ops"])),
+    }
+    return out, info
+
+
+def config_from_joint_condition_point(base_cfg, point):
+    """ExperimentConfig for a joint CONDITION point: HPs and factors move at once.
+
+    Order of operations matters and is asserted by the smoke test:
+
+      1. PROJECT the point (Pi), so the provably-empty
+         (hard, joint*, strict=True) cell can never be built. Pi runs BEFORE
+         any ExperimentConfig exists, which is the whole reason it is a pure
+         function on the point rather than a config-level repair.
+      2. Write the architecture and the head geometry.
+      3. Write loss_type, THEN the loss HPs, so _write_loss_hps sees the
+         sampled loss type (it is passed explicitly anyway).
+      4. Rebuild cfg.train through dataclasses.replace so
+         TrainConfig.__post_init__ RE-RUNS. Direct attribute assignment -- what
+         config_from_train_point does -- skips validation entirely, and
+         cfg.validate() only WARNS. Without the replace, a bug in Pi would
+         produce a silently zero-loss run instead of a loud failure.
+
+    A raised exception here is not a crash: _run_gp catches it, scores the
+    trial FAILED_OBJECTIVE (finite, never NaN) and the study continues.
+    """
+    point, _info = project_joint_condition_point(point)
+    p = dict(zip(_JOINT_CONDITION_NAMES, point))
+    loss_type = str(p["loss_type"])
+
+    cfg = _deep_copy_cfg(base_cfg)
+    cfg.backbone = replace(
+        cfg.backbone,
+        depth_exponent=int(p["depth_exponent"]),
+        width_multiplier=float(p["width_multiplier"]),
+        block_family=int(p["block_family"]),
+        embedding_size=int(p["embedding_size"]),
+        dropout=float(p["dropout"]),
+        head_fusion=decode_head_fusion(p["head_fusion"]),
+        head_pool_ops=decode_head_pool_ops(p["head_pool_ops"]),
+    )
+    # the three fields that are conditions rather than hyper-parameters
+    cfg.train.mining_strategy = str(p["mining_strategy"])
+    cfg.train.loss_type = loss_type
+    cfg.train.strict_semihard = bool(int(p["strict_semihard"]))
+    # the optimizer, identically to config_from_joint_point (beta = 1 - u)
+    cfg.train.lr = float(p["lr"])
+    cfg.train.beta1 = 1.0 - float(p["one_minus_beta1"])
+    cfg.train.beta2 = 1.0 - float(p["one_minus_beta2"])
+    cfg.train.weight_decay = float(p["weight_decay"])
+    # ACTIVE loss HPs only (decision D1); the rest keep the base config's value
+    _write_loss_hps(cfg, p, loss_type=loss_type)
+    # re-run TrainConfig.__post_init__ on the assembled result
+    cfg.train = replace(cfg.train)
+    cfg.validate()
+    return cfg
+
+
+def best_joint_condition_dict(res):
+    """The winning joint-condition point as a dict, ordered by the axis list.
+
+    The point is projected first, so the reported winner is the configuration
+    that actually RAN, not the raw coordinates the surrogate proposed.
+    """
+    point, _info = project_joint_condition_point(res.x)
+    return dict(zip(_JOINT_CONDITION_NAMES, point))
+
+
+def resolve_n_initial_points_joint(search_cfg):
+    """n_init for the joint searches, with its own field and a fallback chain.
+
+    n_initial_points_joint > 0  ->  use it
+    else n_initial_points > 0   ->  use that (one setting for every phase)
+    else 0                      ->  resolve_n_initial_points applies the legacy
+                                    rule min(10, max(1, n_calls // 2))
+
+    The joint condition space is 22 surrogate columns against the staged
+    phases' 4, 5 and 2, so the number of pre-surrogate draws it wants is not
+    the number those phases want. The legacy rule caps at 10, which in 22
+    columns is a very thin design; set n_initial_points_joint deliberately.
+    """
+    n = int(getattr(search_cfg, "n_initial_points_joint", 0))
+    if n > 0:
+        return n
+    return int(getattr(search_cfg, "n_initial_points", 0))
+
+
+def annotate_joint_condition_point(point):
+    """The per-trial log entry for a joint-condition point: what Pi did.
+
+    Everything returned is JSON-serialisable (project_joint_condition_point
+    normalises numpy scalars), because the trial log is written to disk as
+    JSON. Recording BOTH the raw and the projected condition is the point: a
+    trial whose coordinates said (hard, joint_sep, strict=True) but which
+    trained (hard, joint_sep, strict=False) must be readable as such, or the
+    duplicated observations the GP receives look like noise.
+    """
+    _pt, info = project_joint_condition_point(point)
+    p = dict(zip(_JOINT_CONDITION_NAMES, _pt))
+    m, l, s = info["condition"]
+    return {
+        "cell": info["cell"],
+        "projected": bool(info["projected"]),
+        "condition": [m, l, bool(s)],
+        "raw_condition": [info["raw"][0], info["raw"][1], bool(info["raw"][2])],
+        "mining_strategy": m,
+        "loss_type": l,
+        "strict_semihard": bool(s),
+        "head_fusion": bool(decode_head_fusion(p["head_fusion"])),
+        "head_pool_ops": list(decode_head_pool_ops(p["head_pool_ops"])),
+        "active_loss_hps": list(active_loss_hps(l)),
+    }
+
+
+def search_joint_conditions(cfg, splits, device, verbose=False,
+                            train_verbose=False):
+    """THE search: one GP over the 18 axes, replacing the 52-cell factorial.
+
+    Scored by the SAME evaluate_candidate, the same tie-break epsilon and the
+    same disjoint seed blocks as every other phase, so the only thing that
+    differs from the staged pipeline is the shape of the search.
+
+    Failure policy is inherited unchanged and is load-bearing here: a point
+    that builds an invalid config scores FAILED_OBJECTIVE = +1.0, which is
+    finite and strictly worse than any achievable -silhouette, so the surrogate
+    learns to avoid the region WITHOUT the study aborting. NaN is never
+    returned; gp_minimize cannot fit it.
+
+    WHAT THIS DOES NOT ANSWER. The GP allocates trials adaptively, so
+    "triplet" may receive very few. This search returns a tuned configuration;
+    it does NOT establish that the composite objective beats the triplet
+    baseline at matched budget. That comparison needs its own matched-budget
+    run. Recorded here so the limitation travels with the code.
+    """
+    n_calls = resolve_n_calls_joint(cfg.search, cfg.regularization)
+    n_init = resolve_n_initial_points_joint(cfg.search)
+    epsilon, _info = resolve_tie_break_epsilon(cfg, splits, verbose=verbose)
+    space = joint_condition_space(cfg.search, cfg.regularization, cfg.train)
+    if verbose:
+        cols = sum(len(d.categories) if hasattr(d, "categories") else 1
+                   for d in space)
+        print("[joint_cond] %d axes / %d surrogate columns, %d trials x %d "
+              "seed(s) = %d training runs"
+              % (len(space), cols, n_calls, int(cfg.train.n_seeds),
+                 n_calls * int(cfg.train.n_seeds)))
+    return _run_gp(
+        space=space,
+        base_cfg=cfg, splits=splits, device=device,
+        n_calls=n_calls,
+        random_state=int(cfg.search.gp_random_state),
+        build_cfg=config_from_joint_condition_point,
+        verbose=verbose, tag="joint_cond",
+        n_initial_points=n_init,
+        epsilon=epsilon,
+        annotate=annotate_joint_condition_point,
         train_verbose=train_verbose)
 
 

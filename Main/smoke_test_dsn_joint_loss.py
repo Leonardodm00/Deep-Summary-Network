@@ -366,39 +366,60 @@ def check_gate_always_open_when_threshold_none():
 # --------------------------------------------------------------------------- #
 # [G] composite
 # --------------------------------------------------------------------------- #
-def check_composite_switches_at_the_latch():
+def check_composite_follows_the_warmup():
+    """The gate is gone; the composite now follows the deterministic ramp.
+
+    Same assertion shape as the old latch test: at the START of the warm-up the
+    composite must equal L_joint EXACTLY (weight 0), and once the ramp is past
+    tau * T it must equal L_joint + lambda_sep * L_sep EXACTLY.
+    """
     z, y = make_batch(spread=0.6)
     pairs = triplet_miner(0.3)(z, y)
     lam, m_cos, alpha = 0.1, 0.3, 18.0
+    T, tau = 100, 0.3
 
     joint_ref = float(JointTripletLoss(margin=2.0 * m_cos, alpha_deg=alpha)(
         z, y, pairs))
     sep_ref = float(CentroidSeparationLoss(n_classes=3)(z, y))
     assert sep_ref > 1e-6, "fixture broken: L_sep is ~0 (%.3e)" % sep_ref
 
-    closed = CompositeDSNLoss(n_classes=3, margin=2.0 * m_cos, alpha_deg=alpha,
-                              lambda_sep=lam, gate_threshold=2.0,
-                              gate_min_batches=1)
-    got_closed = float(closed(z, y, pairs))
-    assert abs(got_closed - joint_ref) < TOL, \
-        "closed gate: %.8f != joint %.8f" % (got_closed, joint_ref)
-    assert float(closed.gate.latched) == 0.0, "gate latched on an impossible threshold"
+    cold = CompositeDSNLoss(n_classes=3, margin=2.0 * m_cos, alpha_deg=alpha,
+                            lambda_sep=lam, total_steps=T, warmup_frac=tau)
+    got_cold = float(cold(z, y, pairs))
+    assert abs(got_cold - joint_ref) < TOL, \
+        "t = 0: %.8f != joint %.8f" % (got_cold, joint_ref)
+    assert float(cold.stats()["sep_lambda_t"]) == 0.0, \
+        "lambda_sep(0) was not zero"
 
-    opened = CompositeDSNLoss(n_classes=3, margin=2.0 * m_cos, alpha_deg=alpha,
-                              lambda_sep=lam, gate_threshold=None)
-    got_open = float(opened(z, y, pairs))
+    warm = CompositeDSNLoss(n_classes=3, margin=2.0 * m_cos, alpha_deg=alpha,
+                            lambda_sep=lam, total_steps=T, warmup_frac=tau)
+    warm.warmup.step.fill_(T)                 # past the end of the ramp
+    got_warm = float(warm(z, y, pairs))
     want = joint_ref + lam * sep_ref
-    assert abs(got_open - want) < TOL, \
-        "open gate: %.8f != joint + lambda*sep %.8f" % (got_open, want)
-    return "composite = joint when closed, = joint + %.2f*sep when open" % lam
+    assert abs(got_warm - want) < TOL, \
+        "t >= tau*T: %.8f != joint + lambda*sep %.8f" % (got_warm, want)
+
+    # halfway up the ramp the weight is exactly half
+    mid = CompositeDSNLoss(n_classes=3, margin=2.0 * m_cos, alpha_deg=alpha,
+                           lambda_sep=lam, total_steps=T, warmup_frac=tau)
+    mid.warmup.step.fill_(int(0.5 * tau * T))
+    got_mid = float(mid(z, y, pairs))
+    want_mid = joint_ref + 0.5 * lam * sep_ref
+    assert abs(got_mid - want_mid) < TOL, \
+        "halfway: %.8f != joint + 0.5*lambda*sep %.8f" % (got_mid, want_mid)
+
+    return ("composite = joint at t=0, = joint + %.2f*sep past tau*T, "
+            "= joint + %.3f*sep halfway" % (lam, 0.5 * lam))
 
 
 def check_composite_backward():
     z, y = make_batch(spread=0.6)
     pairs = triplet_miner(0.3)(z, y)
     z = z.clone().requires_grad_(True)
+    # warmup_frac = 0 -> full weight from the first step, so the separation
+    # term is in the graph immediately and the gradient check is not vacuous
     fn = CompositeDSNLoss(n_classes=3, margin=0.6, alpha_deg=18.0,
-                          lambda_sep=0.1, gate_threshold=None)
+                          lambda_sep=0.1, total_steps=100, warmup_frac=0.0)
     fn(z, y, pairs).backward()
     assert z.grad is not None and torch.isfinite(z.grad).all(), \
         "non-finite gradient through the composite"
@@ -416,17 +437,21 @@ def check_stats_are_tensors():
     z, y = make_batch(spread=0.6)
     pairs = triplet_miner(0.3)(z, y)
     fn = CompositeDSNLoss(n_classes=3, margin=0.6, alpha_deg=18.0,
-                          lambda_sep=0.1, gate_threshold=0.2,
-                          gate_min_batches=1)
+                          lambda_sep=0.1, total_steps=100, warmup_frac=0.3)
     fn(z, y, pairs)
     st = fn.stats()
     expected = {"n_mined", "n_strict", "n_active", "sep_mean_cos",
-                "sep_n_classes", "sep_centred", "sil_running", "sep_active",
-                "latch_step", "gate_batches_seen"}
+                "sep_n_classes", "sep_centred", "sep_warmup_scale", "sep_step",
+                "sep_lambda_t"}
     missing = expected - set(st)
     assert not missing, "stats() is missing %r" % sorted(missing)
-    bad = [k for k, v in st.items() if not torch.is_tensor(v)]
-    assert not bad, "these stats are not tensors: %r" % bad
+    # sep_warmup_steps / sep_total_steps are CONSTANTS of the run, deliberately
+    # plain floats: reading a constant is not a device sync. Everything that
+    # varies per batch must still be a tensor.
+    constants = {"sep_warmup_steps", "sep_total_steps"}
+    bad = [k for k, v in st.items()
+           if k not in constants and not torch.is_tensor(v)]
+    assert not bad, "these per-batch stats are not tensors: %r" % bad
     assert int(st["n_mined"]) >= int(st["n_strict"]) >= 0, \
         "census ordering violated: mined=%d strict=%d" \
         % (int(st["n_mined"]), int(st["n_strict"]))
@@ -696,7 +721,7 @@ CHECKS = [
      check_gate_always_open_when_threshold_none),
     ("[F] cumulative-mean path exact", check_gate_cumulative_mean_path),
     ("[G] composite switches at the latch",
-     check_composite_switches_at_the_latch),
+     check_composite_follows_the_warmup),
     ("[G] composite backward", check_composite_backward),
     ("[H] statistics are device tensors", check_stats_are_tensors),
     ("[I] empty triplet set", check_empty_triplet_set),

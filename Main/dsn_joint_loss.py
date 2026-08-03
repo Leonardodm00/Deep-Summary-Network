@@ -4,16 +4,53 @@ dsn_joint_loss.py
 
 Composite metric-learning objective for the Deep Summary Network.
 
-    L = L_joint  +  lambda_sep * g_t * L_sep
+    L(t) = L_joint  +  lambda_sep(t) * L_sep
 
 where
 
-    L_joint = ( 1 / |T_active| ) * sum_{(a,p,n) in T_strict} ( l_trip + l_ang )
-    L_sep   = per-batch Gram penalty driving the class means to a simplex
-              equiangular tight frame (ETF). At C >= 3 the means are CENTRED;
-              at C = 2 they are RAW -- see "The two-class case" below.
-    g_t     = a LATCHING gate in {0, 1}, driven by a running estimate of the
-              TRAINING cosine silhouette
+    L_joint    = ( 1 / |T_active| ) * sum_{(a,p,n) in T_strict} (l_trip + l_ang)
+    L_sep      = per-batch Gram penalty driving the class means to a simplex
+                 equiangular tight frame (ETF). Which class directions it is
+                 built from is selected by centre_means -- see
+                 CentroidSeparationLoss.
+    lambda_sep(t) = lambda_sep * min(1, t / (tau * T)), a DETERMINISTIC linear
+                 warm-up over the first tau * T optimiser steps, with
+                 T = max_epochs * batches_per_epoch the PLANNED step budget.
+
+The warm-up REPLACES a latching silhouette gate
+-----------------------------------------------
+Until this change the third term was switched on by a gate: a running estimate
+of the TRAINING cosine silhouette, latched permanently the first time it
+crossed a threshold. That is gone from this path. SilhouetteGate itself is
+KEPT, because the archived analysis tooling still reads its buffers, but
+CompositeDSNLoss no longer constructs one.
+
+Four reasons, three of them measured on the 52-cell screening:
+
+  1. It deletes three hyper-parameters (threshold, momentum, min_batches) and
+     adds one that is FIXED rather than searched.
+  2. The switch is no longer data-dependent, so it cannot fire on a
+     fluctuation. MEASURED: the gate latched in 56 of 60 seeds, 70% of which
+     peaked in a running silhouette of 0.15 to 0.21 -- i.e. on an excursion --
+     at a median held-out silhouette of -0.054, at or below the run's own
+     label-shuffled null.
+  3. It is deterministic, so seed variance no longer mixes optimisation noise
+     with switch timing. Two seeds of one config now share an objective at
+     every step, which is what makes their spread interpretable.
+  4. lambda_sep becomes active in EVERY run, so a search over it can identify
+     it. Under a gate it was inactive in most trials, i.e. a flat direction the
+     surrogate learns nothing from.
+
+tau is FIXED, never searched: the schedule integrates to
+lambda_sep * T * (1 - tau/2), so tau and lambda_sep trade off almost
+multiplicatively and searching both would move along a ridge.
+
+STEP CONVENTION (a plus-or-minus-one that matters for reproducibility). The
+ramp is evaluated at t = the number of optimiser steps COMPLETED so far, so the
+FIRST batch sees t = 0 and therefore weight exactly 0, and full weight is
+reached after exactly tau * T batches. The alternative convention (t = 1 on the
+first batch) would start the run with a small but nonzero separation weight,
+which is precisely what a warm-up exists to avoid.
 
 The two-class case
 ------------------
@@ -46,9 +83,8 @@ Since the backbone L2-normalises every row onto the sphere, translation is not
 a symmetry of the representation anyway, but the two formulations are not
 interchangeable and the census records which one ran.
 
-Before the gate latches the objective is the joint triplet loss alone; from the
-batch at which it latches onward, the centroid-separation term is included. The
-gate is evaluated per batch, so the switch can and does happen MID-EPOCH.
+The ramp is evaluated per batch, so the weight changes MID-EPOCH; history
+records lambda_sep(t) as it stood at the END of each epoch (sep_lambda_t).
 
 Distance conventions (never mixed silently)
 -------------------------------------------
@@ -86,19 +122,21 @@ device->host sync: the gate decision is carried as a 0.0/1.0 TENSOR multiplying
 L_sep rather than as a Python bool branch, and every statistic exposed for
 logging is a device tensor to be read once at the epoch boundary via .stats().
 
-Consequence of a trajectory-dependent gate (recorded, not argued)
------------------------------------------------------------------
-Because the latch epoch is a function of the training trajectory, different
-seeds and different search trials switch objectives at different points. Seed
-std therefore mixes optimisation noise with switch timing, and a search over
-alpha compares trials that did not share an objective for the same number of
-batches. Log latch_step and read it alongside any alpha ranking.
+Early stopping and the planned horizon (recorded, not argued)
+-------------------------------------------------------------
+T is the PLANNED budget max_epochs * batches_per_epoch, not the number of steps
+a run actually takes. A run that early-stops at half its cap therefore spends a
+LARGER fraction of its life at full weight than the schedule nominally implies,
+but still reaches full weight, provided tau < (actual epochs) / max_epochs. At
+tau = 0.3 that holds for any run reaching 30% of its cap. Runs stopping earlier
+than that never see full lambda_sep; sep_lambda_t in history is what makes this
+visible rather than assumed.
 
 Checkpoint note
 ---------------
-The gate state (running statistic, counter, latch) lives in registered buffers.
-If training is resumed from a checkpoint that does not carry this module's
-state_dict, the gate resets and will re-warm from scratch.
+The step counter lives in a registered buffer, so a checkpoint that carries
+this module's state_dict resumes the ramp where it stopped. One that does NOT
+resets the counter to 0 and re-runs the warm-up from the beginning.
 
 HPC note (hpc-python-compat): pure ASCII, no local imports.
 """
@@ -116,6 +154,8 @@ __all__ = [
     "JointTripletLoss",
     "CentroidSeparationLoss",
     "SilhouetteGate",
+    "sep_warmup_scale",
+    "SepWarmup",
     "CompositeDSNLoss",
 ]
 
@@ -486,23 +526,164 @@ class SilhouetteGate(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# the warm-up (replaces the gate)
+# --------------------------------------------------------------------------- #
+def sep_warmup_scale(step, total_steps, warmup_frac):
+    """The dimensionless ramp factor g(t) in [0, 1], as a PLAIN PYTHON float.
+
+        g(t) = min(1, t / (tau * T)),    tau > 0
+        g(t) = 1                          tau = 0   (no warm-up at all)
+
+    so that lambda_sep(t) = lambda_sep * g(t).
+
+    Pure, importable without a config and without a trainer, and it is what the
+    smoke test checks: the module below must agree with it at every step.
+
+    Arguments
+    ---------
+    step        : t, the number of optimiser steps COMPLETED so far, t >= 0.
+                  The first batch of a run passes t = 0, so g(0) = 0 exactly.
+    total_steps : T = max_epochs * batches_per_epoch, the PLANNED budget.
+    warmup_frac : tau in [0, 1]. Full weight is reached at t = tau * T.
+
+    Boundary cases, all deliberate:
+      tau = 0  -> constant 1. This is the CONTROL ARM and the default, and it
+                  reproduces the pre-existing ungated behaviour exactly.
+      tau = 1  -> the ramp finishes exactly at the last planned step.
+      T <= 0   -> constant 1. A ramp needs a horizon; without one the only
+                  honest thing is to apply the full weight rather than to
+                  silently spend the whole run near zero.
+    """
+    t = int(step)
+    T = int(total_steps)
+    tau = float(warmup_frac)
+    if t < 0:
+        raise ValueError("step must be >= 0; got %r" % (step,))
+    if not (0.0 <= tau <= 1.0):
+        raise ValueError("warmup_frac (tau) must lie in [0, 1]; got %r"
+                         % (warmup_frac,))
+    if tau == 0.0 or T <= 0:
+        return 1.0
+    w = tau * float(T)                      # the ramp length, in steps
+    if t >= w:
+        return 1.0
+    return float(t) / w
+
+
+class SepWarmup(nn.Module):
+    """Deterministic linear ramp on the separation weight. Drop-in for the gate.
+
+    Deliberately the SAME SHAPE as SilhouetteGate: it owns a step counter in a
+    registered buffer, it returns a 0-dim tensor the caller multiplies by, and
+    it exposes .stats() as device tensors to be read once per epoch. That is
+    what lets CompositeDSNLoss.forward change by one line.
+
+    READING THE HISTORY (a plus-or-minus-one worth knowing). The scale is
+    computed for the CURRENT step and the counter advances afterwards, so the
+    value recorded at the END of epoch k is g(k * n_batches - 1), not
+    g(k * n_batches): history lags the live state by exactly one step. With
+    tau * T = 20 and n_batches = 5, epoch 4 therefore logs 0.95 and epoch 5 is
+    the first to log 1.0, even though full weight is reached at step 20, the
+    first batch of epoch 5. VERIFIED against a real run. Nothing is wrong with
+    the schedule; the epoch boundary simply does not coincide with the ramp
+    boundary. Read sep_step alongside sep_warmup_scale if the exact step
+    matters.
+
+    NO DEVICE SYNC. The ramp is computed with tensor ops on the step buffer;
+    the ramp LENGTH tau * T is a Python float fixed at construction. Reading
+    int(self.step) instead would force a device->host read on every batch and
+    break the one-.item()-per-epoch discipline that smoke_test_train [D-strict]
+    guards.
+
+    Args:
+        total_steps : T = max_epochs * batches_per_epoch. None or <= 0 disables
+                      the ramp (constant full weight) with a warning, since a
+                      warm-up without a horizon is not well posed.
+        warmup_frac : tau in [0, 1]. 0 (the default) means no warm-up.
+    """
+
+    def __init__(self, total_steps, warmup_frac=0.0):
+        super().__init__()
+        tau = float(warmup_frac)
+        if not (0.0 <= tau <= 1.0):
+            raise ValueError("warmup_frac (tau) must lie in [0, 1]; got %r"
+                             % (warmup_frac,))
+        T = 0 if total_steps is None else int(total_steps)
+        if tau > 0.0 and T <= 0:
+            warnings.warn(
+                "SepWarmup: warmup_frac=%g was requested but total_steps=%r, "
+                "so there is no horizon to ramp over -> the weight is constant "
+                "at full lambda_sep. Pass total_steps = max_epochs * "
+                "batches_per_epoch." % (tau, total_steps), RuntimeWarning)
+        self.total_steps = T
+        self.warmup_frac = tau
+        # ramp length in steps, as a PYTHON float: multiplying a device tensor
+        # by it introduces no sync
+        self.warmup_steps = (tau * float(T)) if (tau > 0.0 and T > 0) else 0.0
+
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
+        self.register_buffer("scale", torch.zeros((), dtype=torch.float32))
+
+    @torch.no_grad()
+    def forward(self):
+        """g(t) for the CURRENT step, then advance. Returns a 0-dim tensor."""
+        if self.warmup_steps <= 0.0:
+            self.scale.fill_(1.0)
+        else:
+            t = self.step.to(torch.float32)
+            self.scale.copy_(torch.clamp(t / self.warmup_steps, max=1.0))
+        self.step.add_(1)
+        return self.scale
+
+    def stats(self):
+        """Device tensors for the per-epoch history entry. Read ONCE per epoch.
+
+        sep_warmup_steps and sep_total_steps are Python floats, not tensors:
+        they are constants of the run, so reading them costs nothing.
+        """
+        return {"sep_warmup_scale": self.scale,
+                "sep_step": self.step,
+                "sep_warmup_steps": float(self.warmup_steps),
+                "sep_total_steps": float(self.total_steps)}
+
+
+# --------------------------------------------------------------------------- #
 # the composite
 # --------------------------------------------------------------------------- #
 class CompositeDSNLoss(nn.Module):
-    """L = L_joint + lambda_sep * g_t * L_sep.
+    """L(t) = L_joint + lambda_sep(t) * L_sep.
 
-    L_sep is evaluated on every batch and multiplied by the gate tensor, rather
+    L_sep is evaluated on EVERY batch and multiplied by the ramp factor, rather
     than being skipped behind a Python branch. That costs one C x C Gram per
-    batch -- negligible at C = 3 -- and buys two things: no device sync, and a
-    switch that is exact at the batch where the gate latches.
+    batch -- negligible at C = 3 -- and buys no device sync and a weight that is
+    exact at every batch boundary.
+
+    THE GATE IS GONE. This class no longer constructs a SilhouetteGate; the
+    separation term is scheduled deterministically by SepWarmup instead (see the
+    module header for why, and for what was measured). SilhouetteGate remains
+    defined and exported for the archived analysis tooling that reads its
+    buffers; it is simply not on this path.
 
     Call signature mirrors the current trainer:  loss_fn(Z, y, pairs).
+
+    Args:
+        n_classes       : C, for the ETF target -1/(K-1) and the class masking.
+        margin          : SQUARED-EUCLIDEAN margin. Pass 2.0 * m_cos.
+        alpha_deg       : angular constraint in degrees, in (0, 90).
+        lambda_sep      : the ASYMPTOTIC weight on L_sep, reached at t = tau*T.
+        total_steps     : T = max_epochs * batches_per_epoch, the planned budget.
+        warmup_frac     : tau in [0, 1]. 0 (default) = full weight from step 0,
+                          which reproduces the pre-existing ungated behaviour.
+        centre_means    : None (automatic: centred at C >= 3, raw at C = 2),
+                          or True/False to force one formulation. This is the
+                          searched sep_centre_means axis; the two are DIFFERENT
+                          objectives, not one corrected version of the other.
     """
 
     def __init__(self, n_classes, margin, alpha_deg=18.0, lambda_sep=0.1,
-                 gate_threshold=None, use_angular=True, strict_semihard=True,
-                 swap=True, reduce_nonzero=True, gate_momentum=0.05,
-                 gate_min_batches=20, min_per_class=2, centre_means=None):
+                 total_steps=None, warmup_frac=0.0, use_angular=True,
+                 strict_semihard=True, swap=True, reduce_nonzero=True,
+                 min_per_class=2, centre_means=None):
         super().__init__()
         lambda_sep = float(lambda_sep)
         if lambda_sep < 0.0:
@@ -515,26 +696,26 @@ class CompositeDSNLoss(nn.Module):
         self.sep = CentroidSeparationLoss(n_classes=n_classes,
                                           min_per_class=min_per_class,
                                           centre_means=centre_means)
-        self.gate = SilhouetteGate(threshold=gate_threshold,
-                                   n_classes=n_classes,
-                                   momentum=gate_momentum,
-                                   min_batches=gate_min_batches,
-                                   min_per_class=min_per_class)
+        self.warmup = SepWarmup(total_steps=total_steps,
+                                warmup_frac=warmup_frac)
 
     def forward(self, emb, labels, indices_tuple):
         joint = self.joint(emb, labels, indices_tuple)
-        gate = self.gate(emb, labels)          # {0, 1}, no grad, no sync
+        scale = self.warmup()                  # g(t) in [0, 1], no grad, no sync
         sep = self.sep(emb, labels)
-        return joint + self.lambda_sep * gate * sep
+        return joint + self.lambda_sep * scale * sep
 
     def stats(self):
         """Everything the per-epoch history entry needs, as device tensors.
 
         Read ONCE per epoch, at the epoch boundary, to preserve the
-        one-.item()-per-epoch discipline.
+        one-.item()-per-epoch discipline. sep_lambda_t is the WEIGHT that was
+        in force at the end of the epoch, which is what makes the ramp auditable
+        after the fact rather than merely intended.
         """
         out = {}
         out.update(self.joint.stats())
         out.update(self.sep.stats())
-        out.update(self.gate.stats())
+        out.update(self.warmup.stats())
+        out["sep_lambda_t"] = self.lambda_sep * self.warmup.scale
         return out

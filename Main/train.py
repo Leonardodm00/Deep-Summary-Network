@@ -213,7 +213,7 @@ def resolve_device(spec):
     return torch.device(s)
 
 
-def build_loss_and_miner(train_cfg, n_classes=None):
+def build_loss_and_miner(train_cfg, n_classes=None, total_steps=None):
     """Assemble the loss and the miner.
 
     The SAME distance family (CosineSimilarity, an inverted metric) is passed
@@ -239,6 +239,17 @@ def build_loss_and_miner(train_cfg, n_classes=None):
 
     n_classes (C) is required for "joint_sep": the separation target -1/(K-1)
     and the supervised class masking are both built from it.
+
+    total_steps (T = max_epochs * batches_per_epoch) is required for
+    "joint_sep" whenever train_cfg.sep_warmup_frac > 0: it is the horizon the
+    separation weight ramps over. Passing None with a nonzero tau is not an
+    error but it is not a warm-up either -- SepWarmup warns and holds the
+    weight constant, because a ramp without a horizon is not well posed.
+
+    THE SILHOUETTE GATE IS NO LONGER BUILT. sep_gate_threshold,
+    sep_gate_momentum and sep_gate_min_batches remain in TrainConfig so every
+    archived config still loads, but they are INERT on this path; a config that
+    sets a threshold gets a warning rather than a silently different objective.
 
     Returns (loss_fn, miner). Every returned loss accepts the SAME call
     signature loss_fn(Z, y, pairs), so the batch loop is identical either way.
@@ -268,20 +279,29 @@ def build_loss_and_miner(train_cfg, n_classes=None):
                 raise ValueError(
                     "loss_type='joint_sep' needs n_classes to build the "
                     "centroid-separation target -1/(C-1)")
+            if train_cfg.sep_gate_threshold is not None:
+                warnings.warn(
+                    "sep_gate_threshold=%r is INERT: the latching silhouette "
+                    "gate has been replaced by the deterministic warm-up "
+                    "lambda_sep(t) = lambda_sep * min(1, t / (tau * T)), tau = "
+                    "train.sep_warmup_frac. The gate parameters are kept in "
+                    "TrainConfig only so archived configs still load. Set "
+                    "sep_warmup_frac to schedule the term."
+                    % (train_cfg.sep_gate_threshold,), RuntimeWarning)
             loss_fn = CompositeDSNLoss(
                 n_classes=int(n_classes),
                 margin=margin_sq,
                 alpha_deg=float(train_cfg.angular_alpha_deg),
                 lambda_sep=float(train_cfg.lambda_sep),
-                gate_threshold=(None if train_cfg.sep_gate_threshold is None
-                                else float(train_cfg.sep_gate_threshold)),
+                total_steps=(None if total_steps is None else int(total_steps)),
+                warmup_frac=float(train_cfg.sep_warmup_frac),
                 use_angular=True,
                 strict_semihard=bool(train_cfg.strict_semihard),
                 swap=bool(train_cfg.swap),
                 reduce_nonzero=True,
-                gate_momentum=(None if float(train_cfg.sep_gate_momentum) == 0.0
-                               else float(train_cfg.sep_gate_momentum)),
-                gate_min_batches=int(train_cfg.sep_gate_min_batches),
+                # the searched sep_centre_means axis. None = the automatic rule
+                # (centred at C >= 3, raw at C = 2), i.e. prior behaviour.
+                centre_means=train_cfg.sep_centre_means,
             )
     else:
         raise ValueError(
@@ -489,8 +509,20 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
     conditions = np.asarray(train_ds.conditions_per_item, dtype=int).ravel()
     n_classes = int(np.unique(conditions).shape[0])
 
+    # n_batches is derived HERE, before the loss, because the separation
+    # warm-up needs the PLANNED step budget T = max_epochs * batches_per_epoch
+    # at construction time. It is a pure function of the training set size and
+    # the config, so moving it earlier changes nothing about its value.
+    n_windows = int(len(train_ds.index))
+    n_batches = derive_batches_per_epoch(
+        n_windows=n_windows, n_classes=n_classes,
+        windows_per_condition=tcfg.windows_per_condition,
+        batches_per_epoch=tcfg.batches_per_epoch)
+    total_steps = int(tcfg.max_epochs) * int(n_batches)
+
     model = build_backbone(cfg.backbone).to(device)
-    loss_fn, miner = build_loss_and_miner(tcfg, n_classes=n_classes)
+    loss_fn, miner = build_loss_and_miner(tcfg, n_classes=n_classes,
+                                          total_steps=total_steps)
     if isinstance(loss_fn, torch.nn.Module):
         loss_fn = loss_fn.to(device)
     optimizer = build_optimizer(model, tcfg)
@@ -505,13 +537,7 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             % device.type, RuntimeWarning)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    # ---- batching ---------------------------------------------------------
-    n_windows = int(len(train_ds.index))
-    n_batches = derive_batches_per_epoch(
-        n_windows=n_windows, n_classes=n_classes,
-        windows_per_condition=tcfg.windows_per_condition,
-        batches_per_epoch=tcfg.batches_per_epoch)
-
+    # ---- batching (n_batches / total_steps derived above, with the loss) ---
     dcfg = cfg.data
     if dcfg.positives_mode == "cross_culture":
         # [C4] culture id per training window = the dataset-local trace index

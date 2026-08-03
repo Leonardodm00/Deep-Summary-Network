@@ -185,7 +185,36 @@ def preflight(path, verbose=True):
                 "collapse-seeking run."
                 % (t.mining_strategy, floor))
     if t.loss_type == "joint_sep":
-        lines.append("  lambda_sep = %.4g  gate_threshold = %s  "
+        # the warm-up REPLACED the gate; report what will actually run
+        tau = float(getattr(t, "sep_warmup_frac", 0.0))
+        T_planned = int(t.max_epochs) * int(t.batches_per_epoch) \
+            if int(t.batches_per_epoch) >= 1 else 0
+        centre = getattr(t, "sep_centre_means", None)
+        lines.append("  lambda_sep = %.4g (asymptotic)  tau = %.4g  "
+                     "-> full weight at step %s of %s"
+                     % (t.lambda_sep, tau,
+                        ("%d" % int(tau * T_planned)) if (tau > 0 and T_planned)
+                        else "0 (constant weight)",
+                        ("%d" % T_planned) if T_planned
+                        else "T unknown (batches_per_epoch=0 -> derived)"))
+        lines.append("  sep_centre_means = %s  ->  %s class means"
+                     % (centre,
+                        "CENTRED (mu_c - mu_G); NEAR-VACUOUS at C = 3"
+                        if (centre is True or (centre is None and n_classes >= 3))
+                        else "RAW (mu_c); a genuine separation requirement, and "
+                             "a DIFFERENT objective from NC2"))
+        if t.sep_gate_threshold is not None:
+            lines.append("  WARNING: sep_gate_threshold = %.4g is INERT. The "
+                         "latching gate was removed; use sep_warmup_frac."
+                         % (t.sep_gate_threshold,))
+        if tau > 0.0 and T_planned and tau * T_planned > 0:
+            frac = float(t.patience) / float(t.max_epochs)
+            if frac < tau:
+                lines.append("  WARNING: patience/max_epochs = %.2f < tau = "
+                             "%.2f: a run that early-stops at its patience "
+                             "floor never reaches full lambda_sep."
+                             % (frac, tau))
+        lines.append("  [legacy] lambda_sep = %.4g  gate_threshold = %s  "
                      "(sep means: %s)"
                      % (t.lambda_sep,
                         "none (always on)" if t.sep_gate_threshold is None
@@ -200,6 +229,61 @@ def preflight(path, verbose=True):
                 % (t.lambda_sep,))
 
     # ---- split arithmetic (trace mode only; time_segment cuts the time axis) --
+    # ---- the joint condition search: the objective is SEARCHED, not fixed --
+    if str(getattr(cfg.search, "search_mode", "staged")) == "joint_conditions":
+        import condition_space as CS
+        sc = cfg.search
+        lines.append("")
+        lines.append("JOINT CONDITION SEARCH (search_mode='joint_conditions')")
+        lines.append("  the OBJECTIVE block above reports the BASE config's "
+                     "values. They are the clamp constants for")
+        lines.append("  inactive coordinates, NOT what will run: these four "
+                     "factors are SEARCHED axes.")
+        lines.append("    mining_strategy in %s" % (list(sc.mining_strategy_choices),))
+        lines.append("    loss_type       in %s" % (list(sc.loss_type_choices),))
+        lines.append("    strict_semihard in %s   (projected by Pi off "
+                     "mining='hard' and off loss='triplet')"
+                     % (list(sc.strict_semihard_choices),))
+        lines.append("    head_fusion     in %s ; head_pool_ops in %s "
+                     "(0 -> ['mean'], 1 -> ['mean','max','std'])"
+                     % (list(sc.head_fusion_choices),
+                        list(sc.head_pool_ops_choices)))
+        lines.append("    sep_centre_means in %s  (active only under "
+                     "loss_type='joint_sep')" % (list(sc.sep_centre_means_choices),))
+        n_legal = CS.n_legal_conditions()
+        lines.append("  legal conditions: %d of the 3 x 3 x 2 = 18 raw triples "
+                     "(x 4 head geometries = %d historical cells)"
+                     % (n_legal, 4 * n_legal))
+        lines.append("  budget: n_calls_joint = %d x n_seeds = %d = %d runs; "
+                     "n_initial_points_joint = %d"
+                     % (int(sc.n_calls_joint), int(t.n_seeds),
+                        int(sc.n_calls_joint) * int(t.n_seeds),
+                        int(sc.n_initial_points_joint)))
+        # the clamp constant that would otherwise spam warnings
+        if abs(float(t.lambda_sep) - 0.1) > 1e-12:
+            lines.append("  WARNING: train.lambda_sep = %.4g is the CLAMP "
+                         "CONSTANT for trials where it is inactive, and it is "
+                         "not the TrainConfig default 0.1, so EVERY "
+                         "triplet/joint trial will fire the 'INERT lambda_sep' "
+                         "RuntimeWarning." % (float(t.lambda_sep),))
+        # the warm-up applies whenever joint_sep is reachable
+        if "joint_sep" in tuple(sc.loss_type_choices):
+            tau = float(getattr(t, "sep_warmup_frac", 0.0))
+            T_planned = int(t.max_epochs) * int(t.batches_per_epoch) \
+                if int(t.batches_per_epoch) >= 1 else 0
+            lines.append("  warm-up (joint_sep trials): tau = %.4g, T = %s -> "
+                         "full lambda_sep(t) at step %s"
+                         % (tau,
+                            ("%d" % T_planned) if T_planned else "derived",
+                            ("%d" % int(tau * T_planned))
+                            if (tau > 0 and T_planned) else "0 (constant)"))
+            if tau > 0.0 and T_planned and \
+                    float(t.patience) / float(t.max_epochs) < tau:
+                lines.append("    WARNING: patience/max_epochs = %.2f < tau = "
+                             "%.2f: a run stopping at its patience floor never "
+                             "reaches full lambda_sep."
+                             % (float(t.patience) / float(t.max_epochs), tau))
+
     lines.append("")
     lines.append("SPLIT")
     n_train_windows = None

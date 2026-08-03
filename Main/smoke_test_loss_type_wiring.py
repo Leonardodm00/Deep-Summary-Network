@@ -294,20 +294,29 @@ def check_all_miners_work_under_every_loss():
     return "%d of 9 loss x mining cells produce a finite loss" % n_ok
 
 
-def check_gate_momentum_zero_means_cumulative():
+def check_warmup_replaces_the_gate():
+    """The gate parameters are now INERT and must say so out loud.
+
+    They stay in TrainConfig so the 52 archived cells still load -- 20 of them
+    set sep_gate_threshold = 0.20 -- but nothing builds a gate any more. A
+    config carrying one must warn rather than train a different objective than
+    its author intended.
+    """
     from train import build_loss_and_miner
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        t = TrainConfig(loss_type="joint_sep", sep_gate_momentum=0.0)
-    loss_fn, _ = build_loss_and_miner(t, n_classes=3)
-    assert loss_fn.gate.momentum is None, \
-        "sep_gate_momentum=0.0 did not select the cumulative mean"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        t2 = TrainConfig(loss_type="joint_sep", sep_gate_momentum=0.05)
-    loss_fn2, _ = build_loss_and_miner(t2, n_classes=3)
-    assert abs(loss_fn2.gate.momentum - 0.05) < 1e-12, "EMA momentum not passed"
-    return "sep_gate_momentum 0.0 -> cumulative mean, 0.05 -> EMA"
+        t = TrainConfig(loss_type="joint_sep", sep_gate_threshold=0.20,
+                        sep_gate_momentum=0.0, sep_warmup_frac=0.3,
+                        max_epochs=60, batches_per_epoch=100)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        loss_fn, _ = build_loss_and_miner(t, n_classes=3, total_steps=6000)
+    assert not hasattr(loss_fn, "gate"), "a SilhouetteGate was still built"
+    assert any("INERT" in str(w.message) for w in rec), \
+        "sep_gate_threshold was accepted SILENTLY"
+    assert abs(loss_fn.warmup.warmup_frac - 0.3) < 1e-12, "tau not passed"
+    assert loss_fn.warmup.total_steps == 6000, "T not passed"
+    return "gate parameters are inert and warn; tau and T reach the warm-up"
 
 
 def check_census_keys_are_plain_floats():
@@ -322,12 +331,18 @@ def check_census_keys_are_plain_floats():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         t = TrainConfig(loss_type="joint_sep")
-    loss_fn, miner = build_loss_and_miner(t, n_classes=3)
+    loss_fn, miner = build_loss_and_miner(t, n_classes=3, total_steps=1000)
     loss_fn(z, y, miner(z, y))
     census = {k: float(v) for k, v in loss_fn.stats().items()}
     json.dumps(census)                       # raises if anything is not a number
-    for key in ("n_mined", "n_strict", "n_active", "sep_active", "latch_step"):
+    # sep_active / latch_step are GONE with the gate; sep_lambda_t and
+    # sep_warmup_scale replace them as the record of what weight actually ran.
+    for key in ("n_mined", "n_strict", "n_active", "sep_lambda_t",
+                "sep_warmup_scale", "sep_step"):
         assert key in census, "census is missing %r" % key
+    for key in ("sep_active", "latch_step", "sil_running"):
+        assert key not in census, \
+            "the gate census key %r survived the gate itself" % key
     return "census has %d JSON-serialisable fields" % len(census)
 
 
@@ -348,7 +363,7 @@ CHECKS = [
     ("trainer builds each loss", check_trainer_builds_each_loss),
     ("margin cosine -> squared Euclidean", check_margin_conversion_is_applied),
     ("3 x 3 loss x mining cells", check_all_miners_work_under_every_loss),
-    ("gate momentum 0 = cumulative", check_gate_momentum_zero_means_cumulative),
+    ("gate momentum 0 = cumulative", check_warmup_replaces_the_gate),
     ("census is JSON-serialisable", check_census_keys_are_plain_floats),
 ]
 

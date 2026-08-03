@@ -685,6 +685,39 @@ class TrainConfig:
     # batches that must be seen before the gate may latch. Guards against
     # latching on one lucky early batch at 9 rows per class.
     sep_gate_min_batches: int = 20
+    # which class directions L_sep is built from (loss_type = "joint_sep" only).
+    #   None  -- AUTOMATIC, and the pre-existing behaviour: CENTRED means
+    #            (mu_c - mu_G) at C >= 3, RAW means (mu_c) at C = 2. Every
+    #            archived config leaves this None and is therefore unchanged.
+    #   True  -- force the CENTRED form. Faithful to the NC2 definition of
+    #            Papyan, Han and Donoho, which is a statement about mu_c - mu_G.
+    #            NEAR-VACUOUS at C = 3: centring forces sum_c (mu_c - mu_G) = 0,
+    #            and three unit vectors summing to zero have pairwise cosines
+    #            of exactly -1/2 whenever their norms are equal -- for ANY
+    #            arrangement at ANY scale, a collapsed one included. What the
+    #            term then penalises is norm imbalance, not separation.
+    #   False -- force the RAW form. At C = 3 this is a genuine separation
+    #            requirement (three unit class means 120 degrees apart) and is
+    #            geometrically reachable, since the head L2-normalises without
+    #            confining the embedding to the positive orthant. It is NOT a
+    #            "corrected" NC2 term but a DIFFERENT, stronger one: it also
+    #            imposes mu_G -> 0. Any write-up must say which form ran.
+    # Searched as a binary axis under the joint condition search (decision D6);
+    # sep_centred in the per-epoch history records which form actually ran.
+    sep_centre_means: Optional[bool] = None
+    # tau: the WARM-UP fraction that replaces the latching gate. The weight on
+    # the separation term ramps linearly from 0 to lambda_sep over the first
+    # tau * T optimiser steps and is constant thereafter,
+    #     lambda_sep(t) = lambda_sep * min(1, t / (tau * T)),
+    #     T = max_epochs * batches_per_epoch,   for all t in {1, ..., T}.
+    # tau = 0.0 is the DEFAULT and means "full weight from the first step",
+    # which reproduces the pre-existing ungated behaviour
+    # (sep_gate_threshold = None) exactly.
+    # tau is FIXED, never searched: the loss integrates to
+    # lambda_sep * T * (1 - tau/2), so tau and lambda_sep trade off almost
+    # multiplicatively -- the same ridge argument that fixes margin whenever
+    # angular_alpha_deg is searched.
+    sep_warmup_frac: float = 0.0
 
     # --- batching (ConditionBalancedBatchSampler; added in Stage 5) ---
     # windows_per_condition = B_c: windows drawn from EACH phenotype class per
@@ -758,6 +791,18 @@ class TrainConfig:
             raise ValueError(
                 "sep_gate_threshold is a silhouette and must lie in [-1, 1] "
                 "or be None; got %r" % (self.sep_gate_threshold,))
+        if not (0.0 <= float(self.sep_warmup_frac) <= 1.0):
+            raise ValueError(
+                "sep_warmup_frac (tau) is a FRACTION OF TRAINING and must lie "
+                "in [0, 1]: 0 means full lambda_sep from the first step, 1 "
+                "means the ramp finishes exactly at the last planned step; "
+                "got %r" % (self.sep_warmup_frac,))
+        if (self.sep_centre_means is not None
+                and not isinstance(self.sep_centre_means, bool)):
+            raise ValueError(
+                "sep_centre_means must be True, False or None (None = the "
+                "automatic rule: centred at C >= 3, raw at C = 2); got %r"
+                % (self.sep_centre_means,))
         if (self.loss_type in ("joint", "joint_sep")
                 and self.strict_semihard
                 and self.mining_strategy == "hard"):
@@ -900,11 +945,61 @@ class SearchConfig:
     #       it in dimension, since 140 trials sample 10-D far more thinly than
     #       three GPs sample 4-D, 5-D and 2-D.
     # Which wins is empirical. Run both, same seed, same data.
+    #   "joint_conditions":
+    #       the joint space PLUS the four CATEGORICAL experimental factors
+    #       (mining_strategy, loss_type, strict_semihard, head geometry), i.e.
+    #       the 18-axis space that REPLACES the 52-cell factorial. The factors
+    #       are searched rather than enumerated, because the screening found
+    #       the head geometries differ chiefly in generalisation gap and the
+    #       strict-filter x head interaction was the largest effect measured --
+    #       a staged search would fix the head before loss_type is a variable.
+    #       Illegal combinations are removed by the legality projection Pi
+    #       (condition_space.project_condition) BEFORE any config is built.
+    #
+    # It is ONE knob rather than "joint" plus a separate boolean, so the
+    # meaningless combination (staged + searched conditions) is not
+    # representable at all.
     search_mode: str = "staged"
     # Joint budget. 0 = MATCH the staged total (n_calls_arch + n_calls_train +
     # regularization.n_calls), which is the only setting under which a
     # staged-vs-joint comparison is about strategy rather than about compute.
     n_calls_joint: int = 0
+    # Size of the random initial design for the JOINT search specifically.
+    # 0 = fall back to n_initial_points, and then to the legacy rule. It is a
+    # separate field because the joint-with-conditions space is far wider than
+    # any staged phase (22 surrogate columns against 4, 5 and 2), so the number
+    # of pre-surrogate draws it wants is not the number those phases want.
+    n_initial_points_joint: int = 0
+
+    # --- the four categorical experimental factors -------------------------- #
+    # These were the 52 config FILES of the screening factorial; the joint
+    # search carries them as dimensions instead. Each list is the set of LEVELS
+    # the search may sample. Defaults are the full level sets, i.e. the whole
+    # factorial; restrict one to a single level to freeze that factor without
+    # touching the code.
+    #
+    # They are INERT unless the joint condition search is running: nothing in
+    # the staged pipeline reads them, so every archived config keeps its exact
+    # semantics whether or not these fields are present in its JSON.
+    mining_strategy_choices: Tuple[str, ...] = (
+        "hard", "easy_positive", "easy_pos_semihard_neg")
+    loss_type_choices: Tuple[str, ...] = ("triplet", "joint", "joint_sep")
+    # The three binaries below are encoded as Integer(0, 1) rather than as a
+    # two-level Categorical. A two-level one-hot is exactly redundant
+    # (x2 = 1 - x1), so this saves one surrogate column each for free, and a
+    # binary carries no false ordering. Same for block_family_choices above:
+    # the BUG 2 warning in search.py is specifically that a REAL block_family
+    # yields floats such as 0.37 and Block_array[0.37] raises TypeError;
+    # Integer yields genuine Python ints and is safe. The Stage 4 smoke test
+    # asserts that int-ness rather than trusting it.
+    strict_semihard_choices: Tuple[int, ...] = (0, 1)
+    head_fusion_choices: Tuple[int, ...] = (0, 1)
+    # 0 -> head_pool_ops = ("mean",);  1 -> ("mean", "max", "std")
+    head_pool_ops_choices: Tuple[int, ...] = (0, 1)
+    # 0 -> sep_centre_means = False (raw class means)
+    # 1 -> sep_centre_means = True  (centred class means)
+    # Active only under loss_type = "joint_sep"; see TrainConfig.
+    sep_centre_means_choices: Tuple[int, ...] = (0, 1)
 
     # [C2] Adaptive lexicographic tie-break. The search objective becomes
     #     J_eps(t) = -(1/S) sum_sigma [ ARI(t,sigma,e*) + eps * Sil(t,sigma,e*) ],
@@ -978,11 +1073,42 @@ class SearchConfig:
         # (config construction) as well as in resolve_n_initial_points (call
         # site), so the error fires BEFORE any trace is generated rather than
         # after the data cache is built.
-        if self.search_mode not in ("staged", "joint"):
-            raise ValueError("search_mode must be 'staged' or 'joint'; got %r"
-                             % (self.search_mode,))
+        if self.search_mode not in ("staged", "joint", "joint_conditions"):
+            raise ValueError(
+                "search_mode must be 'staged', 'joint' or 'joint_conditions'; "
+                "got %r" % (self.search_mode,))
         if self.n_calls_joint < 0:
             raise ValueError("n_calls_joint must be >= 0 (0 = match the staged total)")
+        if self.n_initial_points_joint < 0:
+            raise ValueError(
+                "n_initial_points_joint must be >= 0 (0 = fall back to "
+                "n_initial_points, then to the legacy rule)")
+        # An EMPTY choice list is the failure this checks for: it would build a
+        # zero-level dimension, which skopt rejects only later and obscurely.
+        # An UNKNOWN level is the other: it would be sampled, written into the
+        # config, and rejected by TrainConfig only once a trial started.
+        def _check_choices(name, choices, allowed):
+            seq = tuple(choices)
+            if len(seq) < 1:
+                raise ValueError(
+                    "%s must list at least one level (it is the set the search "
+                    "may sample); got an empty list" % name)
+            bad = [c for c in seq if c not in allowed]
+            if bad:
+                raise ValueError("%s: unknown level(s) %r; allowed %r"
+                                 % (name, bad, allowed))
+            if len(set(seq)) != len(seq):
+                raise ValueError("%s contains duplicate levels: %r" % (name, seq))
+
+        _check_choices("mining_strategy_choices", self.mining_strategy_choices,
+                       ("hard", "easy_positive", "easy_pos_semihard_neg"))
+        _check_choices("loss_type_choices", self.loss_type_choices,
+                       ("triplet", "joint", "joint_sep"))
+        for _name, _val in (("strict_semihard_choices", self.strict_semihard_choices),
+                            ("head_fusion_choices", self.head_fusion_choices),
+                            ("head_pool_ops_choices", self.head_pool_ops_choices),
+                            ("sep_centre_means_choices", self.sep_centre_means_choices)):
+            _check_choices(_name, _val, (0, 1))
         if self.n_initial_points < 0:
             raise ValueError(
                 "n_initial_points must be >= 0 (0 means the legacy rule "
