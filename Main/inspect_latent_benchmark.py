@@ -146,7 +146,7 @@ def latent_spec_from_config_dict(cfg: Dict[str, object],
         fs=fs,
         class_overlap=float(class_overlap if class_overlap is not None
                             else lat.get("class_overlap", 0.10)),
-        class_center_mode=str(lat.get("class_center_mode", "interior")),
+        class_center_mode=str(lat.get("class_center_mode", "simplex")),
         n_neurons=n_neu,
         gaussian_window=float(lat.get("gaussian_window", 0.04)),
         seed=base_seed,
