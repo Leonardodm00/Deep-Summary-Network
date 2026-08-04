@@ -455,6 +455,18 @@ def main(argv=None):
               "space the study will not actually search."
               % (cfg.search.search_mode,))
 
+    # --no-params skips the parameter counts, but the wall-clock extrapolation
+    # regresses seconds-per-epoch on those counts and averages over them. The
+    # two flags are mutually exclusive. Refuse HERE, before the timing runs:
+    # the old behaviour raised KeyError('params_all') in extrapolate_hours only
+    # AFTER every timed point had been trained, throwing the whole measurement
+    # away at the last step.
+    if args.no_params and args.time_points > 0:
+        print("ABORT: --no-params cannot be combined with --time-points. The "
+              "wall-clock model is a regression on parameter counts, so the "
+              "counts are required. Drop --no-params.")
+        return 2
+
     report = dry_run(cfg, args.n, args.random_state,
                      count_params=not args.no_params)
 
