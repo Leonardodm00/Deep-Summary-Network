@@ -1,0 +1,151 @@
+#!/bin/bash
+#PBS -N l3c_fact52
+#PBS -l select=1:ncpus=16
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#
+# NOTE: there is deliberately NO "#PBS -J" directive here. This script runs ONE
+# configuration, selected by PBS_ARRAY_INDEX. launch_factorial52.sh supplies
+# that index -- either by passing -J on the qsub command line (array mode) or
+# by setting PBS_ARRAY_INDEX per job (lanes mode, the default).
+#
+# Baking "-J 0-51" in would be a trap: in lanes mode the launcher submits this
+# script 52 times, and each submission would expand into its own 52-element
+# array -- 2704 jobs instead of 52.
+#
+# Run it directly and it does index 0, or the index you pass:
+#     qsub -v PBS_ARRAY_INDEX=7 Main/hpc/run_factorial52_screen.pbs
+#     bash Main/hpc/run_factorial52_screen.pbs 7
+#
+# run_factorial52_screen.pbs
+# ==========================
+#
+# The 52-cell screening factorial, one array index per configuration.
+#
+#     mkdir -p logs
+#     qsub Main/hpc/run_factorial52_screen.pbs
+#
+# THE GRID (52 = 13 x 4)
+#   mining          hard | easy_positive | easy_pos_semihard_neg
+#   loss_type       triplet | joint | joint_sep
+#   strict_semihard on | off        (not applicable to triplet)
+#   head geometry   head_fusion {false, true} x pool {mean, mean+max+std}
+#
+#   15 loss/mining/filter combinations MINUS 2 that are empty by construction
+#   (hard mining + strict filter: the miner returns D_an < D_ap, the filter
+#   keeps D_ap < D_an, so nothing survives) = 13, times 4 head geometries.
+#
+# SCREENING, NOT SEARCHING. Every cell runs --skip-search: one fixed
+# configuration, 3 seeds, no hyper-parameter search. A full 140-trial search on
+# all 52 cells would be roughly 1500 h of wall time, scaling from the archived
+# l3c study's ~30 h/cell. Screening is about 1/140th of that per cell. Use it to
+# decide WHICH cells deserve a full search, then run those with the
+# factorial_full/ configs.
+#
+# READ THE CENSUS, NOT THE ARI. With no search and 3 seeds on a 3-class
+# benchmark, per-cell ARI differences are not evidence. What screening answers
+# is whether each objective is mechanically sound: does it produce gradient,
+# does the filter starve it, does the gate latch.
+#
+# Pure ASCII.
+
+set -uo pipefail
+
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# --- locate Main/ -----------------------------------------------------------
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 1; fi
+cd "$MAIN"
+export PYTHONPATH="$MAIN"
+
+# --- environment ------------------------------------------------------------
+module load anaconda3 2>/dev/null || true
+source activate brian_env 2>/dev/null || conda activate brian_env 2>/dev/null || true
+python3 -c "import torch, pytorch_metric_learning, skopt, sklearn" || {
+    echo "ABORT: dependencies not importable."; exit 1; }
+
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
+export MKL_NUM_THREADS=$OMP_NUM_THREADS
+
+# --- pick this array index's config -----------------------------------------
+CFG_DIR="hpc/Config/factorial"
+IDX="${PBS_ARRAY_INDEX:-${1:-0}}"
+
+# sorted() so the index -> config mapping is STABLE across submissions; a
+# glob-order mapping would silently repoint indices if a file were added.
+CONFIG=$(python3 - "$CFG_DIR" "$IDX" <<'PYEOF'
+import glob, os, sys
+files = sorted(glob.glob(os.path.join(sys.argv[1], "*.json")))
+i = int(sys.argv[2])
+if not (0 <= i < len(files)):
+    sys.stderr.write("index %d out of range (%d configs)\n" % (i, len(files)))
+    raise SystemExit(1)
+print(files[i])
+PYEOF
+) || { echo "ABORT: could not resolve config for index $IDX"; exit 1; }
+
+NAME=$(basename "$CONFIG" .json)
+OUT_DIR="${OUT_DIR:-$MAIN/../out_factorial52}/$NAME"
+# ONE shared trace cache: all 52 cells use the SAME benchmark data, and the
+# fingerprint check refuses a stale cache, so sharing is safe and avoids
+# regenerating 45 x 600 s of traces 52 times.
+CACHE_DIR="${CACHE_DIR:-$MAIN/../cache_l3c_simplex_3axis}"
+
+echo "=============================================================="
+echo "array index : $IDX"
+echo "config      : $CONFIG"
+echo "out         : $OUT_DIR"
+echo "cache       : $CACHE_DIR (shared)"
+echo "=============================================================="
+
+# --- preflight --------------------------------------------------------------
+python3 hpc/preflight_config.py "$CONFIG" || {
+    echo "ABORT: preflight rejected $CONFIG"; exit 1; }
+
+# --- run --------------------------------------------------------------------
+# NOTE: NO --overwrite-cache here. Index 0 builds the cache, the rest reuse it.
+# If you change the benchmark (label_axes, class_center_mode, tau, duration),
+# delete $CACHE_DIR by hand -- the fingerprint will otherwise refuse to start,
+# which is the intended loud failure rather than silent training on old traces.
+python3 run_optimization.py \
+    --config "$CONFIG" \
+    --skip-search \
+    --out-dir "$OUT_DIR" \
+    --cache-dir "$CACHE_DIR" \
+    --device cpu \
+    --verbose
+RC=$?
+
+echo ""
+echo "== census for $NAME =="
+python3 - "$OUT_DIR" <<'PYEOF'
+import glob, os, sys
+import torch
+out = sys.argv[1]
+cks = sorted(glob.glob(os.path.join(out, "**", "checkpoints", "seed_*", "last.pt"),
+                       recursive=True))
+if not cks:
+    print("  no checkpoint found"); raise SystemExit(0)
+ck = torch.load(cks[0], map_location="cpu", weights_only=False)
+h = ck.get("extra", {}).get("history") or []
+if not h:
+    print("  no history"); raise SystemExit(0)
+last = h[-1]
+zero = sum(1 for r in h if r.get("n_active", 1) == 0)
+fr = [r.get("n_strict", 0) / max(1.0, r.get("n_mined", 1)) for r in h]
+fired = [r["epoch"] for r in h if r.get("sep_active", 0) >= 1]
+print("  epochs=%d  loss %.4f -> %.4f  sil %.4f -> %.4f  ari %.4f"
+      % (len(h), h[0]["train_loss"], last["train_loss"],
+         h[0]["silhouette"], last["silhouette"], last["ari"]))
+print("  n_active==0 in %d/%d epochs | min strict/mined %.3f | gate %s | "
+      "sep_cos %+.4f"
+      % (zero, len(h), min(fr),
+         ("latched@%d" % fired[0]) if fired else "never",
+         float(last.get("sep_mean_cos", float("nan")))))
+if max(r["train_loss"] for r in h) == 0.0:
+    print("  *** train_loss IDENTICALLY ZERO -- this cell trained nothing ***")
+PYEOF
+
+exit $RC

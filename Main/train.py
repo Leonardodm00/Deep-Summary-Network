@@ -213,22 +213,105 @@ def resolve_device(spec):
     return torch.device(s)
 
 
-def build_loss_and_miner(train_cfg):
-    """Assemble the cosine triplet loss and the miner.
+def build_loss_and_miner(train_cfg, n_classes=None, total_steps=None):
+    """Assemble the loss and the miner.
 
     The SAME distance family (CosineSimilarity, an inverted metric) is passed
     EXPLICITLY to both. Passing it only to the loss would leave the miner on its
     LpDistance default, so the mined triplets and the scored triplets would live
     in different geometries.
 
-    Returns (loss_fn, miner).
+    THE MINER IS UNAFFECTED BY loss_type: all three mining strategies stay
+    available under every loss. The composite loss hands whatever the miner
+    returned to pytorch_metric_learning's own lmu.convert_to_triplets, so a
+    3-tuple from a triplet miner and a 4-tuple from a pair miner are converted
+    by exactly the rule TripletMarginLoss already applies internally.
+
+    loss_type dispatch:
+      "triplet"   -- losses.TripletMarginLoss, unchanged, the default
+      "joint"     -- JointTripletLoss (margin + angular hinge, optional filter)
+      "joint_sep" -- CompositeDSNLoss (the above + the gated separation term)
+
+    The margin is stated in COSINE distance in the config and the composite loss
+    works in SQUARED EUCLIDEAN, so it is converted here, once, explicitly:
+    ||u - v||^2 = 2 d_cos(u, v), hence margin = 2 * m_cos. The MINER keeps the
+    cosine margin, because it scores under CosineSimilarity.
+
+    n_classes (C) is required for "joint_sep": the separation target -1/(K-1)
+    and the supervised class masking are both built from it.
+
+    total_steps (T = max_epochs * batches_per_epoch) is required for
+    "joint_sep" whenever train_cfg.sep_warmup_frac > 0: it is the horizon the
+    separation weight ramps over. Passing None with a nonzero tau is not an
+    error but it is not a warm-up either -- SepWarmup warns and holds the
+    weight constant, because a ramp without a horizon is not well posed.
+
+    THE SILHOUETTE GATE IS NO LONGER BUILT. sep_gate_threshold,
+    sep_gate_momentum and sep_gate_min_batches remain in TrainConfig so every
+    archived config still loads, but they are INERT on this path; a config that
+    sets a threshold gets a warning rather than a silently different objective.
+
+    Returns (loss_fn, miner). Every returned loss accepts the SAME call
+    signature loss_fn(Z, y, pairs), so the batch loop is identical either way.
     """
-    loss_fn = losses.TripletMarginLoss(
-        margin=float(train_cfg.margin),
-        swap=bool(train_cfg.swap),
-        distance=distances.CosineSimilarity(),
-        reducer=reducers.AvgNonZeroReducer(),
-    )
+    loss_type = str(getattr(train_cfg, "loss_type", "triplet"))
+    if loss_type == "triplet":
+        loss_fn = losses.TripletMarginLoss(
+            margin=float(train_cfg.margin),
+            swap=bool(train_cfg.swap),
+            distance=distances.CosineSimilarity(),
+            reducer=reducers.AvgNonZeroReducer(),
+        )
+    elif loss_type in ("joint", "joint_sep"):
+        from dsn_joint_loss import CompositeDSNLoss, JointTripletLoss
+        margin_sq = 2.0 * float(train_cfg.margin)          # cosine -> sq. Euclid
+        if loss_type == "joint":
+            loss_fn = JointTripletLoss(
+                margin=margin_sq,
+                alpha_deg=float(train_cfg.angular_alpha_deg),
+                use_angular=True,
+                strict_semihard=bool(train_cfg.strict_semihard),
+                swap=bool(train_cfg.swap),
+                reduce_nonzero=True,               # matches AvgNonZeroReducer
+            )
+        else:
+            if n_classes is None:
+                raise ValueError(
+                    "loss_type='joint_sep' needs n_classes to build the "
+                    "centroid-separation target -1/(C-1)")
+            if getattr(train_cfg, "sep_centre_means", None) is not None:
+                warnings.warn(
+                    "sep_centre_means=%r is INERT: L_sep is always built from "
+                    "the RAW normalised class means now. The centred form was "
+                    "removed because it is invariant to scale and so cannot "
+                    "see collapse."
+                    % (train_cfg.sep_centre_means,), RuntimeWarning)
+            if train_cfg.sep_gate_threshold is not None:
+                warnings.warn(
+                    "sep_gate_threshold=%r is INERT: the latching silhouette "
+                    "gate has been replaced by the deterministic warm-up "
+                    "lambda_sep(t) = lambda_sep * min(1, t / (tau * T)), tau = "
+                    "train.sep_warmup_frac. The gate parameters are kept in "
+                    "TrainConfig only so archived configs still load. Set "
+                    "sep_warmup_frac to schedule the term."
+                    % (train_cfg.sep_gate_threshold,), RuntimeWarning)
+            loss_fn = CompositeDSNLoss(
+                n_classes=int(n_classes),
+                margin=margin_sq,
+                alpha_deg=float(train_cfg.angular_alpha_deg),
+                lambda_sep=float(train_cfg.lambda_sep),
+                total_steps=(None if total_steps is None else int(total_steps)),
+                warmup_frac=float(train_cfg.sep_warmup_frac),
+                use_angular=True,
+                strict_semihard=bool(train_cfg.strict_semihard),
+                swap=bool(train_cfg.swap),
+                reduce_nonzero=True,
+            )
+    else:
+        raise ValueError(
+            "unknown loss_type %r (expected 'triplet', 'joint' or 'joint_sep')"
+            % (loss_type,))
+
     if train_cfg.mining_strategy == "hard":
         miner = miners.TripletMarginMiner(
             margin=float(train_cfg.margin),
@@ -425,8 +508,27 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
     tcfg = cfg.train
 
     # ---- model / loss / miner / optimizer / scheduler ----------------------
+    # C is derived BEFORE the loss is built: loss_type="joint_sep" needs it to
+    # form the separation target -1/(C-1) and the supervised class masking.
+    conditions = np.asarray(train_ds.conditions_per_item, dtype=int).ravel()
+    n_classes = int(np.unique(conditions).shape[0])
+
+    # n_batches is derived HERE, before the loss, because the separation
+    # warm-up needs the PLANNED step budget T = max_epochs * batches_per_epoch
+    # at construction time. It is a pure function of the training set size and
+    # the config, so moving it earlier changes nothing about its value.
+    n_windows = int(len(train_ds.index))
+    n_batches = derive_batches_per_epoch(
+        n_windows=n_windows, n_classes=n_classes,
+        windows_per_condition=tcfg.windows_per_condition,
+        batches_per_epoch=tcfg.batches_per_epoch)
+    total_steps = int(tcfg.max_epochs) * int(n_batches)
+
     model = build_backbone(cfg.backbone).to(device)
-    loss_fn, miner = build_loss_and_miner(tcfg)
+    loss_fn, miner = build_loss_and_miner(tcfg, n_classes=n_classes,
+                                          total_steps=total_steps)
+    if isinstance(loss_fn, torch.nn.Module):
+        loss_fn = loss_fn.to(device)
     optimizer = build_optimizer(model, tcfg)
     scheduler = build_scheduler(optimizer, tcfg)
 
@@ -439,15 +541,7 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             % device.type, RuntimeWarning)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    # ---- batching ---------------------------------------------------------
-    conditions = np.asarray(train_ds.conditions_per_item, dtype=int).ravel()
-    n_classes = int(np.unique(conditions).shape[0])
-    n_windows = int(len(train_ds.index))
-    n_batches = derive_batches_per_epoch(
-        n_windows=n_windows, n_classes=n_classes,
-        windows_per_condition=tcfg.windows_per_condition,
-        batches_per_epoch=tcfg.batches_per_epoch)
-
+    # ---- batching (n_batches / total_steps derived above, with the loss) ---
     dcfg = cfg.data
     if dcfg.positives_mode == "cross_culture":
         # [C4] culture id per training window = the dataset-local trace index
@@ -722,6 +816,16 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         u_e, v_e, delta, epsilon = _primary_secondary(
             m, tcfg.selection_primary, tcfg.min_delta_ari, min_delta_sil_eff)
 
+        # composite-loss census. loss_fn.stats() returns DEVICE TENSORS; they are
+        # converted here, ONCE PER EPOCH, so the single-.item()-per-epoch
+        # discipline (decision 13, guarded by smoke_test_train [D-strict]) is
+        # preserved. A frozen run and a converged run are indistinguishable in
+        # history without this.
+        loss_census = {}
+        if hasattr(loss_fn, "stats"):
+            for _k, _v in loss_fn.stats().items():
+                loss_census[_k] = float(_v)
+
         record = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -737,6 +841,7 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
             "health": {k: float(health[k]) for k in
                        ("min_std", "mean_std", "eff_rank", "mean_pairwise_cos")},
         }
+        record.update(loss_census)
         history.append(record)
 
         # ---- the locked early-stopping / best-epoch rule ------------------
@@ -781,6 +886,16 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
                 "history": history,
                 "best_state": best_state,
             }
+            # The composite loss carries STATE: the gate's running silhouette,
+            # its batch counter and its latch. Without this a resumed run
+            # re-warms from zero and latches later than it would have, silently
+            # changing the objective schedule. Stored under "extra" so the
+            # checkpoint format is unchanged for loss_type="triplet".
+            if isinstance(loss_fn, torch.nn.Module):
+                _ls = loss_fn.state_dict()
+                if _ls:
+                    extra["loss_state"] = {k: v.detach().cpu()
+                                           for k, v in _ls.items()}
             save_kw = dict(
                 config=cfg, model=model, optimizer=optimizer, scheduler=scheduler,
                 epoch=epoch, best_metric={"ari": record["ari"],

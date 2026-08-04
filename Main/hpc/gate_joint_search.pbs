@@ -1,0 +1,172 @@
+#!/bin/bash
+#PBS -N dsn_gate
+#PBS -l select=1:ncpus=48
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o dsn_gate.out
+
+# ======================================================================
+# gate_joint_search.pbs -- Stage 7 SUBMISSION GATE, measured on the node
+# ======================================================================
+#
+# WHY THIS IS A JOB AND NOT A LOGIN-NODE COMMAND
+# ----------------------------------------------
+# search_dry_run.py refuses to authorise submission unless the wall clock
+# has been MEASURED. The measurement is a regression of seconds-per-epoch
+# on parameter count, fitted over --time-points sampled architectures, and
+# then averaged over the sampled size distribution. That number is a
+# property of the HARDWARE. Measuring it on a login node, a laptop, or any
+# machine with a different core count produces a figure that does not
+# transfer, and the gate would then be authorising a run against the wrong
+# cost model. Run it here, on the same node type the search will use, with
+# the same thread count.
+#
+# COST: --time-points 10 at --time-epochs 3 is ~30 short training runs.
+# Two hours of walltime is generous; it usually finishes in well under one.
+#
+# USAGE
+#   qsub -v CFG=hpc/Config/config_l2c_joint_search_e60.json,WALL=144 \
+#        Main/hpc/gate_joint_search.pbs
+#
+#   CFG   config to gate            (required)
+#   WALL  requested walltime, hours (default 144)
+#   NPTS  timed points              (default 10)
+#   NEP   epochs per timed point    (default 3; the first is discarded)
+#
+# EXIT CODE
+#   0 -> the gate authorises submission
+#   non-zero -> DO NOT SUBMIT. Read which check failed.
+#
+# Pure ASCII (hpc-python-compat).
+# ======================================================================
+
+set -uo pipefail
+
+# ---- resolve Main/ ---------------------------------------------------
+cd "${PBS_O_WORKDIR:-$PWD}"
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+cd "$MAIN"
+export PYTHONPATH="$MAIN"
+
+# ---- arguments -------------------------------------------------------
+CFG="${CFG:-}"
+if [ -z "$CFG" ]; then
+    echo "ABORT: set CFG, e.g."
+    echo "  qsub -v CFG=hpc/Config/config_l2c_joint_search_e60.json dsn_gate.pbs"
+    exit 2
+fi
+if [ ! -f "$CFG" ]; then echo "ABORT: config not found: $CFG"; exit 2; fi
+
+WALL="${WALL:-144}"
+NPTS="${NPTS:-10}"
+NEP="${NEP:-3}"
+NCPUS=48                     # MUST match '#PBS -l select=' above
+
+# ---- environment -----------------------------------------------------
+CONDA_ENV="${DSN_CONDA_ENV:-brian_env}"
+if command -v module >/dev/null 2>&1; then
+    module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV" || echo "WARN: could not activate $CONDA_ENV"
+fi
+
+# torch.set_num_threads() does NOT bind the BLAS underneath. These must be
+# exported BEFORE python starts or the timing measures a contended machine
+# and the whole cost model is wrong.
+export OMP_NUM_THREADS="$NCPUS"
+export MKL_NUM_THREADS="$NCPUS"
+export OPENBLAS_NUM_THREADS="$NCPUS"
+export NUMEXPR_NUM_THREADS="$NCPUS"
+
+python3 -c "import torch, pytorch_metric_learning, skopt, sklearn" || {
+    echo "ABORT: dependencies not importable in env '$CONDA_ENV'."; exit 2; }
+
+# ---- guard: ncpus must equal runtime.torch_threads -------------------
+CFG_THREADS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['runtime']['torch_threads'])" "$CFG")
+if [ "$CFG_THREADS" != "$NCPUS" ]; then
+    echo "ABORT: runtime.torch_threads=$CFG_THREADS but the job has ncpus=$NCPUS."
+    echo "       There is no CLI override for torch_threads, so the timing"
+    echo "       would be measured on an over- or under-subscribed machine."
+    exit 2
+fi
+
+# ---- guard: the tau-axis invariants ---------------------------------
+# Since tau (sep_warmup_frac) became axis 18, train.sep_warmup_frac is the
+# CLAMP CONSTANT for the trials where tau is inactive and must be 0.0.
+# preflight only WARNS about this and still exits 0, so a violating config
+# would sail through and produce a study in which two points differing only
+# in tau build different configs. Fail here instead, before the timing.
+python3 - "$CFG" <<'PYEOF'
+import json, sys
+from skopt.space import Space
+import warnings
+sys.path.insert(0, ".")
+from config import ExperimentConfig
+import search as S
+
+path = sys.argv[1]
+raw = json.load(open(path))
+tau0 = float(raw.get("train", {}).get("sep_warmup_frac", 0.0))
+if tau0 != 0.0:
+    print("ABORT: train.sep_warmup_frac = %r, must be 0.0 (the clamp constant)." % tau0)
+    raise SystemExit(1)
+
+cfg = ExperimentConfig.from_json(path)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    dims = S.joint_condition_space(cfg.search, cfg.regularization, cfg.train)
+n_ax, n_col = len(dims), Space(dims).transformed_n_dims
+if (n_ax, n_col) != (18, 22):
+    print("ABORT: space is %d axes / %d columns, expected 18 / 22. Stale checkout?"
+          % (n_ax, n_col))
+    raise SystemExit(1)
+cap = min(1.0, float(cfg.train.patience) / float(cfg.train.max_epochs))
+print("OK: 18 axes / 22 columns; clamp constant 0.0; tau_max = %.6f" % cap)
+PYEOF
+if [ $? -ne 0 ]; then echo "ABORT: tau-axis invariants failed."; exit 5; fi
+
+echo "======================================================================"
+echo "config    : $CFG"
+echo "walltime  : $WALL h (gate margin beta = 0.15 -> budget $(python3 -c "print(0.85*$WALL)") h)"
+echo "threads   : ncpus=$NCPUS torch_threads=$CFG_THREADS OMP=$OMP_NUM_THREADS"
+echo "host      : $(hostname)"
+echo "python    : $(python3 --version 2>&1)  conda: ${CONDA_DEFAULT_ENV:-none}"
+echo "started   : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo "======================================================================"
+
+# ---- 1. does the config load, and does it say what you think? --------
+echo ""; echo "---- [1/3] preflight ----"
+python3 hpc/preflight_config.py "$CFG" || { echo "ABORT: preflight rejected."; exit 3; }
+
+# ---- 2. does the data resolve, without training? ---------------------
+echo ""; echo "---- [2/3] data resolution (no training) ----"
+python3 run_optimization.py --config "$CFG" --dry-run || {
+    echo "ABORT: data did not resolve."; exit 4; }
+
+# ---- 3. coverage + size mix + MEASURED wall clock -> the GATE --------
+echo ""; echo "---- [3/3] submission gate (timed on this node) ----"
+REPORT="dry_run_$(basename "$CFG" .json).json"
+python3 search_dry_run.py \
+    --config "$CFG" \
+    --n 300 \
+    --time-points "$NPTS" \
+    --time-epochs "$NEP" \
+    --walltime "$WALL" \
+    --out "$REPORT"
+GATE=$?
+
+echo ""
+echo "======================================================================"
+echo "report    : $MAIN/$REPORT"
+echo "finished  : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+if [ "$GATE" -eq 0 ]; then
+    echo "GATE      : PASS -- authorised to submit the search."
+else
+    echo "GATE      : FAIL (exit $GATE) -- DO NOT SUBMIT. Read the checks above."
+fi
+echo "======================================================================"
+exit $GATE

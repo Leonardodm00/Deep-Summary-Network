@@ -109,7 +109,198 @@ def preflight(path, verbose=True):
                      "split and geometry arithmetic below is SKIPPED."
                      % (d.data_mode,))
 
+    # ---- objective feasibility -------------------------------------------- #
+    # The margin demands that the closest class pair sit at least m_cos apart in
+    # cosine distance. The largest achievable MINIMUM pairwise cosine distance
+    # over C classes on the unit hypersphere is C/(C-1), so the margin implies
+    #
+    #     S >= m_cos * (C - 1) / C                                        (7)
+    #
+    # on the mean silhouette.
+    #
+    # NO PRACTICAL CEILING IS IMPOSED ON S. An earlier version of this guard
+    # refused any margin implying S >= 0.8, on the grounds that the archived
+    # cells only ever reached 0.424 to 0.556. That calibration is NOT a property
+    # of the geometry: every one of those runs used an ANTI-COLLAPSE mining
+    # strategy (easy positives, chosen precisely so that same-class windows are
+    # not dragged to a single point), so 0.556 describes what is reachable while
+    # actively resisting within-class collapse, not what is reachable at all.
+    # Under a collapse-SEEKING configuration -- hard mining, small alpha, the
+    # NC2 separation term -- a high S is the OBJECTIVE, not a red flag, and
+    # S -> 1 is the intended terminal state (NC1 in Papyan et al.'s decomposition,
+    # of which L_sep implements only NC2).
+    #
+    # What remains is the one bound that is arithmetic rather than judgement:
+    # S <= 1 always, so a margin demanding more than that cannot be met by any
+    # embedding whatsoever. That is the only case still refused.
+    lines.append("")
+    lines.append("OBJECTIVE")
+    lines.append("  loss_type=%s  mining=%s  swap=%s  strict_semihard=%s"
+                 % (t.loss_type, t.mining_strategy, t.swap, t.strict_semihard))
+    s_req = float(t.margin) * (C - 1) / float(C)
+    lines.append("  margin m_cos = %.4g at C = %d  ->  implies silhouette "
+                 ">= %.4g" % (t.margin, C, s_req))
+    if s_req > 1.0:
+        problems["raise"].append(
+            "margin %.3f implies silhouette >= %.3f at C = %d, and the "
+            "silhouette is bounded above by 1: no embedding can satisfy this "
+            "objective. Lower train.margin below %.3f."
+            % (t.margin, s_req, C, float(C) / (C - 1)))
+    if t.loss_type == "triplet":
+        # the FIXED margin is only the starting point: under "triplet" the
+        # margin is SEARCHED, so the binding number is the TOP of margin_range
+        m_hi = float(cfg.search.margin_range[1])
+        s_hi = m_hi * (C - 1) / float(C)
+        lines.append("  margin_range high = %.4g (SEARCHED)  ->  worst-case "
+                     "implied silhouette >= %.4g" % (m_hi, s_hi))
+        if s_hi > 1.0:
+            problems["raise"].append(
+                "search.margin_range high %.3f lets phase 2 sample a margin "
+                "implying silhouette >= %.3f at C = %d, which exceeds the "
+                "silhouette's upper bound of 1. Lower the range high below "
+                "%.3f." % (m_hi, s_hi, C, float(C) / (C - 1)))
+    if t.loss_type in ("joint", "joint_sep"):
+        # the angular hinge is exactly a silhouette floor: S >= 1 - 4 sin^2 alpha
+        floor = 1.0 - 4.0 * math.sin(math.radians(float(t.angular_alpha_deg))) ** 2
+        lines.append("  angular alpha = %.4g deg  ->  silhouette floor "
+                     "S >= %.4g  (tolerated a/b <= %.4g)"
+                     % (t.angular_alpha_deg, floor, 1.0 - floor))
+        if floor <= 0.0:
+            problems["warn"].append(
+                "angular_alpha_deg = %.4g gives a silhouette floor of %.3g: the "
+                "angular term is VACUOUS at this angle on L2-normalised "
+                "embeddings and will contribute no gradient. Lower alpha; "
+                "SMALL alpha is the collapse-forcing direction."
+                % (t.angular_alpha_deg, floor))
+        # alpha is the within-class collapse knob: the floor S >= 1 - 4 sin^2
+        # alpha rises monotonically as alpha falls, and alpha -> 0 demands
+        # a/b -> 0, i.e. exact within-class collapse (NC1).
+        if t.mining_strategy in ("easy_positive", "easy_pos_semihard_neg"):
+            problems["warn"].append(
+                "mining_strategy=%r is an ANTI-COLLAPSE strategy: easy "
+                "positives require only the CLOSEST same-class window to be "
+                "near, which is what lets a class spread over a manifold. It "
+                "works against the angular floor (S >= %.3g) and against the "
+                "NC2 separation term. Use mining_strategy='hard' for a "
+                "collapse-seeking run."
+                % (t.mining_strategy, floor))
+    if t.loss_type == "joint_sep":
+        # the warm-up REPLACED the gate; report what will actually run
+        tau = float(getattr(t, "sep_warmup_frac", 0.0))
+        T_planned = int(t.max_epochs) * int(t.batches_per_epoch) \
+            if int(t.batches_per_epoch) >= 1 else 0
+        if getattr(t, "sep_centre_means", None) is not None:
+            lines.append("  WARNING: sep_centre_means = %r is INERT. L_sep is "
+                         "always built from the RAW normalised class means; "
+                         "the centred form was removed (scale-invariant, so "
+                         "blind to collapse)." % (t.sep_centre_means,))
+        lines.append("  L_sep uses the RAW normalised class means (never centred)")
+        if t.sep_gate_threshold is not None:
+            lines.append("  WARNING: sep_gate_threshold = %.4g is INERT. The "
+                         "latching gate was removed; use sep_warmup_frac."
+                         % (t.sep_gate_threshold,))
+        if tau > 0.0 and T_planned and tau * T_planned > 0:
+            frac = float(t.patience) / float(t.max_epochs)
+            if frac < tau:
+                lines.append("  WARNING: patience/max_epochs = %.2f < tau = "
+                             "%.2f: a run that early-stops at its patience "
+                             "floor never reaches full lambda_sep."
+                             % (frac, tau))
+        lines.append("  [legacy] lambda_sep = %.4g  gate_threshold = %s  "
+                     "(sep means: %s)"
+                     % (t.lambda_sep,
+                        "none (always on)" if t.sep_gate_threshold is None
+                        else "%.4g" % t.sep_gate_threshold,
+                        "raw" if C == 2 else "centred"))
+        if C == 2 and t.lambda_sep > 0.05:
+            problems["warn"].append(
+                "at C = 2 the separation term is computed on RAW class means "
+                "and its natural scale is roughly 30x larger than at C >= 3, so "
+                "lambda_sep = %.3g is likely far too strong. Search "
+                "search.lambda_sep_range rather than reusing a C = 3 value."
+                % (t.lambda_sep,))
+
     # ---- split arithmetic (trace mode only; time_segment cuts the time axis) --
+    # ---- the joint condition search: the objective is SEARCHED, not fixed --
+    if str(getattr(cfg.search, "search_mode", "staged")) == "joint_conditions":
+        import condition_space as CS
+        sc = cfg.search
+        lines.append("")
+        lines.append("JOINT CONDITION SEARCH (search_mode='joint_conditions')")
+        lines.append("  the OBJECTIVE block above reports the BASE config's "
+                     "values. They are the clamp constants for")
+        lines.append("  inactive coordinates, NOT what will run: these four "
+                     "factors are SEARCHED axes.")
+        lines.append("    mining_strategy in %s" % (list(sc.mining_strategy_choices),))
+        lines.append("    loss_type       in %s" % (list(sc.loss_type_choices),))
+        lines.append("    strict_semihard in %s   (projected by Pi off "
+                     "mining='hard' and off loss='triplet')"
+                     % (list(sc.strict_semihard_choices),))
+        lines.append("    head_fusion     in %s ; head_pool_ops in %s "
+                     "(0 -> ['mean'], 1 -> ['mean','max','std'])"
+                     % (list(sc.head_fusion_choices),
+                        list(sc.head_pool_ops_choices)))
+        n_legal = CS.n_legal_conditions()
+        lines.append("  legal conditions: %d of the 3 x 3 x 2 = 18 raw triples "
+                     "(x 4 head geometries = %d historical cells)"
+                     % (n_legal, 4 * n_legal))
+        lines.append("  budget: n_calls_joint = %d x n_seeds = %d = %d runs; "
+                     "n_initial_points_joint = %d"
+                     % (int(sc.n_calls_joint), int(t.n_seeds),
+                        int(sc.n_calls_joint) * int(t.n_seeds),
+                        int(sc.n_initial_points_joint)))
+        # the clamp constant that would otherwise spam warnings
+        if abs(float(t.lambda_sep) - 0.1) > 1e-12:
+            lines.append("  WARNING: train.lambda_sep = %.4g is the CLAMP "
+                         "CONSTANT for trials where it is inactive, and it is "
+                         "not the TrainConfig default 0.1, so EVERY "
+                         "triplet/joint trial will fire the 'INERT lambda_sep' "
+                         "RuntimeWarning." % (float(t.lambda_sep),))
+        # tau is the 18th SEARCHED axis, active under joint_sep only, and its
+        # upper bound is DERIVED rather than configured. No
+        # "patience/max_epochs < tau" warning is emitted here: the cap makes
+        # that condition unreachable by construction. (The OBJECTIVE block
+        # above still warns, and must -- it covers the STAGED path, where tau
+        # is fixed and no cap exists.)
+        if "joint_sep" in tuple(sc.loss_type_choices):
+            tau_lo, tau_hi = sc.sep_warmup_frac_range
+            tau_cap = CS.sep_warmup_frac_cap(int(t.patience),
+                                             int(t.max_epochs))
+            tau_hi_eff = min(float(tau_hi), tau_cap)
+            T_planned = int(t.max_epochs) * int(t.batches_per_epoch) \
+                if int(t.batches_per_epoch) >= 1 else 0
+            lines.append("    sep_warmup_frac (tau) in [%.4g, %.4g] "
+                         "(joint_sep trials only)"
+                         % (float(tau_lo), tau_hi_eff))
+            lines.append("  warm-up: tau_max = min(1, patience/max_epochs) = "
+                         "min(1, %d/%d) = %.4g   [DERIVED, not configured]"
+                         % (int(t.patience), int(t.max_epochs), tau_cap))
+            if float(tau_hi) > tau_cap:
+                lines.append("    the requested upper bound %.4g is CLIPPED to "
+                             "%.4g; search._loss_dims warns when it does this"
+                             % (float(tau_hi), tau_hi_eff))
+            if T_planned:
+                lines.append("    T = %d steps -> full lambda_sep reached "
+                             "between step %d and step %d"
+                             % (T_planned, int(float(tau_lo) * T_planned),
+                                int(tau_hi_eff * T_planned)))
+            else:
+                lines.append("    T is DERIVED at trainer build time "
+                             "(batches_per_epoch = 0), so the full-weight step "
+                             "range cannot be printed here")
+            lines.append("    the cap guarantees the ramp completes even for "
+                         "the shortest run patience permits, so 'large tau "
+                         "wins' can never mean 'the term was off'")
+            base_tau = float(getattr(t, "sep_warmup_frac", 0.0))
+            if abs(base_tau) > 1e-12:
+                lines.append("  WARNING: train.sep_warmup_frac = %.4g is the "
+                             "CLAMP CONSTANT for the trials where tau is "
+                             "inactive, and it is not the TrainConfig default "
+                             "0.0, so non-joint_sep trials will ramp a term "
+                             "they never use and two points differing only in "
+                             "tau will NOT build identical configs."
+                             % (base_tau,))
+
     lines.append("")
     lines.append("SPLIT")
     n_train_windows = None

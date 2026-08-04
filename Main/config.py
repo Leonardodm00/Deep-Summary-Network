@@ -42,7 +42,7 @@ import json
 import warnings
 from dataclasses import dataclass, field, fields, is_dataclass, asdict, replace
 from pathlib import Path
-from typing import Tuple, get_type_hints, get_origin, get_args
+from typing import Optional, Tuple, get_type_hints, get_origin, get_args
 
 from backbone import BackboneConfig
 from augmentation import AugmentationConfig
@@ -306,8 +306,20 @@ class LatentConfig:
                     holds only ~3-12 bursts and a duration CV cannot be estimated
                     from so few. Do not revert to one label axis without
                     re-running that calibration.
-    class_center_mode : where the class centres m_c sit along a label axis.
-                    "interior" (DEFAULT) places them at m_c = (c+1)/(C+1), so at
+    class_center_mode : where the class centres sit in the label subspace.
+                    "simplex" (DEFAULT) gives each class a DIFFERENT centre on
+                    EACH label axis, placed at the vertices of a regular
+                    simplex. The other two modes return ONE SCALAR per class and
+                    replicate it across every label axis, so all C centres lie
+                    on the diagonal and rank Cov({mu_c}) = 1 whatever C and L
+                    are -- the centres are collinear, and any objective asking
+                    for an ARRANGEMENT of centres (the NC2 separation term) is
+                    asking for a geometry the data does not contain. "simplex"
+                    reaches the maximum achievable rank min(L, C-1) with
+                    pairwise cosine -1/(C-1). NOTE the centre-to-centre spacing
+                    differs from "interior", so class_overlap (tau) should be
+                    re-measured rather than carried over.
+                    "interior" places them at m_c = (c+1)/(C+1), so at
                     C = 3 they are 0.25, 0.50, 0.75 and none touches a boundary
                     of [0, 1]. "endpoints" reproduces the original
                     m_c = c/(C-1) = 0, 0.5, 1, whose OUTER centres sit exactly
@@ -332,7 +344,7 @@ class LatentConfig:
         "intraburst_rate", "participation", "background")
     label_axes: Tuple[int, ...] = (0, 1)
     class_overlap: float = 0.10
-    class_center_mode: str = "interior"
+    class_center_mode: str = "simplex"
     n_neurons: int = 100
     gaussian_window: float = 0.04
     axis_overrides: Tuple[LatentAxisOverride, ...] = ()
@@ -364,10 +376,10 @@ class LatentConfig:
                 RuntimeWarning)
         if self.class_overlap < 0.0:
             raise ValueError("latent.class_overlap (tau) must be >= 0")
-        if self.class_center_mode not in ("interior", "endpoints"):
+        if self.class_center_mode not in ("simplex", "interior", "endpoints"):
             raise ValueError(
-                "latent.class_center_mode must be 'interior' or 'endpoints'; "
-                "got %r" % (self.class_center_mode,))
+                "latent.class_center_mode must be 'simplex', 'interior' or "
+                "'endpoints'; got %r" % (self.class_center_mode,))
         if int(self.n_neurons) < 1:
             raise ValueError("latent.n_neurons must be >= 1")
         if float(self.gaussian_window) <= 0.0:
@@ -602,13 +614,112 @@ class TrainConfig:
     """Trainer settings used identically by the HPO objective and the final run."""
 
     # --- loss / miner ---
-    margin: float = 0.3                     # loss margin m (searched in phase 2; default / fixed value)
+    # Which objective. ADDITIVE: "triplet" is the pre-existing behaviour and the
+    # default, so every archived config reproduces byte-identically.
+    #   "triplet"   : losses.TripletMarginLoss (margin searched, as before)
+    #   "joint"     : dsn_joint_loss.JointTripletLoss -- margin hinge PLUS the
+    #                 angular hinge, optionally on strict-semi-hard triplets.
+    #                 margin is FIXED and angular_alpha_deg is searched instead:
+    #                 both bind on the within/between ratio, so searching the
+    #                 pair moves along a ridge (see the loss handoff, S3.4).
+    #   "joint_sep" : the above PLUS the gated CentroidSeparationLoss.
+    loss_type: str = "triplet"
+    margin: float = 0.3                     # loss margin m, COSINE convention.
+                                            # Searched under "triplet"; FIXED
+                                            # under "joint" / "joint_sep".
     swap: bool = True                       # TripletMarginLoss swap
     # "hard"                  : TripletMarginMiner(type_of_triplets="hard") --
-    #                           positives FARTHER than negatives (violating triplets)
+    #                           positives FARTHER than negatives (violating
+    #                           triplets). The COLLAPSE-SEEKING choice: every
+    #                           same-class pair is pulled together, so within-
+    #                           class variance is driven down (NC1).
     # "easy_positive"         : BatchEasyHardMiner(pos=easy, neg=hard)
     # "easy_pos_semihard_neg" : BatchEasyHardMiner(pos=easy, neg=semihard)
+    #
+    # The two easy-positive strategies are ANTI-COLLAPSE by design: they require
+    # only the CLOSEST same-class window to be near the anchor, which is exactly
+    # what allows a class to spread over a manifold instead of contracting to a
+    # point. That is the right choice when within-class structure must be
+    # preserved and the WRONG one when collapse is the goal. preflight_config
+    # warns when an easy-positive strategy is paired with the composite loss.
     mining_strategy: str = "hard"
+
+    # --- composite objective (used only when loss_type != "triplet") ---
+    # angular constraint alpha, in DEGREES. Equivalent to a silhouette floor
+    # S >= 1 - 4 sin^2(alpha), which is why it is the parameter that is
+    # searched. Chung and Lee's {30, 45, 60, 75} are VACUOUS on L2-normalised
+    # embeddings: every one of them is already satisfied at this pipeline's
+    # operating point, so the term would contribute no gradient.
+    # SMALL alpha is the collapse-forcing direction: the floor rises
+    # monotonically as alpha falls (5 deg -> S >= 0.970, 2 deg -> S >= 0.995),
+    # and alpha -> 0 demands a/b -> 0, i.e. exact within-class collapse. Pair a
+    # small alpha with mining_strategy="hard"; an easy-positive miner will fight
+    # it.
+    angular_alpha_deg: float = 18.0
+    # strict semi-hard filter (Chung and Lee): keep a triplet only when the
+    # negative sits inside the margin band from BOTH the anchor and the
+    # positive. Acts on WHICH triplets are used; swap acts on how they are
+    # SCORED, so the two are not substitutes.
+    # DEFAULT FALSE, deliberately. The filter requires D_ap < D_an, which is
+    # the exact complement of what mining_strategy="hard" (the default miner)
+    # produces, so defaulting it True would make TrainConfig(loss_type="joint")
+    # an error out of the box -- and, before the guard below existed, a silent
+    # zero-gradient run. Enable it together with
+    # mining_strategy="easy_pos_semihard_neg".
+    strict_semihard: bool = False
+    # weight on the centroid-separation term (loss_type = "joint_sep" only).
+    # SCALE WARNING: L_sep has very different magnitudes either side of C = 3,
+    # because at C = 2 it is computed on RAW class means and at C >= 3 on
+    # CENTRED ones. On random unit embeddings the median is ~0.98 at C = 2 and
+    # ~0.03 at C = 3. One fixed value cannot serve both, which is why
+    # lambda_sep is searched (search.lambda_sep_range) rather than pinned.
+    lambda_sep: float = 0.1
+    # the separation term is GATED on a running estimate of the TRAINING cosine
+    # silhouette, and switches on mid-epoch at the batch where the estimate
+    # first reaches this threshold. None means "no gate": the term is active
+    # from the first batch, which is the control arm.
+    sep_gate_threshold: Optional[float] = None
+    # EMA coefficient for that running estimate. 0.0 means a cumulative mean
+    # over every batch seen instead of an EMA.
+    sep_gate_momentum: float = 0.05
+    # batches that must be seen before the gate may latch. Guards against
+    # latching on one lucky early batch at 9 rows per class.
+    sep_gate_min_batches: int = 20
+    # DEPRECATED AND INERT. L_sep is now always built from the RAW normalised
+    # class means. The centred form (mu_c - mu_G) was removed because centring
+    # then normalising is invariant to translation AND scale, so it measures
+    # only the SHAPE of the simplex of class means and never its SIZE: three
+    # classes collapsed to a cap with raw pairwise cosine +0.9994 score
+    # L_sep = 0.000035 centred against 2.248 raw. The field is kept only so
+    # archived configs still parse; setting it to anything but None warns.
+    sep_centre_means: Optional[bool] = None
+    # tau: the WARM-UP fraction that replaces the latching gate. The weight on
+    # the separation term ramps linearly from 0 to lambda_sep over the first
+    # tau * T optimiser steps and is constant thereafter,
+    #     lambda_sep(t) = lambda_sep * min(1, t / (tau * T)),
+    #     T = max_epochs * batches_per_epoch,   for all t in {1, ..., T}.
+    # tau = 0.0 is the DEFAULT and means "full weight from the first step",
+    # which reproduces the pre-existing ungated behaviour
+    # (sep_gate_threshold = None) exactly.
+    #
+    # tau IS NOW SEARCHED under the joint condition search (18th axis), and the
+    # default 0.0 is therefore ALSO the CLAMP CONSTANT: it is the value every
+    # trial whose sampled loss type is not "joint_sep" keeps, so that two
+    # points differing only in tau build byte-identical configs. Leave it at
+    # 0.0 in any base config for that search.
+    #
+    # SUPERSEDED ARGUMENT, kept because it was wrong in an instructive way: tau
+    # was previously FIXED at 0.3 on the grounds that the loss integrates to
+    # lambda_sep * T * (1 - tau/2), so tau and lambda_sep trade off almost
+    # multiplicatively and would trace a ridge -- the same reasoning that fixes
+    # margin whenever angular_alpha_deg is searched. That does not follow. Two
+    # settings with equal DOSE have different TERMINAL weights
+    # lambda_sep * g(T), and the epoch selector usually picks a late epoch, so
+    # the terminal weight plausibly governs the converged geometry more than
+    # the integral does. The dose is not a sufficient statistic; tau carries a
+    # genuine second degree of freedom. Under the STAGED phase-2 search tau
+    # remains fixed (see search._STAGED_EXCLUDED_LOSS_HPS).
+    sep_warmup_frac: float = 0.0
 
     # --- batching (ConditionBalancedBatchSampler; added in Stage 5) ---
     # windows_per_condition = B_c: windows drawn from EACH phenotype class per
@@ -661,6 +772,64 @@ class TrainConfig:
                 "'easy_pos_semihard_neg'; got %r" % (self.mining_strategy,))
         if self.margin <= 0.0:
             raise ValueError("margin must be > 0")
+        if self.loss_type not in ("triplet", "joint", "joint_sep"):
+            raise ValueError(
+                "loss_type must be 'triplet', 'joint' or 'joint_sep'; got %r"
+                % (self.loss_type,))
+        if not (0.0 < self.angular_alpha_deg < 90.0):
+            raise ValueError(
+                "angular_alpha_deg must lie in (0, 90); got %r"
+                % (self.angular_alpha_deg,))
+        if self.lambda_sep < 0.0:
+            raise ValueError("lambda_sep must be >= 0")
+        if not (0.0 <= self.sep_gate_momentum <= 1.0):
+            raise ValueError(
+                "sep_gate_momentum must lie in [0, 1] (0 = cumulative mean); "
+                "got %r" % (self.sep_gate_momentum,))
+        if self.sep_gate_min_batches < 1:
+            raise ValueError("sep_gate_min_batches must be >= 1")
+        if (self.sep_gate_threshold is not None
+                and not (-1.0 <= float(self.sep_gate_threshold) <= 1.0)):
+            raise ValueError(
+                "sep_gate_threshold is a silhouette and must lie in [-1, 1] "
+                "or be None; got %r" % (self.sep_gate_threshold,))
+        if not (0.0 <= float(self.sep_warmup_frac) <= 1.0):
+            raise ValueError(
+                "sep_warmup_frac (tau) is a FRACTION OF TRAINING and must lie "
+                "in [0, 1]: 0 means full lambda_sep from the first step, 1 "
+                "means the ramp finishes exactly at the last planned step; "
+                "got %r" % (self.sep_warmup_frac,))
+        if self.sep_centre_means is not None:
+            warnings.warn(
+                "sep_centre_means=%r is INERT and ignored: L_sep is now always "
+                "built from the RAW normalised class means. The centred form "
+                "was removed because it is scale-invariant and therefore blind "
+                "to collapse. Remove this field from the config."
+                % (self.sep_centre_means,), RuntimeWarning)
+        if (self.loss_type in ("joint", "joint_sep")
+                and self.strict_semihard
+                and self.mining_strategy == "hard"):
+            # PROVABLY EMPTY, and silently so. TripletMarginMiner with
+            # type_of_triplets="hard" returns exactly the triplets whose
+            # negative is CLOSER than the positive (D_an < D_ap); the strict
+            # semi-hard filter of Eq. (6) keeps only those with D_ap < D_an.
+            # The intersection is empty by construction, so every batch yields
+            # n_strict = 0, n_active = 0 and train_loss = 0.0: the network
+            # never receives a gradient and the run looks stable rather than
+            # broken. MEASURED: 16814 mined, 0 surviving.
+            raise ValueError(
+                "mining_strategy='hard' and strict_semihard=True are mutually "
+                "exclusive: 'hard' mines D_an < D_ap while the strict "
+                "semi-hard filter requires D_ap < D_an, so NO triplet ever "
+                "survives and the loss is identically zero. Use "
+                "mining_strategy='easy_pos_semihard_neg' (semi-hard negatives, "
+                "compatible with the filter) or set strict_semihard=False to "
+                "keep hard mining.")
+        if self.loss_type != "joint_sep" and self.lambda_sep != 0.1:
+            warnings.warn(
+                "lambda_sep=%g is INERT under loss_type=%r: the separation term "
+                "is only built for 'joint_sep'."
+                % (self.lambda_sep, self.loss_type), RuntimeWarning)
         if self.lr <= 0.0:
             raise ValueError("lr must be > 0")
         if not (0.0 < self.beta1 < 1.0) or not (0.0 < self.beta2 < 1.0):
@@ -725,7 +894,38 @@ class SearchConfig:
     embedding_size_range: Tuple[int, int] = (8, 16)            # Integer es
 
     # --- phase 2: training HPs ---
+    # margin_range is used only when train.loss_type == "triplet". Under
+    # "joint"/"joint_sep" the margin is FIXED and angular_alpha_deg_range is
+    # searched in its place; the field is kept so archived configs still load
+    # and so the two loss types remain runnable from the same file.
     margin_range: Tuple[float, float] = (0.1, 1.0)             # Real m
+    # searched INSTEAD of margin_range under "joint"/"joint_sep". NOT Chung and
+    # Lee's {30, 45, 60, 75}: those were chosen for UNNORMALISED embeddings and
+    # are all vacuous on the unit hypersphere here (the floor goes non-positive
+    # at 30 deg). The LOW end is the collapse-forcing end -- the implied
+    # silhouette floor is 0.970 at 5 deg and 0.995 at 2 deg -- so the range
+    # extends to 2 deg to leave the search room to ask for near-total
+    # within-class collapse. Raise the low bound to 5.0 to reproduce the
+    # pre-collapse setting.
+    angular_alpha_deg_range: Tuple[float, float] = (2.0, 20.0)  # Real alpha
+    # searched ADDITIONALLY under "joint_sep". Log-uniform, and deliberately
+    # wide: the natural scale of L_sep differs by more than an order of
+    # magnitude between C = 2 (raw class means) and C >= 3 (centred), so a
+    # linear prior centred on the C >= 3 value would barely reach the C = 2 one.
+    lambda_sep_range: Tuple[float, float] = (1e-3, 1.0)        # log-uniform
+    # tau, the warm-up fraction. The UPPER bound is DERIVED at
+    # space-construction time as min(1, patience / max_epochs) and this range
+    # is clipped to it, so that the ramp always completes before the earliest
+    # possible early stop. Stating a high value here is therefore a REQUEST,
+    # not a guarantee; search._loss_dims warns when it clips.
+    #
+    # Uniform, NOT log-uniform: tau = 0 must be reachable, because it is the
+    # no-warm-up control arm (sep_warmup_scale already handles it as constant
+    # full weight), and a log prior cannot include zero.
+    #
+    # Searched ONLY by the joint condition search. The staged phase 2 never
+    # searched tau, and search._STAGED_EXCLUDED_LOSS_HPS keeps it that way.
+    sep_warmup_frac_range: Tuple[float, float] = (0.0, 0.5)    # Real tau
     lr_range: Tuple[float, float] = (1e-4, 0.2)               # log-uniform
     one_minus_beta1_range: Tuple[float, float] = (1e-2, 1e-1)  # log-uniform -> b1 in [0.9, 0.99]
     one_minus_beta2_range: Tuple[float, float] = (1e-4, 1e-2)  # log-uniform -> b2 in [0.99, 0.9999]
@@ -761,11 +961,60 @@ class SearchConfig:
     #       it in dimension, since 140 trials sample 10-D far more thinly than
     #       three GPs sample 4-D, 5-D and 2-D.
     # Which wins is empirical. Run both, same seed, same data.
+    #   "joint_conditions":
+    #       the joint space PLUS the four CATEGORICAL experimental factors
+    #       (mining_strategy, loss_type, strict_semihard, head geometry), i.e.
+    #       the 18-axis space that REPLACES the 52-cell factorial. The factors
+    #       are searched rather than enumerated, because the screening found
+    #       the head geometries differ chiefly in generalisation gap and the
+    #       strict-filter x head interaction was the largest effect measured --
+    #       a staged search would fix the head before loss_type is a variable.
+    #       Illegal combinations are removed by the legality projection Pi
+    #       (condition_space.project_condition) BEFORE any config is built.
+    #
+    # It is ONE knob rather than "joint" plus a separate boolean, so the
+    # meaningless combination (staged + searched conditions) is not
+    # representable at all.
     search_mode: str = "staged"
     # Joint budget. 0 = MATCH the staged total (n_calls_arch + n_calls_train +
     # regularization.n_calls), which is the only setting under which a
     # staged-vs-joint comparison is about strategy rather than about compute.
     n_calls_joint: int = 0
+    # Size of the random initial design for the JOINT search specifically.
+    # 0 = fall back to n_initial_points, and then to the legacy rule. It is a
+    # separate field because the joint-with-conditions space is far wider than
+    # any staged phase (22 surrogate columns against 4, 5 and 2), so the number
+    # of pre-surrogate draws it wants is not the number those phases want.
+    n_initial_points_joint: int = 0
+
+    # --- the four categorical experimental factors -------------------------- #
+    # These were the 52 config FILES of the screening factorial; the joint
+    # search carries them as dimensions instead. Each list is the set of LEVELS
+    # the search may sample. Defaults are the full level sets, i.e. the whole
+    # factorial; restrict one to a single level to freeze that factor without
+    # touching the code.
+    #
+    # They are INERT unless the joint condition search is running: nothing in
+    # the staged pipeline reads them, so every archived config keeps its exact
+    # semantics whether or not these fields are present in its JSON.
+    mining_strategy_choices: Tuple[str, ...] = (
+        "hard", "easy_positive", "easy_pos_semihard_neg")
+    loss_type_choices: Tuple[str, ...] = ("triplet", "joint", "joint_sep")
+    # The three binaries below are encoded as Integer(0, 1) rather than as a
+    # two-level Categorical. A two-level one-hot is exactly redundant
+    # (x2 = 1 - x1), so this saves one surrogate column each for free, and a
+    # binary carries no false ordering. Same for block_family_choices above:
+    # the BUG 2 warning in search.py is specifically that a REAL block_family
+    # yields floats such as 0.37 and Block_array[0.37] raises TypeError;
+    # Integer yields genuine Python ints and is safe. The Stage 4 smoke test
+    # asserts that int-ness rather than trusting it.
+    strict_semihard_choices: Tuple[int, ...] = (0, 1)
+    head_fusion_choices: Tuple[int, ...] = (0, 1)
+    # 0 -> head_pool_ops = ("mean",);  1 -> ("mean", "max", "std")
+    head_pool_ops_choices: Tuple[int, ...] = (0, 1)
+    # DEPRECATED AND INERT: sep_centre_means is no longer a searched axis, so
+    # this list is read by nothing. Kept only so archived configs still parse.
+    sep_centre_means_choices: Tuple[int, ...] = (0, 1)
 
     # [C2] Adaptive lexicographic tie-break. The search objective becomes
     #     J_eps(t) = -(1/S) sum_sigma [ ARI(t,sigma,e*) + eps * Sil(t,sigma,e*) ],
@@ -819,6 +1068,29 @@ class SearchConfig:
                 b not in (0, 1) for b in self.block_family_choices):
             raise ValueError("block_family_choices must be a non-empty subset of {0, 1}")
         _check("margin_range", self.margin_range, positive=True)
+        _check("angular_alpha_deg_range", self.angular_alpha_deg_range,
+               positive=True)
+        if self.angular_alpha_deg_range[1] >= 90.0:
+            raise ValueError(
+                "angular_alpha_deg_range high must be < 90 degrees")
+        _check("lambda_sep_range", self.lambda_sep_range, positive=True)
+        # tau is a FRACTION of the planned step budget, so the range must sit
+        # inside [0, 1], and it must be non-degenerate: lo == hi would ask
+        # skopt for a zero-width Real. The upper bound is NOT checked against
+        # patience / max_epochs here -- SearchConfig cannot see TrainConfig,
+        # and the derived cap is applied where both are in scope
+        # (search._loss_dims).
+        _check("sep_warmup_frac_range", self.sep_warmup_frac_range)
+        _lo_tau, _hi_tau = self.sep_warmup_frac_range
+        if float(_lo_tau) < 0.0 or float(_hi_tau) > 1.0:
+            raise ValueError(
+                "sep_warmup_frac_range must lie within [0, 1] (tau is a "
+                "fraction of the planned step budget); got %r"
+                % (self.sep_warmup_frac_range,))
+        if not (float(_lo_tau) < float(_hi_tau)):
+            raise ValueError(
+                "sep_warmup_frac_range must be non-degenerate (low < high); "
+                "got %r" % (self.sep_warmup_frac_range,))
         _check("lr_range", self.lr_range, positive=True)
         _check("one_minus_beta1_range", self.one_minus_beta1_range, positive=True)
         _check("one_minus_beta2_range", self.one_minus_beta2_range, positive=True)
@@ -833,11 +1105,42 @@ class SearchConfig:
         # (config construction) as well as in resolve_n_initial_points (call
         # site), so the error fires BEFORE any trace is generated rather than
         # after the data cache is built.
-        if self.search_mode not in ("staged", "joint"):
-            raise ValueError("search_mode must be 'staged' or 'joint'; got %r"
-                             % (self.search_mode,))
+        if self.search_mode not in ("staged", "joint", "joint_conditions"):
+            raise ValueError(
+                "search_mode must be 'staged', 'joint' or 'joint_conditions'; "
+                "got %r" % (self.search_mode,))
         if self.n_calls_joint < 0:
             raise ValueError("n_calls_joint must be >= 0 (0 = match the staged total)")
+        if self.n_initial_points_joint < 0:
+            raise ValueError(
+                "n_initial_points_joint must be >= 0 (0 = fall back to "
+                "n_initial_points, then to the legacy rule)")
+        # An EMPTY choice list is the failure this checks for: it would build a
+        # zero-level dimension, which skopt rejects only later and obscurely.
+        # An UNKNOWN level is the other: it would be sampled, written into the
+        # config, and rejected by TrainConfig only once a trial started.
+        def _check_choices(name, choices, allowed):
+            seq = tuple(choices)
+            if len(seq) < 1:
+                raise ValueError(
+                    "%s must list at least one level (it is the set the search "
+                    "may sample); got an empty list" % name)
+            bad = [c for c in seq if c not in allowed]
+            if bad:
+                raise ValueError("%s: unknown level(s) %r; allowed %r"
+                                 % (name, bad, allowed))
+            if len(set(seq)) != len(seq):
+                raise ValueError("%s contains duplicate levels: %r" % (name, seq))
+
+        _check_choices("mining_strategy_choices", self.mining_strategy_choices,
+                       ("hard", "easy_positive", "easy_pos_semihard_neg"))
+        _check_choices("loss_type_choices", self.loss_type_choices,
+                       ("triplet", "joint", "joint_sep"))
+        for _name, _val in (("strict_semihard_choices", self.strict_semihard_choices),
+                            ("head_fusion_choices", self.head_fusion_choices),
+                            ("head_pool_ops_choices", self.head_pool_ops_choices),
+                            ("sep_centre_means_choices", self.sep_centre_means_choices)):
+            _check_choices(_name, _val, (0, 1))
         if self.n_initial_points < 0:
             raise ValueError(
                 "n_initial_points must be >= 0 (0 means the legacy rule "

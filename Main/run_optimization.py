@@ -1153,6 +1153,45 @@ def _agg(values):
 # --------------------------------------------------------------------------- #
 # the search phases
 # --------------------------------------------------------------------------- #
+def build_splits(cfg, traces, conditions, fs, verbose=False):
+    """The train/val/test splits, from loaded traces. THE single split path.
+
+    Extracted from the driver's main flow so that anything which must be
+    measured on the SAME data the study trains on -- Stage 7's timing, above
+    all -- calls this rather than reimplementing the dispatch. A second copy of
+    these arguments is a second thing to keep in step, and a timing measured on
+    a different split is not a measurement of this study.
+
+    cfg.data.split_mode selects the splitter; the two are positionally
+    interchangeable in their first five arguments by construction.
+    """
+    if cfg.data.split_mode == "trace":
+        splits = make_trace_splits(
+            traces, conditions, fs, cfg.data,
+            base_seed=int(cfg.runtime.seed),
+            mode=cfg.data.trace_split_mode,
+            fold=(int(cfg.data.trace_split_fold)
+                  if cfg.data.trace_split_mode == "leave_one_out" else None),
+            split_seed=int(cfg.data.trace_split_seed),
+            min_train_cultures_per_class=int(
+                cfg.data.min_train_cultures_per_class),
+            alloc_rule=cfg.data.trace_alloc_rule,
+        )
+        if verbose:
+            print("[run] WHOLE-CULTURE split (%s): %d / %d / %d cultures, "
+                  "%d / %d / %d windows"
+                  % (cfg.data.trace_split_mode,
+                     len(splits.cultures["train"]), len(splits.cultures["val"]),
+                     len(splits.cultures["test"]),
+                     len(splits.train), len(splits.val), len(splits.test)))
+            for _name in ("train", "val", "test"):
+                print("[run]   %-5s cultures: %s"
+                      % (_name, splits.cultures[_name].tolist()))
+        return splits
+    return make_time_segment_splits(traces, conditions, fs, cfg.data,
+                                    base_seed=int(cfg.runtime.seed))
+
+
 def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
                       verbose=False, on_stage_complete=None, trial_verbose=False):
     """Phase 1 (architecture) -> Phase 2 (training HPs) -> [re-tune] ->
@@ -1209,10 +1248,38 @@ def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
     # training. The staged phases below are skipped entirely -- not run and
     # discarded -- so the two modes cost the same only because the joint budget
     # defaults to the staged total (S.resolve_n_calls_joint).
+    # THE JOINT CONDITION SEARCH: one GP over the 18 axes, the four categorical
+    # experimental factors included. Replaces the 52-cell factorial outright,
+    # so there are no staged phases at all and no per-cell config files.
+    if getattr(cfg.search, "search_mode", "staged") == "joint_conditions":
+        res_c = S.search_joint_conditions(work, splits, device, verbose=verbose,
+                                          train_verbose=trial_verbose)
+        best_c = S.best_joint_condition_dict(res_c)
+        work = S.config_from_joint_condition_point(work, res_c.x)
+        n_proj = sum(1 for r in res_c.trial_log if r.get("projected"))
+        print("[run]   winner: %s  (objective %+.4f); %d of %d trials were "
+              "projected by Pi"
+              % (best_c.get("loss_type"), float(res_c.fun), n_proj,
+                 len(res_c.trial_log)))
+        report = {
+            "search_mode": "joint_conditions",
+            "joint_conditions": {
+                "best": best_c,
+                "best_cell": S.annotate_joint_condition_point(res_c.x)["cell"],
+                "objective": float(res_c.fun),
+                "n_calls": int(len(res_c.func_vals)),
+                "n_initial_points": int(getattr(res_c, "n_initial_points_used", 0)),
+                "n_projected": int(n_proj),
+                "trial_log": res_c.trial_log},
+        }
+        if on_stage_complete is not None:
+            on_stage_complete("joint_conditions", work)
+        return work, report
+
     if getattr(cfg.search, "search_mode", "staged") == "joint":
         res_j = S.search_joint(work, splits, device, verbose=verbose,
                                train_verbose=trial_verbose)
-        best_j = S.best_joint_dict(res_j)
+        best_j = S.best_joint_dict(res_j, cfg.train)
         work = S.config_from_joint_point(work, res_j.x)
         report = {
             "search_mode": "joint",
@@ -1247,14 +1314,18 @@ def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
           % (work.search.n_calls_train, Ns))
     res2 = S.search_training(work, splits, device, best_arch, verbose=verbose,
                              train_verbose=trial_verbose)
-    best_train = S.best_train_dict(res2)        # betas already converted: b = 1 - u
+    best_train = S.best_train_dict(res2, cfg.train)        # betas already converted: b = 1 - u
+    # only the loss HPs this loss_type actually searched are written back;
+    # the others keep their configured (fixed) values
+    _loss_updates = {k: float(best_train[k])
+                     for k in S.loss_hp_names(cfg.train)}
     work.train = replace(
         work.train,
-        margin=float(best_train["margin"]),
         lr=float(best_train["lr"]),
         beta1=float(best_train["beta1"]),
         beta2=float(best_train["beta2"]),
         weight_decay=float(best_train["weight_decay"]),
+        **_loss_updates
     )
     work.validate()
     report["phase2_train"] = {
@@ -1616,33 +1687,7 @@ def run(cfg, args, on_stage_complete=None):
         }
 
     # ---- splits (fs is injected into the augmentation config HERE) ---------
-    # cfg.data.split_mode selects the splitter. The two are positionally
-    # interchangeable in their first five arguments by construction.
-    if cfg.data.split_mode == "trace":
-        splits = make_trace_splits(
-            traces, conditions, fs, cfg.data,
-            base_seed=int(cfg.runtime.seed),
-            mode=cfg.data.trace_split_mode,
-            fold=(int(cfg.data.trace_split_fold)
-                  if cfg.data.trace_split_mode == "leave_one_out" else None),
-            split_seed=int(cfg.data.trace_split_seed),
-            min_train_cultures_per_class=int(
-                cfg.data.min_train_cultures_per_class),
-            alloc_rule=cfg.data.trace_alloc_rule,
-        )
-        if verbose:
-            print("[run] WHOLE-CULTURE split (%s): %d / %d / %d cultures, "
-                  "%d / %d / %d windows"
-                  % (cfg.data.trace_split_mode,
-                     len(splits.cultures["train"]), len(splits.cultures["val"]),
-                     len(splits.cultures["test"]),
-                     len(splits.train), len(splits.val), len(splits.test)))
-            for _name in ("train", "val", "test"):
-                print("[run]   %-5s cultures: %s"
-                      % (_name, splits.cultures[_name].tolist()))
-    else:
-        splits = make_time_segment_splits(traces, conditions, fs, cfg.data,
-                                          base_seed=int(cfg.runtime.seed))
+    splits = build_splits(cfg, traces, conditions, fs, verbose=verbose)
 
     # ---- search ------------------------------------------------------------
     report = {}

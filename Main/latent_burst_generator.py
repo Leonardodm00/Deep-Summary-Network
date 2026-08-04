@@ -254,7 +254,7 @@ class LatentSpec:
     n_classes: int = 3
     class_overlap: float = 0.10
     n_per_class: Tuple[int, ...] = (3, 3, 3)
-    class_center_mode: str = "interior"
+    class_center_mode: str = "simplex"
     duration_s: float = 600.0
     n_neurons: int = 100
     w_size: float = 0.02
@@ -366,7 +366,7 @@ def build_latent_spec(axis_names: Sequence[str],
                       duration_s: float,
                       fs: float,
                       class_overlap: float = 0.10,
-                      class_center_mode: str = "interior",
+                      class_center_mode: str = "simplex",
                       n_neurons: int = 100,
                       gaussian_window: float = 0.04,
                       seed: int = 0,
@@ -409,7 +409,7 @@ def build_latent_spec(axis_names: Sequence[str],
 # --------------------------------------------------------------------------- #
 # section 2 -- per-trace latent sampling (no signal synthesis)
 # --------------------------------------------------------------------------- #
-CLASS_CENTER_MODES = ("interior", "endpoints")
+CLASS_CENTER_MODES = ("simplex", "interior", "endpoints")
 
 
 def _class_mean(c: int, n_classes: int, mode: str = "interior") -> float:
@@ -457,6 +457,76 @@ def _class_mean(c: int, n_classes: int, mode: str = "interior") -> float:
     return float(c + 1) / float(n_classes + 1)
 
 
+def _class_center_vectors(n_classes: int, n_axes: int,
+                          mode: str = "simplex") -> np.ndarray:
+    """(C, L) matrix of class centres in [0, 1]^L, one row per class.
+
+    THE DEFECT THIS FIXES. "interior" and "endpoints" return a single SCALAR
+    m_c and the caller writes it to EVERY label axis, so class c sits at
+    m_c * (1, 1, ..., 1): all C centres lie on the main diagonal of the label
+    subspace. Cov({mu_c}) then has rank 1 whatever L and C are -- the centres
+    are collinear, and any objective that asks for a non-degenerate ARRANGEMENT
+    of centres (the NC2 separation term) is asking for a geometry the DATA does
+    not contain.
+
+    "simplex" (the default) places the C centres at the vertices of a regular
+    simplex instead. Construction:
+
+      1. P = I_C - 11^T / C is the centring projector; its SVD gives C rows
+         with pairwise cosine exactly -1/(C-1) spanning C-1 dimensions -- the
+         canonical regular simplex, and exactly the configuration L_sep
+         targets.
+      2. Those coordinates are embedded in the L label axes. If L >= C-1 an
+         orthonormal DCT-II rotation spreads them over ALL L axes, so no label
+         axis is left carrying zero class information. If L < C-1 the first L
+         coordinates are used and the rank is L, which is the most any L axes
+         can carry.
+      3. The result is scaled about 0.5 to fill the same interior box the
+         "interior" mode uses, so no centre touches the clip boundary.
+
+    Achieved rank is min(L, C-1), the maximum possible: C points span at most
+    C-1 dimensions however many axes they are written to.
+
+    NOTE the spacing changes. "interior" puts adjacent centres (C+1)^-1 apart
+    along one line; the simplex spreads the same box over min(L, C-1)
+    directions, so the realised centre-to-centre distance differs and
+    class_overlap (tau) should be re-checked rather than carried over.
+    """
+    C, L = int(n_classes), int(n_axes)
+    if C < 1 or L < 1:
+        raise ValueError("n_classes and n_axes must be >= 1")
+    if mode != "simplex":
+        # legacy: one scalar per class, replicated across every axis
+        col = np.array([[_class_mean(c, C, mode)] for c in range(C)],
+                       dtype=float)
+        return np.repeat(col, L, axis=1)
+    if C == 1:
+        return np.full((1, L), 0.5, dtype=float)
+
+    # 1. regular simplex: rows of U have Gram = I - 11^T/C, hence pairwise
+    #    cosine exactly -1/(C-1)
+    proj = np.eye(C) - 1.0 / C
+    u, _s, _vt = np.linalg.svd(proj)
+    y = u[:, :C - 1]                                   # (C, C-1)
+
+    # 2. embed in the L label axes
+    d = min(L, C - 1)
+    z = np.zeros((C, L), dtype=float)
+    z[:, :d] = y[:, :d]
+    if L >= C - 1 and L > 1:
+        k = np.arange(L)
+        q = np.cos(np.pi * (k[:, None] + 0.5) * k[None, :] / L)   # DCT-II
+        q /= np.linalg.norm(q, axis=0, keepdims=True)
+        z = z @ q.T                                    # orthonormal: rank kept
+
+    # 3. scale about 0.5 into the same interior box "interior" occupies
+    half = 0.5 * (C - 1.0) / (C + 1.0)
+    peak = float(np.max(np.abs(z)))
+    if peak > 0.0:
+        z = z * (half / peak)
+    return np.clip(0.5 + z, 0.0, 1.0)
+
+
 def sample_latents(spec: LatentSpec, condition: int, trace_id: int) -> np.ndarray:
     """Draw the latent vector phi in [0, 1]^n for ONE trace.
 
@@ -480,10 +550,13 @@ def sample_latents(spec: LatentSpec, condition: int, trace_id: int) -> np.ndarra
         (int(spec.seed), 1000003 * int(condition) + int(trace_id)))
     n = spec.n_latent
     phi = rng.uniform(0.0, 1.0, size=n)
-    m_c = _class_mean(int(condition), spec.n_classes, spec.class_center_mode)
-    for k in spec.label_axes:
+    centres = _class_center_vectors(spec.n_classes, len(spec.label_axes),
+                                    spec.class_center_mode)
+    m_ck = centres[int(condition)]        # one centre PER LABEL AXIS, not one
+    for i, k in enumerate(spec.label_axes):            # scalar for all of them
         eps = rng.normal(0.0, 1.0)
-        phi[int(k)] = float(np.clip(m_c + spec.class_overlap * eps, 0.0, 1.0))
+        phi[int(k)] = float(np.clip(m_ck[i] + spec.class_overlap * eps,
+                                    0.0, 1.0))
     return phi
 
 
@@ -614,8 +687,9 @@ def latent_ground_truth_table(spec: LatentSpec) -> Dict[str, object]:
         "n_classes": int(spec.n_classes),
         "class_overlap": float(spec.class_overlap),
         "class_center_mode": str(spec.class_center_mode),
-        "class_means": [_class_mean(c, spec.n_classes, spec.class_center_mode)
-                        for c in range(spec.n_classes)],
+        "class_means": _class_center_vectors(
+            spec.n_classes, len(spec.label_axes),
+            spec.class_center_mode).tolist(),
         "fs": float(spec.fs),
         "rows": rows,
     }
