@@ -8,12 +8,16 @@
 > **Revision 2:** `sep_centre_means` is no longer a searched axis and the
 > centred form of $\mathcal{L}_{\mathrm{sep}}$ has been removed from the code.
 > Both `train.sep_centre_means` and `search.sep_centre_means_choices` are now
-> **inert** and warn if set; the generator no longer emits either. The space is
-> 17 axes / 21 columns.
+> **inert** and warn if set; the generator no longer emits either.
+>
+> **Revision 3:** $\tau$ (`sep_warmup_frac`) is **no longer a fixed knob**. It
+> is now the 18th *searched* axis and is documented in Document I §3.17; what
+> remains here is only its role as a **clamp constant**. The space is
+> 18 axes / 22 columns.
 
 ## Abstract
 
-Document I covers the seventeen dimensions the Gaussian process moves. This one
+Document I covers the eighteen dimensions the Gaussian process moves. This one
 covers everything else: every knob you set by hand, what it means, what it is
 set to, what happens if you change it, and — a category that deserves its own
 section — the knobs that are present in the configuration file and **have no
@@ -47,7 +51,7 @@ where it constrains a knob.
 | $P$ | `patience` | $P = 40$ | epochs | §3.2 |
 | $n_{\mathrm{b}}$ | `batches_per_epoch` | $n_{\mathrm{b}} = 100$ | steps/epoch | §3.2 |
 | $T$ | planned steps, $T = E_{\max} n_{\mathrm{b}}$ | $T = 10\,000$ | steps | §3.2 |
-| $\tau$ | `sep_warmup_frac` | $\tau = 0.3$ | dimensionless | §3.2 |
+| $\tau$ | `sep_warmup_frac` — **SEARCHED**, see Document I §3.17; the value here is only the clamp | clamp $= 0.0$ | dimensionless | §3.3 |
 | $t$ | optimiser-step index, steps **completed** | $t \in \{0,\dots,T\}$ | steps | §3.2 |
 | $\lambda_{\mathrm{sep}}$ | asymptotic separation weight (searched; base value is the clamp) | base $= 0.1$ | dimensionless | §3.3 |
 | $m_{\cos}$ | margin (searched under `triplet`; base value is the clamp) | base $= 0.3$ | cosine distance | §3.3 |
@@ -202,7 +206,7 @@ axis order.
 | `train.max_epochs` | 100 | — | epoch cap, $E_{\max}$ |
 | `train.patience` | 40 | — | early-stopping patience, $P$ |
 | `train.batches_per_epoch` | 100 | 0 | steps per epoch, $n_{\mathrm{b}}$ |
-| `train.sep_warmup_frac` | 0.3 | 0.0 | warm-up fraction, $\tau$ |
+| `train.sep_warmup_frac` | 0.0 | 0.0 | **searched**; 0.0 is the clamp constant, $\tau$ |
 
 **`n_seeds = 1` — what one seed buys and costs.** With across-seed standard
 deviation $\sigma_s$, the probability that a single seed each misranks two
@@ -258,24 +262,40 @@ directly and it multiplies the cost directly. It is the knob that makes the
 neural-collapse-inspired term even arguably applicable, since the phenomenon it
 derives from is documented after hundreds of epochs of training.
 
-**`sep_warmup_frac = 0.3` ($\tau$) — fixed, never searched.** The separation
+**`sep_warmup_frac = 0.0` ($\tau$) — a CLAMP CONSTANT, not a schedule.**
+
+> **This knob moved.** $\tau$ was fixed at $0.3$ in Revisions 1–2 on the
+> argument reproduced below; it is now **searched** (Document I §3.17). What
+> the base config carries is the value every trial whose sampled loss type is
+> *not* `joint_sep` keeps — so that two points differing only in $\tau$ build
+> byte-identical configs. It must be exactly the `TrainConfig` default $0.0$,
+> the same rule that governs `lambda_sep = 0.1` above.
+
+*The superseded argument, kept because the reversal matters.* The separation
 weight ramps as
 $\lambda_{\mathrm{sep}}(t) = \lambda_{\mathrm{sep}}\min(1, t/(\tau T))$, so the
-total dose integrates to $\lambda_{\mathrm{sep}} T (1-\tau/2)$ — $\tau$ and
-$\lambda_{\mathrm{sep}}$ trade off almost multiplicatively, and searching both
-would move along a ridge. Hence one is fixed.
+total dose integrates to $\lambda_{\mathrm{sep}} T (1-\tau/2)$; $\tau$ and
+$\lambda_{\mathrm{sep}}$ therefore appeared to trade off almost
+multiplicatively, so that searching both would move along a ridge. **The
+integral is correct and the conclusion does not follow.** Equal dose does not
+mean equal *terminal* weight $\lambda_{\mathrm{sep}} g(T)$, and since the epoch
+selector usually picks a late epoch, the terminal weight plausibly matters more
+than the integral. The dose is not a sufficient statistic, so $\tau$ carries a
+genuine second degree of freedom and is now an axis.
 
-Three practical consequences:
+Three practical consequences, restated for the searched $\tau$:
 
-1. At $\tau = 0.3$, $T = 10\,000$: full weight is reached at step 3 000, i.e.
-   epoch 30 of 100.
+1. The searched range is $[0, \tau_{\max}]$ with
+   $\tau_{\max} = \min(1, P/E_{\max})$ **derived** at space-construction time:
+   $0.40$ at $100/40$, $0.333$ at $60/20$. At the top of that range and
+   $T = 10\,000$, full weight is reached at step $4\,000$, i.e. epoch 40 of 100.
 2. **A run reaches full weight only if $\tilde{e}/E_{\max} \ge \tau$**, where
-   $\tilde{e}$ is the epochs it actually ran. Since patience bounds how early it
-   can stop, the preflight warns when $P/E_{\max} < \tau$. Here
-   $40/100 = 0.4 > 0.3$, so it passes — but at the recommended 60/20,
-   $20/60 = 0.33$, only just above $\tau = 0.3$. **If you reduce to 60/20, that
-   margin becomes thin**, and runs stopping at their patience floor will barely
-   reach full weight.
+   $\tilde{e}$ is the epochs it actually ran. The cap is precisely what makes
+   this hold for every sampled $\tau$, taking the worst case $\tilde{e} = P$.
+   The old preflight warning "$P/E_{\max} < \tau$" is therefore **unreachable
+   under the joint condition search** and has been removed from that block — it
+   is retained in the objective block, where it still applies to the *staged*
+   path, on which $\tau$ is fixed and no cap exists.
 3. The logged value lags the live value by one step: history at the end of
    epoch $k$ records $g(k n_{\mathrm{b}} - 1)$, so full weight first appears at
    epoch $\lceil (\tau T + 1)/n_{\mathrm{b}}\rceil$, not

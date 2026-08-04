@@ -58,12 +58,22 @@ them the configured loss actually reads:
 
     A(triplet)   = {margin}
     A(joint)     = {angular_alpha_deg}
-    A(joint_sep) = {angular_alpha_deg, lambda_sep}
+    A(joint_sep) = {angular_alpha_deg, lambda_sep, sep_warmup_frac}
 
     sep_centre_means was removed as an axis: the centred formulation of L_sep
     is invariant to scale and therefore blind to collapse (MEASURED: 0.000035
     against 2.248 raw on a collapsed batch), so the raw form is now the only
     one and there is nothing left to select.
+
+    sep_warmup_frac (tau) was ADDED as an axis. It had been fixed at 0.3 on the
+    argument that tau and lambda_sep trade off through the dose
+    lambda_sep * T * (1 - tau/2) and would therefore trace a ridge. That
+    argument does not hold: two settings with equal dose have different
+    TERMINAL weights lambda_sep * g(T), and since the epoch selector usually
+    picks a late epoch, the terminal weight plausibly governs the converged
+    geometry more than the integral does. The dose is not a sufficient
+    statistic, so tau carries a second degree of freedom and is searched.
+    Its upper bound is DERIVED, not configured -- see search._loss_dims.
 
 margin and angular_alpha_deg are never BOTH active, which is the point: both
 bind on the within/between distance ratio, so a config that searched the pair
@@ -80,6 +90,7 @@ __all__ = [
     "HEAD_POOL_OPS_LEVELS",
     "LOSS_HP_SUPERSET",
     "active_loss_hps",
+    "sep_warmup_frac_cap",
     "reads_strict_semihard",
     "is_legal",
     "project_condition",
@@ -103,12 +114,13 @@ HEAD_POOL_OPS_LEVELS = (("mean",), ("mean", "max", "std"))
 
 # every loss hyper-parameter that ANY loss type reads, in one fixed order. The
 # search space carries all of them in every point; A(l) selects.
-LOSS_HP_SUPERSET = ("margin", "angular_alpha_deg", "lambda_sep")
+LOSS_HP_SUPERSET = ("margin", "angular_alpha_deg", "lambda_sep",
+                    "sep_warmup_frac")
 
 _ACTIVE = {
     "triplet": ("margin",),
     "joint": ("angular_alpha_deg",),
-    "joint_sep": ("angular_alpha_deg", "lambda_sep"),
+    "joint_sep": ("angular_alpha_deg", "lambda_sep", "sep_warmup_frac"),
 }
 
 _MINING_TAG = {"hard": "h", "easy_positive": "ep",
@@ -130,6 +142,51 @@ def _check_loss(loss_type):
         raise ValueError("unknown loss_type %r; expected one of %r"
                          % (loss_type, LOSS_TYPES))
     return l
+
+
+def sep_warmup_frac_cap(patience, max_epochs):
+    """tau_max = min(1, P / E_max): the DERIVED upper bound on the warm-up.
+
+    THE SINGLE SOURCE OF TRUTH for the cap. search._loss_dims clips the
+    requested range to it, hpc/preflight_config.py reports it, and
+    hpc/make_joint_search_config.py prints it; all three call this, so the
+    number cannot drift between the space that is built and the number that is
+    printed next to it.
+
+    WHY A CAP AT ALL. A run reaches full separation weight only if it completes
+    at least tau * T of its T = E_max * n_b planned steps, i.e. only if
+    e_tilde / E_max >= tau, where e_tilde is the number of epochs the run
+    actually completes. Early stopping with patience P means the earliest
+    possible stop is at roughly P + 1 epochs, so e_tilde >= P is the
+    conservative worst case. Requiring the ramp to complete EVEN FOR THE
+    SHORTEST RUN THE STOPPING RULE PERMITS gives tau_max = min(1, P / E_max).
+
+    Without it the optimiser can sample tau large enough that the separation
+    term never reaches full weight before patience fires; "large tau wins"
+    would then mean "the term was effectively off", which is a finding about
+    joint versus joint_sep -- ALREADY a searched axis -- arrived at by a
+    confounded route. The cap makes that region unsamplable rather than merely
+    discouraged.
+
+    WHY IT IS DERIVED RATHER THAN CONFIGURED. tau_max depends on P and E_max, so
+    a static config field would go stale the moment either changes -- which is
+    exactly what happens if the wall-clock gate forces the 60/20 reduction.
+
+    Arguments
+    ---------
+    patience    : P, consecutive no-improvement epochs before stopping, P >= 1.
+    max_epochs  : E_max, the hard epoch ceiling, E_max >= 1.
+
+    Returns 1.0 (i.e. no cap) when either argument is non-positive, which is
+    the "cannot be derived" case rather than a claim that no cap is needed.
+
+    Pure arithmetic: no torch, no config, no skopt.
+    """
+    P = int(patience)
+    E = int(max_epochs)
+    if P <= 0 or E <= 0:
+        return 1.0
+    return min(1.0, float(P) / float(E))
 
 
 def active_loss_hps(loss_type):

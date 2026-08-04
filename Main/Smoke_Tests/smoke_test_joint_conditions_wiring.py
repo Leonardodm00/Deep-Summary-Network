@@ -107,6 +107,20 @@ def _cfg(n_seeds=1, gamma=0.0, primary="ari"):
 
 
 # --------------------------------------------------------------------------- #
+def _space(cfg):
+    """joint_condition_space with the tau-cap clip warning silenced.
+
+    The clip is EXPECTED under the defaults: SearchConfig requests tau up to
+    0.5 while TrainConfig (max_epochs=100, patience=10) derives a cap of 0.10.
+    The dedicated cap test asserts that the warning fires; everywhere else it
+    is noise that would drown the pass/fail lines.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return S.joint_condition_space(cfg.search, cfg.regularization,
+                                       cfg.train)
+
+
 def test_6a_single_seed_is_not_nan():
     """The named acceptance test: n_seeds = 1 must not yield NaN."""
     cfg = _cfg(n_seeds=1)
@@ -191,7 +205,7 @@ def test_6b_gamma_zero_disables_tie_break():
 
 def test_6c_pi_recorded_per_trial():
     base = ExperimentConfig()
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     names = S.joint_condition_names()
     pts = [list(p) for p in Space(space).rvs(n_samples=120, random_state=29)]
     n_proj = 0
@@ -263,7 +277,7 @@ def test_6d_failure_path_finite_and_annotated():
 def test_6e_trial_log_is_json():
     """The trial log is written to disk; every field must survive json.dumps."""
     base = ExperimentConfig()
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     pt = [list(p) for p in Space(space).rvs(n_samples=1, random_state=31)][0]
     note = S.annotate_joint_condition_point(pt)
     rec = {"trial": 0, "scores": [0.5], "mean": 0.5, "std": 0.0,

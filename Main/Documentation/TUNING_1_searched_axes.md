@@ -10,11 +10,17 @@
 > collapse (measured: 0.000035 against 2.248 raw on collapsed classes), and
 > equiangularity at $-1/(K-1)$ already implies the class directions sum to zero,
 > so the raw form imposes nothing extra. Centring is deleted from the code, not
-> made selectable. The space is now **17 axes / 21 surrogate columns**.
+> made selectable.
+>
+> **Revision 3:** `sep_warmup_frac` ($\tau$) has been **added** as axis 18,
+> appended last. It was previously a fixed knob (Document II §3.3) on a dose
+> argument that does not hold — equal dose does not imply equal terminal
+> weight. Its upper bound is **derived**, $\tau_{\max} = \min(1, P/E_{\max})$,
+> not configured. The space is now **18 axes / 22 surrogate columns**. §3.17.
 
 ## Abstract
 
-This document is the reference for the seventeen dimensions that the Gaussian
+This document is the reference for the eighteen dimensions that the Gaussian
 process moves on its own. For each axis it states the meaning, the type and
 range as configured, the prior, the condition under which the axis is *active*,
 the theory behind the range choice, the consequences of widening or narrowing
@@ -494,7 +500,7 @@ mining explicitly resists that. The categorical encoding is correct precisely
 because no ordering exists.
 
 **Cost note.** This axis and `loss_type` are the only two three-level
-categoricals, and together they account for 6 of the 21 surrogate columns —
+categoricals, and together they account for 6 of the 22 surrogate columns —
 nearly a third of the surrogate's input dimension for two of seventeen axes.
 Freezing either to a single level is therefore the largest available saving in
 column count.
@@ -572,7 +578,11 @@ head: all stages, three statistics each, so the pre-projection feature count is
 (stages × 3). At high `depth_exponent` this is where the parameter count peaks.
 The four combinations are equiprobable, so a quarter of trials draw the largest.
 
-### 3.16 Axis 18 — `sep_centre_means` — **REMOVED**
+### 3.16 *Formerly* axis 18 — `sep_centre_means` — **REMOVED**
+
+> Axis number 18 is now occupied by `sep_warmup_frac` (§3.17). This
+> section documents the axis that vacated the slot, not the one that
+> holds it.
 
 This axis existed in Revision 1 and has been deleted. It selected whether
 $\mathcal{L}_{\mathrm{sep}}$ was built from centred class means
@@ -598,8 +608,8 @@ trade-off to search — one option was simply broken.
 given one. `train.sep_centre_means` and `search.sep_centre_means_choices` remain
 in the configuration schema so archived files parse, are read by nothing, and
 warn if set. $A(\texttt{joint\_sep})$ is now
-$\{\alpha, \lambda_{\mathrm{sep}}\}$, and `sep_centred` stays in the
-per-epoch history pinned to 0 so archived readers do not break.
+$\{\alpha, \lambda_{\mathrm{sep}}, \tau\}$ (§3.17), and `sep_centred` stays in
+the per-epoch history pinned to 0 so archived readers do not break.
 
 **One thing to weigh:** the raw form is a considerably *stronger* constraint
 than the shape-only term it replaces, and the searched range of
@@ -607,18 +617,120 @@ $\lambda_{\mathrm{sep}}$ (§3.11) was chosen against the weaker one. See §5.
 
 ---
 
+### 3.17 Axis 18 — `sep_warmup_frac` ($\tau$)
+
+| | |
+|---|---|
+| **Config field** | `search.sep_warmup_frac_range` |
+| **Type / prior** | `Real`, **uniform** |
+| **Requested range** | $(0.0,\ 0.5)$ — a *request*, not a guarantee |
+| **Effective range** | $(0.0,\ \tau_{\max})$, $\tau_{\max}$ **derived** |
+| **Active when** | $\ell = \texttt{joint\_sep}$ only |
+| **Clamp constant** | `train.sep_warmup_frac = 0.0` (the `TrainConfig` default) |
+
+**Meaning.** $\tau$ is the fraction of the planned step budget over which the
+separation weight ramps linearly from $0$ to $\lambda_{\mathrm{sep}}$:
+
+$$
+\lambda_{\mathrm{sep}}(t) = \lambda_{\mathrm{sep}}\, g(t),
+\qquad
+g(t) = \min\!\left(1,\ \frac{t}{\tau T}\right),
+\qquad
+T = E_{\max}\, n_{\mathrm{b}},
+\tag{17}
+$$
+
+for all $t \in \{0, \dots, T\}$, with $g(t) \equiv 1$ at $\tau = 0$. Full
+weight is reached at step $\tau T$.
+
+**Why it is searched, having been fixed.** Document II §3.3 fixed $\tau = 0.3$
+because the schedule integrates to $\lambda_{\mathrm{sep}} T (1 - \tau/2)$, so
+$\tau$ and $\lambda_{\mathrm{sep}}$ appeared to trade off multiplicatively and
+trace a ridge. **The integral is right; the inference is not.** Two settings
+with equal dose have different *terminal* weights $\lambda_{\mathrm{sep}} g(T)$,
+and the epoch selector usually picks a late epoch, so the terminal weight
+plausibly governs the converged geometry more than the integral does. The dose
+is not a sufficient statistic for $(\lambda_{\mathrm{sep}}, \tau)$, and the
+ridge does not close. THEORY §3.6.2 carries the superseded derivation.
+
+**Why the prior is uniform, not log-uniform.** $\tau = 0$ must be reachable: it
+is the no-warm-up control arm, handled by `sep_warmup_scale` as constant full
+weight, and a log prior cannot contain zero. This is the same reason `dropout`
+is uniform (§3.9).
+
+**Why the upper bound is derived rather than configured.** A run reaches full
+weight only if it completes at least $\tau T$ of its planned steps, i.e. only if
+
+$$
+\frac{\tilde{e}}{E_{\max}} \;\ge\; \tau ,
+\tag{18}
+$$
+
+where $\tilde{e}$ is the number of epochs the run actually completes. Early
+stopping with patience $P$ makes the earliest possible stop roughly $P+1$
+epochs, so $\tilde{e} \ge P$ is the conservative worst case. Requiring (18) to
+hold **even for the shortest run the stopping rule permits** gives
+
+$$
+\boxed{\ \tau_{\max} \;=\; \min\!\left(1,\ \frac{P}{E_{\max}}\right)\ }
+\tag{19}
+$$
+
+$\tau_{\max} = 0.40$ at the shipped $100/40$, and $0.333$ at the alternative
+$60/20$. Above the cap, "large $\tau$ wins" would be indistinguishable from
+"the separation term was effectively off" — a finding about `joint` versus
+`joint_sep`, which is *already* axis 14, reached by a confounded route. The cap
+makes that region **unsamplable** rather than merely discouraged. And because
+$\tau_{\max}$ depends on $P$ and $E_{\max}$, a static config field would go
+stale the moment either changed, which is exactly what the wall-clock gate may
+force.
+
+Implementation: `condition_space.sep_warmup_frac_cap` owns the formula;
+`search._loss_dims` clips the requested range to it and emits a `RuntimeWarning`
+naming the clip; a lower bound at or above the cap raises `ValueError` rather
+than building a degenerate dimension.
+
+**Position in the axis order.** Appended **last**, not slotted in beside the
+other loss hyper-parameters at 10–12. Axis order is load-bearing at a fixed
+`gp_random_state` — the initial design is a function of the ordering — and no
+study had been run against the 17-axis order, so appending is the minimal-diff
+choice.
+
+**What it costs.** 18 axes over 22 columns at $N_{\mathrm{calls}} = 300$ is
+thinner than 17 over 21. No analysis quantifies the loss. $\tau$ is active in
+only about a third of trials (`joint_sep` only), so the marginal cost is
+probably small — but that is inference, not measurement. Cells, $\Pi$ and the
+coverage arithmetic are **unaffected**: $\tau$ is not part of the cell
+definition, and coverage is still 52/52 at $N = 300$.
+
+**What is logged.** The per-trial record carries the realised dose
+$\lambda_{\mathrm{sep}} T (1 - \tau/2)$ *and* the terminal weight
+$\lambda_{\mathrm{sep}} g(T)$, because without both the post-hoc question "did
+$\tau$ matter through the integral or through the shape?" cannot be answered.
+When $n_{\mathrm{b}} = 0$ the trainer derives $T$ at build time, so the dose is
+recorded as `null` and the $T$-free ratio $\lambda_{\mathrm{sep}}(1 - \tau/2)$
+is recorded instead.
+
+**Boundary caveat.** At exactly $\tau = \tau_{\max}$ a worst-case run reaches
+full weight at its final step and spends *zero* steps there. A safety factor
+$\tau_{\max} = s\,P/E_{\max}$ with $s \approx 0.8$ would remove this; $s = 1$
+is shipped because that is what "fully open at the last training point" states,
+but the choice is not derived.
+
+---
+
 ## 4. Summary of results
 
-**R1. Axis and column budget.** 17 declared axes; 21 surrogate columns —
-9 Real + 6 Integer + two 3-level Categoricals expanding to 6. The four binaries
+**R1. Axis and column budget.** 18 declared axes; 22 surrogate columns —
+10 Real + 6 Integer + two 3-level Categoricals expanding to 6. The four binaries
 are Integer rather than Categorical, saving four columns, because a two-level
 one-hot is exactly redundant. §3, §3.3.
 
-**R2. Activity.** Nine axes are always active. Three loss hyper-parameters are
+**R2. Activity.** Nine axes are always active. Four loss hyper-parameters are
 governed by $A(\ell)$: `margin` under `triplet` only; `angular_alpha_deg` under
-the two composite losses; `lambda_sep` under `joint_sep` only;
-`strict_semihard` under non-`triplet` only. Up to two columns are exactly flat
-on any given trial. §3.10–§3.16.
+the two composite losses; `lambda_sep` and `sep_warmup_frac` under `joint_sep`
+only; `strict_semihard` under non-`triplet` only. Up to **three** columns are
+exactly flat on any given trial. §3.10–§3.17.
 
 **R3. `margin` and `angular_alpha_deg` are never both active,** because both
 bind on the within/between distance ratio and would trace a ridge. Enforced
@@ -646,7 +758,7 @@ $1/36$; the other 32 carry $1/72$. Expected coverage after $N$ draws is
 $20(1-1/36)^N + 32(1-1/72)^N$ unvisited cells. THEORY §3.5.
 
 **R9. Freezing a three-level categorical is the largest available saving**, at
-3 columns each; `mining_strategy` and `loss_type` account for 6 of 21 columns.
+3 columns each; `mining_strategy` and `loss_type` account for 6 of 22 columns.
 §3.12.
 
 **R10. The search does not answer the baseline question.** Adaptive allocation

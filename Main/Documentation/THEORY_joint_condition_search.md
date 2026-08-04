@@ -9,7 +9,15 @@
 > unit vectors, equiangularity at $-1/(K-1)$ *already implies* the vectors sum
 > to zero — the two are one condition, not two. The centring has been **removed
 > from the code entirely**, the search axis $\kappa$ (`sep_centre_means`) has
-> been **deleted**, and the space is now **17 axes / 21 columns**. §3.7.3–§3.7.4
+> been **deleted**, and the space became **17 axes / 21 columns**. §3.7.3–§3.7.4
+>
+> **Revision 3:** $\tau$ (`sep_warmup_frac`) has been **added** as axis 18, so
+> the space is now **18 axes / 22 columns**. §3.6.2 is superseded: its dose
+> integral is correct but the ridge it infers does not close, because equal
+> dose does not imply equal terminal weight. The upper bound of the new axis is
+> **derived**, $\tau_{\max} = \min(1, P/E_{\max})$. Sentences below that read
+> "18 axes / 22 columns became 17 / 21" describe the Revision-2 *transition* and
+> are left as written; the live counts are 18 / 22.
 > are rewritten below; §3.5's coverage arithmetic is unaffected, since $\kappa$
 > was never part of the cell definition.
 **Repository / branch:** `Leonardodm00/Deep-Summary-Network`, `feat/composite-dsn-loss`, commit `fab2053`
@@ -591,7 +599,7 @@ non-identifiable from the objective alone.
 Restricting each loss type to at most one of them removes the ridge by
 construction rather than hoping the search avoids it.
 
-### 3.4 Encoding and dimension: 17 axes, 21 columns
+### 3.4 Encoding and dimension: 18 axes, 22 columns
 
 *This section establishes exactly what the surrogate sees, and why that is not
 what the configuration declares.*
@@ -790,7 +798,27 @@ since $t/(\tau T)$ is undefined there; the convention is that no warm-up means
 full weight from the first step, which reproduces the pre-existing ungated
 behaviour exactly.
 
-#### 3.6.2 Why $\tau$ is fixed rather than searched
+#### 3.6.2 Why $\tau$ was fixed rather than searched — **SUPERSEDED**
+
+> **Revision 3 supersedes this subsection.** The dose argument below is
+> reproduced unchanged because it is wrong in an instructive way, and deleting
+> it would leave the reversal unexplained. Equation (16) is correct; the
+> *inference* drawn from it is not. Two settings with equal dose have different
+> **terminal** weights $\lambda_{\mathrm{sep}}\,g(T)$, and since the epoch
+> selector usually picks a late epoch, the terminal weight plausibly governs the
+> converged geometry more than the integral does. The dose is therefore **not a
+> sufficient statistic** for the pair $(\lambda_{\mathrm{sep}}, \tau)$, the
+> ridge does not close, and $\tau$ carries a genuine second degree of freedom.
+> It is now the **18th searched axis**, with an upper bound
+> $\tau_{\max} = \min(1, P/E_{\max})$ **derived** rather than configured, so
+> that the ramp always completes before the earliest stop the rule permits.
+> Above that cap "large $\tau$ wins" would be indistinguishable from "the
+> separation term was off" — a statement about `joint` versus `joint_sep`, which
+> is *already* a searched axis, reached by a confounded route. See
+> `TUNING_1_searched_axes.md` §3.17. The claim that the terminal weight matters
+> more than the integral remains an **argument, not a measurement**; the
+> per-trial log now records both channels so it can be checked.
+
 
 Integrating the schedule over the planned horizon, for $\tau \in (0, 1]$,
 
@@ -1364,9 +1392,11 @@ supplies the clamp constants. §3.3.2.
 
 **S6. $m_{\cos}$ and $\alpha$ are never jointly active** because both bind on
 the within/between distance ratio, making the pair near-non-identifiable and
-tracing a ridge. §3.3.3. The same argument fixes $\tau$, §3.6.2.
+tracing a ridge. §3.3.3. That argument was also applied to $\tau$, and is
+**superseded** there: equal dose does not imply equal terminal weight, so
+$\tau$ is now searched under a derived cap. §3.6.2.
 
-**S7. 17 axes, 21 surrogate columns,** Eq. (9); the four binaries are integer
+**S7. 18 axes, 22 surrogate columns,** Eq. (9); the four binaries are integer
 axes because a two-level one-hot is exactly redundant, $x^{(2)} = 1 - x^{(1)}$.
 §3.4.
 
@@ -1385,7 +1415,9 @@ probability $0.247$. §3.5.3.
 
 **S11. The warm-up dose is $\lambda_{\mathrm{sep}} T (1 - \tau/2)$,** Eq. (16),
 which is why $\tau$ and $\lambda_{\mathrm{sep}}$ trade off multiplicatively and
-only one may be searched. §3.6.2.
+only one may be searched. §3.6.2 — but note that the $\tau$ case is
+**superseded**; the ridge closes for $(m_{\cos}, \alpha)$ and does not close
+for $(\lambda_{\mathrm{sep}}, \tau)$.
 
 **S12. A deterministic schedule removes a variance component.** Under a
 data-dependent gate the seed spread decomposes as Eq. (17) into optimisation
@@ -1409,7 +1441,7 @@ the special case. §3.7.3, §3.7.4.
 
 **S16. Equiangularity at $-1/(K-1)$ already implies $\sum_c \hat\mu_c = 0$,**
 by Eq. (21a), so the raw form imposes no extra constraint and the centring is
-not a correction but a defect. It has been removed; the space is 17 axes / 21
+not a correction but a defect. It has been removed; the space became 17 axes / 21
 columns. §3.7.4.
 
 **S17. The composite objective contains an internal tension:** the separation

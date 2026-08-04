@@ -139,6 +139,7 @@ from condition_space import (
     decode_head_fusion,
     decode_head_pool_ops,
     project_condition,
+    sep_warmup_frac_cap,
 )
 from config import ExperimentConfig
 from objective_utils import (
@@ -150,6 +151,7 @@ from objective_utils import (
     selected_epoch_scores,      #      so it is testable without torch
     tie_break_applicable,       # [C3] the dispatch policy, testable without torch
 )
+from dsn_joint_loss import sep_warmup_scale
 from train import train
 
 __all__ = [
@@ -207,11 +209,15 @@ _OPT_NAMES = ("lr", "one_minus_beta1", "one_minus_beta2", "weight_decay")
 # STAGED phase 2 never searched. Excluding them from the staged name list is
 # what keeps loss_hp_names(train_cfg) byte-compatible with every archived
 # staged run: phase 2 searched (angular_alpha_deg, lambda_sep) under
-# "joint_sep", and sep_centre_means postdates that pipeline entirely (before
-# this design it was not even reachable from a config file).
-# nothing is excluded any more: A(l) and the staged phase-2 list now coincide,
-# because sep_centre_means (the only axis the staged pipeline predated) is gone.
-_STAGED_EXCLUDED_LOSS_HPS = ()
+# "joint_sep", and nothing else.
+#
+# sep_warmup_frac (tau) is here because it joined A(joint_sep) when it became
+# the 18th axis of the JOINT CONDITION search. Letting that propagate to the
+# staged path would silently widen staged phase 2 from 2 dimensions to 3 under
+# "joint_sep" and rewrite the meaning of every archived staged coordinate
+# vector, which is a change nobody asked for. The joint condition space builds
+# the superset (superset=True) and is therefore unaffected by this list.
+_STAGED_EXCLUDED_LOSS_HPS = ("sep_warmup_frac",)
 
 
 def loss_hp_names(train_cfg=None, superset=False):
@@ -278,6 +284,22 @@ def _binary_dim(name, choices):
     return Integer(min(vals), max(vals), name=name)
 
 
+def _sep_warmup_frac_cap(train_cfg):
+    """tau_max for this trainer config, or 1.0 when it cannot be derived.
+
+    A thin adapter over condition_space.sep_warmup_frac_cap, which owns the
+    formula. train_cfg=None (the drop-in default of joint_condition_space) or a
+    config missing either field means the cap is UNKNOWN, and an unknown cap
+    must not silently narrow the space -- so 1.0 is returned and the requested
+    range stands. Every real caller in this pipeline passes cfg.train, and the
+    Stage-4 smoke test asserts the cap actually binds there.
+    """
+    if train_cfg is None:
+        return 1.0
+    return sep_warmup_frac_cap(int(getattr(train_cfg, "patience", 0)),
+                               int(getattr(train_cfg, "max_epochs", 0)))
+
+
 def _loss_dims(search_cfg, train_cfg, superset=False):
     """skopt dimensions for the loss HPs, in loss_hp_names order.
 
@@ -298,6 +320,25 @@ def _loss_dims(search_cfg, train_cfg, superset=False):
             lo, hi = search_cfg.lambda_sep_range
             dims.append(Real(float(lo), float(hi), prior="log-uniform",
                              name="lambda_sep"))
+        elif name == "sep_warmup_frac":
+            lo, hi = search_cfg.sep_warmup_frac_range
+            cap = _sep_warmup_frac_cap(train_cfg)
+            hi_eff = min(float(hi), cap)
+            if hi_eff < float(hi):
+                warnings.warn(
+                    "sep_warmup_frac_range upper bound %.3g exceeds patience/"
+                    "max_epochs = %.3g; clipped. Above the cap the ramp cannot "
+                    "finish before the earliest possible early stop, so a large "
+                    "tau would be confounded with 'the separation term was "
+                    "off'." % (float(hi), cap), RuntimeWarning)
+            if not (float(lo) < hi_eff):
+                raise ValueError(
+                    "sep_warmup_frac_range lower bound %.3g is at or above the "
+                    "derived cap %.3g (patience/max_epochs). Lower the range or "
+                    "raise patience." % (float(lo), hi_eff))
+            # uniform, NOT log-uniform: tau = 0 is the no-warm-up control arm
+            # and a log prior cannot include zero
+            dims.append(Real(float(lo), hi_eff, name="sep_warmup_frac"))
         else:
             raise ValueError("unhandled loss HP %r" % (name,))
     return dims
@@ -336,6 +377,8 @@ def _write_loss_hps(cfg, p, loss_type=None):
         cfg.train.angular_alpha_deg = float(p["angular_alpha_deg"])
     if "lambda_sep" in active and "lambda_sep" in p:
         cfg.train.lambda_sep = float(p["lambda_sep"])
+    if "sep_warmup_frac" in active and "sep_warmup_frac" in p:
+        cfg.train.sep_warmup_frac = float(p["sep_warmup_frac"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1105,9 +1148,16 @@ def search_joint(cfg, splits, device, verbose=False, train_verbose=False):
 #   10-12 loss HPs          margin, angular_alpha_deg, lambda_sep
 #   13-15 objective factors mining_strategy, loss_type, strict_semihard
 #   16-17 head geometry     head_fusion, head_pool_ops
+#   18    loss HP           sep_warmup_frac (tau)
 #
 # sep_centre_means was axis 18 and has been REMOVED: the centred form of L_sep
 # is scale-invariant and so cannot see collapse, leaving nothing to select.
+#
+# sep_warmup_frac was ADDED, and is APPENDED LAST rather than slotted in beside
+# the other loss HPs at 10-12. Axis order is load-bearing at a fixed
+# gp_random_state -- the initial design is a function of the ORDER of the
+# dimensions -- so appending is the minimal-diff choice, and no study has yet
+# been run against the 17-axis order that a reordering would have to preserve.
 #
 _JOINT_CONDITION_NAMES = (
     "depth_exponent", "width_multiplier", "block_family", "embedding_size",
@@ -1115,6 +1165,7 @@ _JOINT_CONDITION_NAMES = (
     "margin", "angular_alpha_deg", "lambda_sep",
     "mining_strategy", "loss_type", "strict_semihard",
     "head_fusion", "head_pool_ops",
+    "sep_warmup_frac",
 )
 
 
@@ -1146,11 +1197,11 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
     COLUMN ARITHMETIC. 18 declared axes, but the GP surrogate sees more,
     because skopt one-hots every Categorical:
 
-        11 numeric  (1, 2, 4-12 minus block_family)   -> 11 columns
-         4 binaries as Integer(0, 1)                  ->  4 columns
-         2 three-level Categorical (13, 14)           ->  6 columns
-                                                        ---------
-                                                          21 columns
+        12 numeric  (1, 2, 4-12, 18 minus block_family)  -> 12 columns
+         4 binaries as Integer(0, 1)                     ->  4 columns
+         2 three-level Categorical (13, 14)              ->  6 columns
+                                                            ---------
+                                                             22 columns
 
     Encoding the five binaries as Integer rather than Categorical is what saves
     5 columns: a two-level one-hot is exactly redundant (x2 = 1 - x1). This
@@ -1160,11 +1211,14 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
     TypeError. Integer yields genuine Python ints. The smoke test ASSERTS the
     int-ness rather than trusting this paragraph.
 
-    Up to 2 of the 21 columns are INACTIVE for any given trial (the loss HPs
+    Up to 3 of the 22 columns are INACTIVE for any given trial (the loss HPs
     outside A(l)). _write_loss_hps clamps them so they never reach the config,
     which turns them into genuinely flat directions for the surrogate rather
     than noise-injecting ones; ARD length-scales absorb flat directions. What
     that costs in sample efficiency at this budget is not estimated anywhere.
+
+    Cells, Pi and the coverage arithmetic are UNAFFECTED by the tau axis: tau
+    is not part of the cell definition, so the space is still 52 cells.
     """
     lo_d, hi_d = search_cfg.depth_exponent_range
     lo_w, hi_w = search_cfg.width_multiplier_range
@@ -1185,10 +1239,11 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
         Real(float(lo_wd), float(hi_wd), prior="log-uniform", name="weight_decay"),
         Real(float(lo_dr), float(hi_dr), name="dropout"),
     ]
-    # the loss-HP superset, minus sep_centre_means, which the axis order puts
-    # last; _loss_dims builds them in LOSS_HP_SUPERSET order, so slice rather
-    # than rebuild, and let the assertion below catch any drift between the two
-    # orderings instead of letting it become a silent coordinate swap.
+    # the loss-HP superset. _loss_dims builds them in LOSS_HP_SUPERSET order,
+    # so pick by name rather than rebuild, and let the assertion below catch
+    # any drift between the two orderings instead of letting it become a silent
+    # coordinate swap. Three of the four go here at 10-12; sep_warmup_frac is
+    # deliberately placed LAST, at 18.
     loss_dims = _loss_dims(search_cfg, train_cfg, superset=True)
     by_name = dict((d.name, d) for d in loss_dims)
     dims += [by_name["margin"], by_name["angular_alpha_deg"],
@@ -1200,6 +1255,11 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
         _binary_dim("strict_semihard", search_cfg.strict_semihard_choices),
         _binary_dim("head_fusion", search_cfg.head_fusion_choices),
         _binary_dim("head_pool_ops", search_cfg.head_pool_ops_choices),
+        # axis 18, appended LAST: see the note above _JOINT_CONDITION_NAMES on
+        # why the order is load-bearing. Its upper bound was DERIVED inside
+        # _loss_dims, which is the only place where both the requested range
+        # and (patience, max_epochs) are in scope.
+        by_name["sep_warmup_frac"],
     ]
     built = tuple(d.name for d in dims)
     if built != _JOINT_CONDITION_NAMES:
@@ -1345,7 +1405,7 @@ def resolve_n_initial_points_joint(search_cfg):
     return int(getattr(search_cfg, "n_initial_points", 0))
 
 
-def annotate_joint_condition_point(point):
+def annotate_joint_condition_point(point, train_cfg=None):
     """The per-trial log entry for a joint-condition point: what Pi did.
 
     Everything returned is JSON-serialisable (project_joint_condition_point
@@ -1354,11 +1414,40 @@ def annotate_joint_condition_point(point):
     trial whose coordinates said (hard, joint_sep, strict=True) but which
     trained (hard, joint_sep, strict=False) must be readable as such, or the
     duplicated observations the GP receives look like noise.
+
+    train_cfg is OPTIONAL and defaults to None, so every pre-existing
+    one-argument caller keeps working. When it is supplied AND the sampled loss
+    type is "joint_sep", two further quantities are recorded, and they are the
+    whole reason tau became a searched axis rather than a fixed knob:
+
+        sep_dose            lambda_sep * T * (1 - tau/2), the INTEGRAL of the
+                            weight over the planned budget;
+        sep_terminal_weight lambda_sep * g(T), the weight in force at the last
+                            planned step.
+
+    Equal-dose settings can differ in terminal weight, which is exactly why the
+    dose is not a sufficient statistic for tau. Without BOTH in the log, the
+    post-hoc question "did tau matter through the integral or through the
+    shape?" cannot be answered at all.
+
+    T IS NOT ALWAYS KNOWABLE HERE. batches_per_epoch = 0 means "derive n_b at
+    trainer build time as ceil(N_train / (C * B_c))", so T = E_max * n_b does
+    not exist yet. In that case sep_planned_steps and sep_dose are None and the
+    T-FREE ratio sep_dose_per_step = lambda_sep * (1 - tau/2) = sep_dose / T is
+    recorded instead, which is enough to rank trials against each other at a
+    common T. Reporting None beats reporting a number computed from a guessed
+    n_b.
+
+    OFF BY ONE, STATED SO IT IS NOT REDISCOVERED. sep_terminal_weight is
+    lambda_sep * g(T) as the design document defines it, but the last batch of
+    a run passes t = T - 1, not t = T, because t counts steps COMPLETED. The
+    difference is one step of the ramp and is immaterial at T >> 1; it is the
+    same lag SepWarmup's own docstring records for the per-epoch history.
     """
     _pt, info = project_joint_condition_point(point)
     p = dict(zip(_JOINT_CONDITION_NAMES, _pt))
     m, l, s = info["condition"]
-    return {
+    note = {
         "cell": info["cell"],
         "projected": bool(info["projected"]),
         "condition": [m, l, bool(s)],
@@ -1370,6 +1459,28 @@ def annotate_joint_condition_point(point):
         "head_pool_ops": list(decode_head_pool_ops(p["head_pool_ops"])),
         "active_loss_hps": list(active_loss_hps(l)),
     }
+    if l == "joint_sep" and "sep_warmup_frac" in p and "lambda_sep" in p:
+        tau = float(p["sep_warmup_frac"])
+        lam = float(p["lambda_sep"])
+        note["sep_warmup_frac"] = tau
+        note["lambda_sep"] = lam
+        # g(T) = min(1, T / (tau * T)) = min(1, 1 / tau), independent of T, so
+        # the terminal weight is computable even when T is not. Evaluated
+        # through the pure schedule rather than restated, so that a future
+        # change to the ramp shape propagates here automatically.
+        note["sep_terminal_weight"] = lam * float(
+            sep_warmup_scale(1, 1, tau))
+        note["sep_dose_per_step"] = lam * (1.0 - 0.5 * tau)
+        T = None
+        if train_cfg is not None:
+            n_b = int(getattr(train_cfg, "batches_per_epoch", 0))
+            E = int(getattr(train_cfg, "max_epochs", 0))
+            if n_b >= 1 and E >= 1:
+                T = E * n_b
+        note["sep_planned_steps"] = T
+        note["sep_dose"] = None if T is None else lam * float(T) * (1.0 - 0.5 * tau)
+        note["sep_full_weight_step"] = None if T is None else int(tau * T)
+    return note
 
 
 def search_joint_conditions(cfg, splits, device, verbose=False,
@@ -1412,7 +1523,9 @@ def search_joint_conditions(cfg, splits, device, verbose=False,
         verbose=verbose, tag="joint_cond",
         n_initial_points=n_init,
         epsilon=epsilon,
-        annotate=annotate_joint_condition_point,
+        # bound so the dose / terminal-weight decomposition can be
+        # computed; the callback itself takes one argument
+        annotate=lambda pt: annotate_joint_condition_point(pt, cfg.train),
         train_verbose=train_verbose)
 
 

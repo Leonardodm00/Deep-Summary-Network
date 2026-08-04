@@ -701,10 +701,24 @@ class TrainConfig:
     # tau = 0.0 is the DEFAULT and means "full weight from the first step",
     # which reproduces the pre-existing ungated behaviour
     # (sep_gate_threshold = None) exactly.
-    # tau is FIXED, never searched: the loss integrates to
+    #
+    # tau IS NOW SEARCHED under the joint condition search (18th axis), and the
+    # default 0.0 is therefore ALSO the CLAMP CONSTANT: it is the value every
+    # trial whose sampled loss type is not "joint_sep" keeps, so that two
+    # points differing only in tau build byte-identical configs. Leave it at
+    # 0.0 in any base config for that search.
+    #
+    # SUPERSEDED ARGUMENT, kept because it was wrong in an instructive way: tau
+    # was previously FIXED at 0.3 on the grounds that the loss integrates to
     # lambda_sep * T * (1 - tau/2), so tau and lambda_sep trade off almost
-    # multiplicatively -- the same ridge argument that fixes margin whenever
-    # angular_alpha_deg is searched.
+    # multiplicatively and would trace a ridge -- the same reasoning that fixes
+    # margin whenever angular_alpha_deg is searched. That does not follow. Two
+    # settings with equal DOSE have different TERMINAL weights
+    # lambda_sep * g(T), and the epoch selector usually picks a late epoch, so
+    # the terminal weight plausibly governs the converged geometry more than
+    # the integral does. The dose is not a sufficient statistic; tau carries a
+    # genuine second degree of freedom. Under the STAGED phase-2 search tau
+    # remains fixed (see search._STAGED_EXCLUDED_LOSS_HPS).
     sep_warmup_frac: float = 0.0
 
     # --- batching (ConditionBalancedBatchSampler; added in Stage 5) ---
@@ -899,6 +913,19 @@ class SearchConfig:
     # magnitude between C = 2 (raw class means) and C >= 3 (centred), so a
     # linear prior centred on the C >= 3 value would barely reach the C = 2 one.
     lambda_sep_range: Tuple[float, float] = (1e-3, 1.0)        # log-uniform
+    # tau, the warm-up fraction. The UPPER bound is DERIVED at
+    # space-construction time as min(1, patience / max_epochs) and this range
+    # is clipped to it, so that the ramp always completes before the earliest
+    # possible early stop. Stating a high value here is therefore a REQUEST,
+    # not a guarantee; search._loss_dims warns when it clips.
+    #
+    # Uniform, NOT log-uniform: tau = 0 must be reachable, because it is the
+    # no-warm-up control arm (sep_warmup_scale already handles it as constant
+    # full weight), and a log prior cannot include zero.
+    #
+    # Searched ONLY by the joint condition search. The staged phase 2 never
+    # searched tau, and search._STAGED_EXCLUDED_LOSS_HPS keeps it that way.
+    sep_warmup_frac_range: Tuple[float, float] = (0.0, 0.5)    # Real tau
     lr_range: Tuple[float, float] = (1e-4, 0.2)               # log-uniform
     one_minus_beta1_range: Tuple[float, float] = (1e-2, 1e-1)  # log-uniform -> b1 in [0.9, 0.99]
     one_minus_beta2_range: Tuple[float, float] = (1e-4, 1e-2)  # log-uniform -> b2 in [0.99, 0.9999]
@@ -1047,6 +1074,23 @@ class SearchConfig:
             raise ValueError(
                 "angular_alpha_deg_range high must be < 90 degrees")
         _check("lambda_sep_range", self.lambda_sep_range, positive=True)
+        # tau is a FRACTION of the planned step budget, so the range must sit
+        # inside [0, 1], and it must be non-degenerate: lo == hi would ask
+        # skopt for a zero-width Real. The upper bound is NOT checked against
+        # patience / max_epochs here -- SearchConfig cannot see TrainConfig,
+        # and the derived cap is applied where both are in scope
+        # (search._loss_dims).
+        _check("sep_warmup_frac_range", self.sep_warmup_frac_range)
+        _lo_tau, _hi_tau = self.sep_warmup_frac_range
+        if float(_lo_tau) < 0.0 or float(_hi_tau) > 1.0:
+            raise ValueError(
+                "sep_warmup_frac_range must lie within [0, 1] (tau is a "
+                "fraction of the planned step budget); got %r"
+                % (self.sep_warmup_frac_range,))
+        if not (float(_lo_tau) < float(_hi_tau)):
+            raise ValueError(
+                "sep_warmup_frac_range must be non-degenerate (low < high); "
+                "got %r" % (self.sep_warmup_frac_range,))
         _check("lr_range", self.lr_range, positive=True)
         _check("one_minus_beta1_range", self.one_minus_beta1_range, positive=True)
         _check("one_minus_beta2_range", self.one_minus_beta2_range, positive=True)

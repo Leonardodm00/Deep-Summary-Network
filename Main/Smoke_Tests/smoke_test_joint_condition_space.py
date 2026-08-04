@@ -3,8 +3,9 @@ smoke_test_joint_condition_space.py
 ===================================
 
 Acceptance tests for Stages 1-4 of the joint-GP-search implementation: the
-config surface, the legality projection Pi, the loss-HP triple, and the 18-axis
-joint condition space.
+config surface, the legality projection Pi, the loss-HP superset, and the
+18-axis joint condition space -- including the derived cap on tau
+(sep_warmup_frac), the 18th axis.
 
 Nothing here trains. Every check is a pure-function or config-construction
 check, so the whole file runs in seconds on a login node and needs no data, no
@@ -33,7 +34,8 @@ WHAT EACH CHECK GUARDS
   [3-A] Stage 3: names <-> dimensions <-> writer agree, for each loss type, in
         both staged and superset mode.
   [3-B] Stage 3: the staged space is UNCHANGED by this work (1 dim for triplet,
-        1 for joint, 2 for joint_sep -- sep_centre_means is not a staged axis).
+        1 for joint, 2 for joint_sep -- neither sep_centre_means nor
+        sep_warmup_frac is a staged axis).
   [3-C] Stage 3: inactive coordinates provably do not reach the config.
   [3-D] Stage 3: two points differing ONLY in inactive coordinates build
         BYTE-IDENTICAL configs (decision D1).
@@ -48,6 +50,20 @@ WHAT EACH CHECK GUARDS
         enough draws.
   [4-F] Stage 4: every sampled point builds a VALID config (Pi has removed the
         empty cell, so no draw can raise).
+
+  [T-A] Stage 4b: a requested tau range above the DERIVED cap
+        tau_max = min(1, patience/max_epochs) is clipped to it, and warns.
+  [T-B] Stage 4b: the cap tracks the config -- 0.40 at 100/40, 1/3 at 60/20 --
+        and is a no-op when the requested range already fits.
+  [T-C] Stage 4b: the cap is a GUARANTEE, not a hint: every sampled point
+        satisfies tau * T <= P * n_b, so the ramp always completes before the
+        earliest stop the rule permits. Inactive trials keep tau = 0.0.
+  [T-D] Stage 4b: a lower bound at or above the cap RAISES, rather than
+        silently producing an empty dimension.
+  [T-E] Stage 4b: tau = 0, the no-warm-up control arm, is inside the space and
+        builds (this is why the prior is uniform, not log-uniform).
+  [T-F] Stage 4b: the trial log records realised dose AND terminal weight, the
+        two channels tau is now free to move independently.
 
 HOW TO RUN
 ----------
@@ -107,6 +123,20 @@ def _expect(cond, msg):
         raise AssertionError(msg)
 
 
+def _space(cfg):
+    """joint_condition_space with the tau-cap clip warning silenced.
+
+    The clip is EXPECTED under the defaults: SearchConfig requests tau up to
+    0.5 while TrainConfig (max_epochs=100, patience=10) derives a cap of 0.10.
+    The dedicated cap test asserts that the warning fires; everywhere else it
+    is noise that would drown the pass/fail lines.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return S.joint_condition_space(cfg.search, cfg.regularization,
+                                       cfg.train)
+
+
 def _draw(dims, n, seed):
     """Sample n points from a list of skopt dimensions.
 
@@ -145,6 +175,7 @@ def test_1b_search_round_trip():
                      head_fusion_choices=(1,),
                      head_pool_ops_choices=(0,),
                      sep_centre_means_choices=(0, 1),
+                     sep_warmup_frac_range=(0.0, 0.35),
                      n_calls_joint=300, n_initial_points_joint=40)
     cfg = ExperimentConfig()
     cfg.search = s
@@ -158,6 +189,9 @@ def test_1b_search_round_trip():
         _expect(isinstance(got, tuple),
                 "%s came back as %s, not tuple (JSON lists must be coerced)"
                 % (f, type(got).__name__))
+    _expect(tuple(back.search.sep_warmup_frac_range) == (0.0, 0.35),
+            "sep_warmup_frac_range round-trip: %r"
+            % (back.search.sep_warmup_frac_range,))
     _expect(back.search.n_calls_joint == 300, "n_calls_joint round-trip")
     _expect(back.search.n_initial_points_joint == 40,
             "n_initial_points_joint round-trip")
@@ -209,6 +243,11 @@ def test_1d_validation():
         ("unknown binary level", dict(strict_semihard_choices=(0, 2))),
         ("duplicate level", dict(head_pool_ops_choices=(0, 0))),
         ("negative n_initial_points_joint", dict(n_initial_points_joint=-1)),
+        # tau is a FRACTION: outside [0, 1] and degenerate ranges must raise
+        ("tau range above 1", dict(sep_warmup_frac_range=(0.0, 1.5))),
+        ("tau range below 0", dict(sep_warmup_frac_range=(-0.1, 0.5))),
+        ("degenerate tau range", dict(sep_warmup_frac_range=(0.3, 0.3))),
+        ("inverted tau range", dict(sep_warmup_frac_range=(0.5, 0.2))),
     ]
     for label, kwargs in bad:
         try:
@@ -323,7 +362,9 @@ def test_3a_names_dims_writer_agree():
         t = TrainConfig(loss_type=l)
         for superset in (False, True):
             names = S.loss_hp_names(t, superset=superset)
-            dims = S._loss_dims(cfg.search, t, superset=superset)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")   # the expected tau-cap clip
+                dims = S._loss_dims(cfg.search, t, superset=superset)
             _expect(tuple(d.name for d in dims) == tuple(names),
                     "loss_type=%s superset=%s: names %r != dims %r"
                     % (l, superset, names, tuple(d.name for d in dims)))
@@ -349,7 +390,17 @@ def test_3b_staged_space_unchanged():
     _expect(len(S.train_space(cfg.search, TrainConfig(loss_type="joint_sep")))
             == 2 + 4,
             "staged train_space width changed for joint_sep")
-    print("  [3-B] the STAGED phase-2 space is unchanged by this work OK")
+    # tau joined A(joint_sep) when it became the 18th JOINT axis. It must NOT
+    # leak into the staged path: that would widen staged phase 2 from 2 dims to
+    # 3 and rewrite the meaning of every archived staged coordinate vector.
+    _expect("sep_warmup_frac" in CS.active_loss_hps("joint_sep"),
+            "sep_warmup_frac is missing from A(joint_sep)")
+    _expect("sep_warmup_frac" not in S.loss_hp_names(
+                TrainConfig(loss_type="joint_sep")),
+            "sep_warmup_frac leaked into the STAGED phase-2 space; "
+            "_STAGED_EXCLUDED_LOSS_HPS is what keeps it out")
+    print("  [3-B] the STAGED phase-2 space is unchanged by this work, "
+          "including by the new tau axis OK")
 
 
 def test_3c_inactive_never_reaches_config():
@@ -357,8 +408,10 @@ def test_3c_inactive_never_reaches_config():
     base_margin = cfg.train.margin
     base_alpha = cfg.train.angular_alpha_deg
     base_lambda = cfg.train.lambda_sep
+    base_tau = cfg.train.sep_warmup_frac
     # a point carrying EVERY loss HP at values far from the base config's
-    p = {"margin": 0.77, "angular_alpha_deg": 3.5, "lambda_sep": 7.25}
+    p = {"margin": 0.77, "angular_alpha_deg": 3.5, "lambda_sep": 7.25,
+         "sep_warmup_frac": 0.29}
     for l in CS.LOSS_TYPES:
         c = ExperimentConfig()
         c.train.loss_type = l
@@ -369,9 +422,10 @@ def test_3c_inactive_never_reaches_config():
         got = {"margin": c.train.margin,
                "angular_alpha_deg": c.train.angular_alpha_deg,
                "lambda_sep": c.train.lambda_sep,
+               "sep_warmup_frac": c.train.sep_warmup_frac,
                }
         base = {"margin": base_margin, "angular_alpha_deg": base_alpha,
-                "lambda_sep": base_lambda}
+                "lambda_sep": base_lambda, "sep_warmup_frac": base_tau}
         for name in CS.LOSS_HP_SUPERSET:
             if name in active:
                 want = float(p[name])
@@ -389,7 +443,7 @@ def test_3d_byte_identical_configs():
     """D1: two points differing ONLY in inactive coordinates -> same config."""
     base = ExperimentConfig()
     names = S.joint_condition_names()
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     pt = _draw(space, 1, 7)[0]
     i_loss = names.index("loss_type")
     i_strict = names.index("strict_semihard")
@@ -409,6 +463,11 @@ def test_3d_byte_identical_configs():
                 b[j] = 19.0 if float(a[j]) < 18.0 else 3.0
             elif n == "lambda_sep":
                 b[j] = 0.9 if float(a[j]) < 0.5 else 0.02
+            elif n == "sep_warmup_frac":
+                # perturb WITHIN the built dimension's bounds, so the point
+                # stays a legal sample of this space
+                lo_t, hi_t = space[names.index(n)].bounds
+                b[j] = hi_t if float(a[j]) < 0.5 * (lo_t + hi_t) else lo_t
         _expect(a != b, "test bug: no inactive coordinate was perturbed for %s" % l)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -432,25 +491,33 @@ def test_3d_byte_identical_configs():
 # --------------------------------------------------------------------------- #
 def test_4a_axis_and_column_count():
     cfg = ExperimentConfig()
-    space = S.joint_condition_space(cfg.search, cfg.regularization, cfg.train)
+    space = _space(cfg)
     names = S.joint_condition_names()
-    _expect(len(space) == 17, "expected 17 axes, got %d" % len(space))
+    _expect(len(space) == 18, "expected 18 axes, got %d" % len(space))
     _expect(tuple(d.name for d in space) == tuple(names),
             "space axis order != joint_condition_names()")
     # surrogate columns: skopt one-hots Categorical, everything else is 1 column
     cols = sum(len(d.categories) if hasattr(d, "categories") else 1
                for d in space)
-    _expect(cols == 21,
-            "expected 22 surrogate columns, got %d. Column arithmetic: 11 "
+    _expect(cols == 22,
+            "expected 22 surrogate columns, got %d. Column arithmetic: 12 "
             "numeric + 5 Integer binaries + 2 three-level Categorical (6) = 22."
             % cols)
-    print("  [4-A] 17 declared axes, 22 surrogate columns, names in order OK")
+    # tau is axis 18, LAST, and a Real -- one axis is one column
+    _expect(names[-1] == "sep_warmup_frac",
+            "sep_warmup_frac must be the LAST axis (order is load-bearing at "
+            "a fixed gp_random_state); got %r" % (names[-1],))
+    _expect(type(space[-1]).__name__ == "Real",
+            "sep_warmup_frac must be a Real, got %s"
+            % type(space[-1]).__name__)
+    print("  [4-A] 18 declared axes, 22 surrogate columns, tau last and Real, "
+          "names in order OK")
 
 
 def test_4b_round_trip():
     base = ExperimentConfig()
     names = S.joint_condition_names()
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     for pt in _draw(space, 40, 11):
         pt, info = S.project_joint_condition_point(list(pt))
         p = dict(zip(names, pt))
@@ -502,7 +569,7 @@ def test_4c_binaries_are_usable_integers():
     import numbers
     block_array = ["ResNet", "ResNeXt"]           # stands in for Block_array
     cfg = ExperimentConfig()
-    space = S.joint_condition_space(cfg.search, cfg.regularization, cfg.train)
+    space = _space(cfg)
     names = S.joint_condition_names()
     binaries = ("block_family", "strict_semihard", "head_fusion",
                 "head_pool_ops")
@@ -552,7 +619,7 @@ def test_4d_head_pool_ops_decode():
     base = ExperimentConfig()
     names = S.joint_condition_names()
     j = names.index("head_pool_ops")
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     seen = set()
     for pt in _draw(space, 30, 13):
         pt = list(pt)
@@ -571,7 +638,7 @@ def test_4d_head_pool_ops_decode():
 def test_4e_coverage():
     base = ExperimentConfig()
     names = S.joint_condition_names()
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     conds, heads = set(), set()
     for pt in _draw(space, 400, 17):
         _pt, info = S.project_joint_condition_point(list(pt))
@@ -588,7 +655,7 @@ def test_4e_coverage():
 
 def test_4f_every_draw_builds():
     base = ExperimentConfig()
-    space = S.joint_condition_space(base.search, base.regularization, base.train)
+    space = _space(base)
     n_projected = 0
     for pt in _draw(space, 200, 23):
         pt = list(pt)
@@ -608,6 +675,176 @@ def test_4f_every_draw_builds():
             "no draw out of 200 was projected -- the test is not exercising Pi")
     print("  [4-F] all 200 draws build a valid, legal config (%d were projected "
           "by Pi) OK" % n_projected)
+
+
+# --------------------------------------------------------------------------- #
+# The derived tau cap -- tau_max = min(1, patience / max_epochs)
+# --------------------------------------------------------------------------- #
+def _tau_dim(requested, max_epochs, patience, record=False):
+    """Build the sep_warmup_frac dimension for a given (range, budget) pair."""
+    sc = SearchConfig(sep_warmup_frac_range=requested)
+    tc = TrainConfig(max_epochs=max_epochs, patience=patience)
+    if record:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            dims = S._loss_dims(sc, tc, superset=True)
+        return [d for d in dims if d.name == "sep_warmup_frac"][0], rec
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dims = S._loss_dims(sc, tc, superset=True)
+    return [d for d in dims if d.name == "sep_warmup_frac"][0], None
+
+
+def test_ta_cap_binds():
+    """A requested range wider than the cap is CLIPPED, loudly."""
+    dim, rec = _tau_dim((0.0, 0.9), 100, 40, record=True)
+    lo, hi = dim.bounds
+    _expect(abs(float(hi) - 0.40) < 1e-12,
+            "at max_epochs=100, patience=40 the cap is 0.40; the built "
+            "dimension has high = %r" % (hi,))
+    _expect(abs(float(lo) - 0.0) < 1e-12,
+            "the lower bound must be left alone; got %r" % (lo,))
+    _expect(any(issubclass(w.category, RuntimeWarning)
+                and "sep_warmup_frac_range" in str(w.message) for w in rec),
+            "clipping the range must WARN and name the field; got %r"
+            % ([str(w.message) for w in rec],))
+    print("  [T-A] a range above the cap is clipped to P/E_max = 0.40 and "
+          "warns OK")
+
+
+def test_tb_cap_tracks_the_config():
+    """The cap is DERIVED, so changing patience/max_epochs moves it."""
+    dim, _ = _tau_dim((0.0, 0.9), 60, 20)
+    _expect(abs(float(dim.bounds[1]) - 1.0 / 3.0) < 1e-12,
+            "at 60/20 the cap is 1/3; got %r" % (dim.bounds[1],))
+    # and a range already inside the cap is left EXACTLY alone
+    dim2, rec2 = _tau_dim((0.0, 0.25), 100, 40, record=True)
+    _expect(abs(float(dim2.bounds[1]) - 0.25) < 1e-12,
+            "a range inside the cap must not be touched; got %r"
+            % (dim2.bounds[1],))
+    _expect(not any("sep_warmup_frac_range" in str(w.message) for w in rec2),
+            "a range inside the cap must not warn")
+    print("  [T-B] the cap tracks (patience, max_epochs): 0.40 at 100/40, "
+          "1/3 at 60/20, no-op when the range already fits OK")
+
+
+def test_tc_cap_is_a_guarantee():
+    """Not a hint: EVERY sampled point must satisfy tau <= P / E_max."""
+    base = ExperimentConfig()
+    names = S.joint_condition_names()
+    E = int(base.train.max_epochs)
+    P = int(base.train.patience)
+    n_b = int(base.train.batches_per_epoch) or 1
+    cap = CS.sep_warmup_frac_cap(P, E)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        space = S.joint_condition_space(base.search, base.regularization,
+                                        base.train)
+    j = names.index("sep_warmup_frac")
+    n_jsep = 0
+    for pt in _draw(space, 200, 3):
+        _expect(float(pt[j]) <= cap + 1e-12,
+                "sampled tau = %r exceeds the cap %r" % (pt[j], cap))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cfg = S.config_from_joint_condition_point(base, pt)
+        tau = float(cfg.train.sep_warmup_frac)
+        _expect(tau <= cap + 1e-12,
+                "a BUILT config carries tau = %r above the cap %r" % (tau, cap))
+        # the ramp completes before the earliest stop the rule permits:
+        #     tau * T <= P * n_b,  with T = E * n_b
+        _expect(tau * (E * n_b) <= P * n_b + 1e-9,
+                "tau * T = %r exceeds P * n_b = %r" % (tau * E * n_b, P * n_b))
+        if cfg.train.loss_type == "joint_sep":
+            n_jsep += 1
+        else:
+            _expect(tau == 0.0,
+                    "tau is INACTIVE under %r and must stay at the clamp "
+                    "constant 0.0; got %r" % (cfg.train.loss_type, tau))
+    _expect(n_jsep > 0, "no joint_sep draw out of 200 -- test not exercised")
+    print("  [T-C] all 200 draws satisfy tau <= P/E_max, so the ramp always "
+          "completes before the earliest possible stop (%d were joint_sep) OK"
+          % n_jsep)
+
+
+def test_td_degenerate_range_raises():
+    """A lower bound at or above the cap is an ERROR, not an empty dimension."""
+    try:
+        _tau_dim((0.5, 0.9), 100, 10)      # cap = 0.10, lo = 0.50
+    except ValueError as ex:
+        _expect("cap" in str(ex),
+                "the error must explain the derived cap; got %r" % (str(ex),))
+    else:
+        raise AssertionError(
+            "a lower bound above the derived cap built a dimension silently")
+    print("  [T-D] a lower bound above the cap raises ValueError OK")
+
+
+def test_te_tau_zero_survives():
+    """tau = 0 is the control arm and must remain buildable."""
+    base = ExperimentConfig()
+    names = S.joint_condition_names()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        space = S.joint_condition_space(base.search, base.regularization,
+                                        base.train)
+    pt = _draw(space, 1, 5)[0]
+    pt[names.index("loss_type")] = "joint_sep"
+    pt[names.index("mining_strategy")] = "easy_pos_semihard_neg"
+    pt[names.index("strict_semihard")] = 0
+    pt[names.index("sep_warmup_frac")] = 0.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = S.config_from_joint_condition_point(base, pt)
+    _expect(cfg.train.sep_warmup_frac == 0.0,
+            "tau = 0 did not survive to the config: %r"
+            % (cfg.train.sep_warmup_frac,))
+    _expect(float(space[names.index("sep_warmup_frac")].bounds[0]) == 0.0,
+            "the tau axis must REACH 0: it is the no-warm-up control arm, and "
+            "that is why the prior is uniform rather than log-uniform")
+    print("  [T-E] tau = 0 is inside the space and builds a valid config OK")
+
+
+def test_tf_trial_log_separates_dose_from_shape():
+    """The log must carry BOTH channels tau is now free to move."""
+    base = ExperimentConfig()
+    names = S.joint_condition_names()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        space = S.joint_condition_space(base.search, base.regularization,
+                                        base.train)
+    pt = _draw(space, 1, 13)[0]
+    pt[names.index("loss_type")] = "joint_sep"
+    pt[names.index("mining_strategy")] = "easy_positive"
+    pt[names.index("strict_semihard")] = 0
+    pt[names.index("lambda_sep")] = 4.0
+    pt[names.index("sep_warmup_frac")] = 0.08
+    t = TrainConfig(max_epochs=100, patience=40, batches_per_epoch=100)
+    note = S.annotate_joint_condition_point(pt, t)
+    T = 100 * 100
+    _expect(abs(note["sep_dose"] - 4.0 * T * (1.0 - 0.04)) < 1e-6,
+            "realised dose is wrong: %r" % (note["sep_dose"],))
+    _expect(abs(note["sep_terminal_weight"] - 4.0) < 1e-9,
+            "terminal weight should be lambda_sep for any tau <= 1; got %r"
+            % (note["sep_terminal_weight"],))
+    _expect(note["sep_planned_steps"] == T, "T not recorded")
+    _expect(note["sep_full_weight_step"] == int(0.08 * T),
+            "full-weight step not recorded")
+    json.dumps(note)                       # the trial log is written as JSON
+    # one-argument callers still work, and T is honestly reported as unknown
+    note1 = S.annotate_joint_condition_point(pt)
+    _expect(note1["sep_planned_steps"] is None and note1["sep_dose"] is None,
+            "without a train_cfg, T is unknown and must be None, not guessed")
+    _expect(abs(note1["sep_dose_per_step"] - 4.0 * (1.0 - 0.04)) < 1e-9,
+            "the T-free dose ratio must still be recorded")
+    # a non-joint_sep trial carries none of it (tau is inactive there)
+    pt2 = list(pt)
+    pt2[names.index("loss_type")] = "triplet"
+    note2 = S.annotate_joint_condition_point(pt2, t)
+    _expect("sep_dose" not in note2,
+            "tau is INACTIVE under triplet; the dose must not be logged")
+    print("  [T-F] the trial log separates realised dose from terminal weight, "
+          "and stays JSON-serialisable OK")
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +872,13 @@ def main():
     test_4d_head_pool_ops_decode()
     test_4e_coverage()
     test_4f_every_draw_builds()
+    print("Stage 4b -- the DERIVED tau cap (tau_max = min(1, P/E_max))")
+    test_ta_cap_binds()
+    test_tb_cap_tracks_the_config()
+    test_tc_cap_is_a_guarantee()
+    test_td_degenerate_range_raises()
+    test_te_tau_zero_survives()
+    test_tf_trial_log_separates_dose_from_shape()
     print("\nALL SMOKE TESTS PASSED")
     return 0
 

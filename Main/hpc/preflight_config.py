@@ -256,23 +256,50 @@ def preflight(path, verbose=True):
                          "not the TrainConfig default 0.1, so EVERY "
                          "triplet/joint trial will fire the 'INERT lambda_sep' "
                          "RuntimeWarning." % (float(t.lambda_sep),))
-        # the warm-up applies whenever joint_sep is reachable
+        # tau is the 18th SEARCHED axis, active under joint_sep only, and its
+        # upper bound is DERIVED rather than configured. No
+        # "patience/max_epochs < tau" warning is emitted here: the cap makes
+        # that condition unreachable by construction. (The OBJECTIVE block
+        # above still warns, and must -- it covers the STAGED path, where tau
+        # is fixed and no cap exists.)
         if "joint_sep" in tuple(sc.loss_type_choices):
-            tau = float(getattr(t, "sep_warmup_frac", 0.0))
+            tau_lo, tau_hi = sc.sep_warmup_frac_range
+            tau_cap = CS.sep_warmup_frac_cap(int(t.patience),
+                                             int(t.max_epochs))
+            tau_hi_eff = min(float(tau_hi), tau_cap)
             T_planned = int(t.max_epochs) * int(t.batches_per_epoch) \
                 if int(t.batches_per_epoch) >= 1 else 0
-            lines.append("  warm-up (joint_sep trials): tau = %.4g, T = %s -> "
-                         "full lambda_sep(t) at step %s"
-                         % (tau,
-                            ("%d" % T_planned) if T_planned else "derived",
-                            ("%d" % int(tau * T_planned))
-                            if (tau > 0 and T_planned) else "0 (constant)"))
-            if tau > 0.0 and T_planned and \
-                    float(t.patience) / float(t.max_epochs) < tau:
-                lines.append("    WARNING: patience/max_epochs = %.2f < tau = "
-                             "%.2f: a run stopping at its patience floor never "
-                             "reaches full lambda_sep."
-                             % (float(t.patience) / float(t.max_epochs), tau))
+            lines.append("    sep_warmup_frac (tau) in [%.4g, %.4g] "
+                         "(joint_sep trials only)"
+                         % (float(tau_lo), tau_hi_eff))
+            lines.append("  warm-up: tau_max = min(1, patience/max_epochs) = "
+                         "min(1, %d/%d) = %.4g   [DERIVED, not configured]"
+                         % (int(t.patience), int(t.max_epochs), tau_cap))
+            if float(tau_hi) > tau_cap:
+                lines.append("    the requested upper bound %.4g is CLIPPED to "
+                             "%.4g; search._loss_dims warns when it does this"
+                             % (float(tau_hi), tau_hi_eff))
+            if T_planned:
+                lines.append("    T = %d steps -> full lambda_sep reached "
+                             "between step %d and step %d"
+                             % (T_planned, int(float(tau_lo) * T_planned),
+                                int(tau_hi_eff * T_planned)))
+            else:
+                lines.append("    T is DERIVED at trainer build time "
+                             "(batches_per_epoch = 0), so the full-weight step "
+                             "range cannot be printed here")
+            lines.append("    the cap guarantees the ramp completes even for "
+                         "the shortest run patience permits, so 'large tau "
+                         "wins' can never mean 'the term was off'")
+            base_tau = float(getattr(t, "sep_warmup_frac", 0.0))
+            if abs(base_tau) > 1e-12:
+                lines.append("  WARNING: train.sep_warmup_frac = %.4g is the "
+                             "CLAMP CONSTANT for the trials where tau is "
+                             "inactive, and it is not the TrainConfig default "
+                             "0.0, so non-joint_sep trials will ramp a term "
+                             "they never use and two points differing only in "
+                             "tau will NOT build identical configs."
+                             % (base_tau,))
 
     lines.append("")
     lines.append("SPLIT")

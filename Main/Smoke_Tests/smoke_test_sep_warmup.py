@@ -30,6 +30,9 @@ AND THE CHECKS THAT GUARD THE WIRING AROUND THEM
         sep_centre_means or gate threshold warns
   [5-L] the gradient actually scales with the ramp (the term is not merely
         multiplied by a number that never reaches the graph)
+  [5-M] tau is now a SEARCHED axis: a sampled tau round-trips
+        point -> cfg.train.sep_warmup_frac -> SepWarmup.warmup_frac
+  [5-N] tau = 0 survives that path and still means constant full weight
 
 HOW TO RUN
 ----------
@@ -352,6 +355,97 @@ def test_5l_gradient_scales_with_ramp():
           "(|grad| %.4g at t=0 vs %.4g at t>=tau*T) OK" % (g1, g2))
 
 
+def _joint_sep_point(tau, seed=17):
+    """A joint_sep point of the 18-axis space, with tau pinned to a value.
+
+    Imported lazily: this file is otherwise a loss-module test and needs no
+    skopt. If the search stack is unavailable the two checks below SKIP rather
+    than fail, because they are about wiring, not about the ramp itself.
+    """
+    import warnings as _w
+    from skopt.space import Space
+    import search as S
+    from config import ExperimentConfig
+
+    base = ExperimentConfig()
+    names = S.joint_condition_names()
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")           # the expected tau-cap clip
+        space = S.joint_condition_space(base.search, base.regularization,
+                                        base.train)
+    pt = [list(x) for x in Space(space).rvs(n_samples=1, random_state=seed)][0]
+    pt[names.index("loss_type")] = "joint_sep"
+    pt[names.index("mining_strategy")] = "easy_pos_semihard_neg"
+    pt[names.index("strict_semihard")] = 0
+    pt[names.index("sep_warmup_frac")] = float(tau)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        cfg = S.config_from_joint_condition_point(base, pt)
+    return cfg
+
+
+def test_5m_searched_tau_reaches_the_loss():
+    """ACCEPTANCE: the sampled tau reaches cfg.train AND then the loss module.
+
+    tau is the 18th searched axis, so the path
+        point -> cfg.train.sep_warmup_frac -> SepWarmup.warmup_frac
+    is now load-bearing. A break anywhere along it is silent: the run trains
+    perfectly well, just on a schedule nobody chose.
+    """
+    try:
+        cfg = _joint_sep_point(0.17)
+    except ImportError:
+        print("  [5-M] SKIPPED: the search stack (skopt) is not importable")
+        return
+    _expect(abs(float(cfg.train.sep_warmup_frac) - 0.17) < 1e-12,
+            "the sampled tau did not reach cfg.train: %r"
+            % (cfg.train.sep_warmup_frac,))
+    _expect(cfg.train.loss_type == "joint_sep",
+            "the test point did not build a joint_sep config")
+    T = int(cfg.train.max_epochs) * 100
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        loss_fn, _m = build_loss_and_miner(cfg.train, n_classes=3,
+                                           total_steps=T)
+    _expect(abs(float(loss_fn.warmup.warmup_frac) - 0.17) < 1e-12,
+            "tau reached the config but NOT the loss: %r"
+            % (loss_fn.warmup.warmup_frac,))
+    _expect(abs(loss_fn.warmup.warmup_steps - 0.17 * T) < 1e-9,
+            "the ramp length is wrong: %r" % (loss_fn.warmup.warmup_steps,))
+    print("  [5-M] a SEARCHED tau round-trips point -> config -> "
+          "SepWarmup.warmup_frac OK")
+
+
+def test_5n_searched_tau_zero_is_constant_full_weight():
+    """ACCEPTANCE: tau = 0 survives the search path as the control arm.
+
+    tau = 0 must be REACHABLE (it is why the prior is uniform, not
+    log-uniform) and must still mean "full weight from step 0" once it has
+    travelled through the point -> config -> loss path.
+    """
+    try:
+        cfg = _joint_sep_point(0.0)
+    except ImportError:
+        print("  [5-N] SKIPPED: the search stack (skopt) is not importable")
+        return
+    _expect(float(cfg.train.sep_warmup_frac) == 0.0,
+            "tau = 0 did not survive to the config: %r"
+            % (cfg.train.sep_warmup_frac,))
+    T = int(cfg.train.max_epochs) * 100
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        loss_fn, _m = build_loss_and_miner(cfg.train, n_classes=3,
+                                           total_steps=T)
+    _expect(loss_fn.warmup.warmup_steps == 0.0,
+            "tau = 0 must disable the ramp entirely; warmup_steps = %r"
+            % (loss_fn.warmup.warmup_steps,))
+    for _ in range(5):
+        _expect(float(loss_fn.warmup()) == 1.0,
+                "tau = 0 must give constant FULL weight from step 0")
+    print("  [5-N] tau = 0 survives the search path and gives constant full "
+          "weight from step 0 OK")
+
+
 def main():
     print("Stage 5 -- the warm-up that replaces the gate")
     test_5a_zero_at_zero()
@@ -367,6 +461,9 @@ def main():
     test_5j_state_dict_resumes()
     test_5k_end_to_end_from_config()
     test_5l_gradient_scales_with_ramp()
+    print("Stage 5 -- tau as a SEARCHED axis")
+    test_5m_searched_tau_reaches_the_loss()
+    test_5n_searched_tau_zero_is_constant_full_weight()
     print("\nALL SMOKE TESTS PASSED")
     return 0
 

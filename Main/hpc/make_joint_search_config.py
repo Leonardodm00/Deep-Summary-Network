@@ -38,7 +38,19 @@ WHAT IS SET, AND WHY
   train.batches_per_epoch = 100             6.7x the screening's step budget,
                                             and the single most important
                                             change in the design
-  train.sep_warmup_frac = 0.3               tau, FIXED not searched
+  search.sep_warmup_frac_range              tau, SEARCHED (18th axis). The
+                                            UPPER bound written here is a
+                                            REQUEST: search._loss_dims clips it
+                                            to the DERIVED cap
+                                            min(1, patience/max_epochs) so the
+                                            ramp always completes before the
+                                            earliest possible early stop. The
+                                            cap is printed below.
+  train.sep_warmup_frac = 0.0               NOT a value that will be used --
+                                            it is the CLAMP CONSTANT for the
+                                            trials where tau is inactive
+                                            (every non-joint_sep trial), and
+                                            must be the TrainConfig default.
   train.lambda_sep = 0.1                    NOT a value that will be used --
                                             it is the CLAMP CONSTANT for the
                                             trials where lambda_sep is
@@ -68,6 +80,12 @@ import json
 import os
 import sys
 
+# the cap formula lives in condition_space, which is pure stdlib, so
+# importing it here costs nothing and keeps ONE definition of tau_max
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from condition_space import sep_warmup_frac_cap
+
 
 # the design document's search-space table (section 3.5)
 RANGES = {
@@ -80,6 +98,9 @@ RANGES = {
     "margin_range": [0.1, 1.0],
     "angular_alpha_deg_range": [2.0, 20.0],
     "lambda_sep_range": [1e-2, 20.0],
+    # REQUESTED range for tau; clipped to min(1, patience/max_epochs)
+    # at space-construction time. Overridden by --warmup-frac-range.
+    "sep_warmup_frac_range": [0.0, 0.5],
 }
 # weight_decay and dropout come from the REGULARIZATION block in the joint
 # space (it takes the wider weight_decay range), so they are set there
@@ -125,6 +146,8 @@ def build(base, args):
     s["n_initial_points_joint"] = int(args.n_initial_points)
     s["tie_break_gamma"] = 0.0
     s["gp_random_state"] = int(args.gp_random_state)
+    s["sep_warmup_frac_range"] = [float(args.warmup_frac_range[0]),
+                                  float(args.warmup_frac_range[1])]
     cfg["regularization"].update(REG_RANGES)
 
     # ---- the trainer --------------------------------------------------------
@@ -133,7 +156,12 @@ def build(base, args):
     t["batches_per_epoch"] = int(args.batches_per_epoch)
     t["max_epochs"] = int(args.max_epochs)
     t["patience"] = int(args.patience)
-    t["sep_warmup_frac"] = float(args.warmup_frac)
+    # tau is SEARCHED, so what the trainer block carries is the CLAMP
+    # CONSTANT for the trials where it is inactive, not a schedule. Written
+    # EXPLICITLY rather than left to the base config, because a --base that was
+    # itself generated before this change carries 0.3 and would otherwise make
+    # every triplet/joint trial ramp a term it does not use.
+    t["sep_warmup_frac"] = 0.0
     # the CLAMP CONSTANT for inactive trials -- must be the TrainConfig default
     t["lambda_sep"] = 0.1
     # NOT written: sep_centre_means is inert (the centred form was removed)
@@ -152,7 +180,9 @@ def report(cfg, args):
     E = int(t["max_epochs"])
     n_calls = int(cfg["search"]["n_calls_joint"])
     ns = int(t["n_seeds"])
-    tau = float(t["sep_warmup_frac"])
+    tau_lo, tau_hi = cfg["search"]["sep_warmup_frac_range"]
+    tau_cap = sep_warmup_frac_cap(int(t["patience"]), E)
+    tau_hi_eff = min(float(tau_hi), tau_cap)
 
     spe = seconds_per_epoch(nb)
     mean_epochs = _MEAN_EPOCH_FRACTION * E
@@ -167,12 +197,24 @@ def report(cfg, args):
                % (E, nb, T))
     out.append("    (the screening's maximum was 1500 steps -> %.1fx)"
                % (T / 1500.0))
-    out.append("  warm-up: tau = %.3g -> full lambda_sep at step %d, i.e. "
-               "epoch %.1f of %d" % (tau, int(tau * T), tau * E, E))
-    if float(t["patience"]) / float(E) < tau:
-        out.append("    WARNING: patience/max_epochs = %.2f < tau = %.2f, so a "
-                   "run stopping at its patience floor never reaches full "
-                   "lambda_sep." % (float(t["patience"]) / float(E), tau))
+    out.append("  warm-up: tau is SEARCHED over [%.3g, %.3g] as requested"
+               % (float(tau_lo), float(tau_hi)))
+    out.append("    DERIVED CAP tau_max = min(1, patience/max_epochs) = "
+               "min(1, %d/%d) = %.4g" % (int(t["patience"]), E, tau_cap))
+    if float(tau_hi) > tau_cap:
+        out.append("    -> the requested upper bound %.3g is CLIPPED to %.4g "
+                   "(search._loss_dims warns at build time)"
+                   % (float(tau_hi), tau_hi_eff))
+    out.append("    effective range [%.3g, %.4g] -> full lambda_sep between "
+               "step %d and step %d of %d"
+               % (float(tau_lo), tau_hi_eff, int(float(tau_lo) * T),
+                  int(tau_hi_eff * T), T))
+    out.append("    the cap guarantees the ramp completes even for the "
+               "shortest run patience permits (%d epochs), so a large tau is "
+               "never confounded with 'the separation term was off'"
+               % int(t["patience"]))
+    out.append("  train.sep_warmup_frac = %.3g is the CLAMP CONSTANT for the "
+               "trials where tau is inactive" % float(t["sep_warmup_frac"]))
     out.append("")
     out.append("WALL CLOCK (depth-4 rate, size mix UNMEASURED)")
     out.append("  %.1f s/epoch at %d batches (extrapolated from a MEASURED "
@@ -231,7 +273,13 @@ def main(argv=None):
                          "records that as not yet accepted.")
     ap.add_argument("--patience", type=int, default=40,
                     help="the STATED value. The design recommends 20.")
-    ap.add_argument("--warmup-frac", type=float, default=0.3, help="tau")
+    ap.add_argument("--warmup-frac-range", type=float, nargs=2,
+                    metavar=("LO", "HI"), default=(0.0, 0.5),
+                    help="REQUESTED range for tau, the warm-up fraction. The "
+                         "upper bound is clipped at space-construction time to "
+                         "the derived cap min(1, patience/max_epochs); this "
+                         "script prints both. Replaces the old --warmup-frac, "
+                         "which pinned a single value back when tau was fixed.")
     ap.add_argument("--gp-random-state", type=int, default=0)
     ap.add_argument("--walltime", type=float, default=144.0,
                     help="requested walltime in hours, for the arithmetic")
