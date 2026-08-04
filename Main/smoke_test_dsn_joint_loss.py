@@ -260,15 +260,60 @@ def check_sep_ignores_surrogates():
     return "L_sep unchanged by 12 surrogate rows (%.6f), K = 3" % clean
 
 
-def check_sep_translation_invariant():
-    """The means are centred, so a rigid shift of the whole batch is a no-op."""
+def check_sep_is_not_scale_blind():
+    """THE regression guard for the defect that removed the centred form.
+
+    The centred form was invariant to translation AND scale, so it measured
+    only the SHAPE of the simplex of class means and never its SIZE: three
+    classes collapsed into a tiny cap scored ~0. The raw form must respond
+    to collapse, monotonically.
+    """
+    import math
+    def cap_batch(eps, K=3, E=8, per_class=9, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        base = torch.zeros(E); base[0] = 1.0
+        e1 = torch.zeros(E); e1[1] = 1.0
+        e2 = torch.zeros(E); e2[2] = 1.0
+        Z, y = [], []
+        for c in range(K):
+            ang = 2 * math.pi * c / K
+            v = base + eps * (math.cos(ang) * e1 + math.sin(ang) * e2)
+            d = v / v.norm()
+            z = d.unsqueeze(0) + 0.001 * torch.randn(per_class, E, generator=g)
+            Z.append(z / z.norm(dim=1, keepdim=True)); y += [c] * per_class
+        return torch.cat(Z), torch.tensor(y)
+
+    fn = CentroidSeparationLoss(n_classes=3)
+    vals = [float(fn(*cap_batch(e)).detach()) for e in (0.02, 0.5, 1.0, 2.0)]
+    assert vals[0] > 1.0, \
+        ("COLLAPSED classes scored %.6f -- the term is blind to collapse, "
+         "which is exactly the centred-form defect" % vals[0])
+    assert all(a > b for a, b in zip(vals, vals[1:])), \
+        "L_sep is not monotone decreasing in separation: %r" % vals
+    return ("L_sep sees collapse: %.3f (cap) -> %.3f (spread), monotone"
+            % (vals[0], vals[-1]))
+
+
+def check_sep_responds_to_scale():
+    """Scaling the class means toward their own mean MUST change L_sep.
+
+    Under the centred form this was identically zero change; it is the
+    single-line statement of why that form was removed.
+    """
     z, y = make_batch(spread=0.6)
     fn = CentroidSeparationLoss(n_classes=3)
-    base = float(fn(z, y))
-    shifted = float(fn(z + 3.7, y))
-    assert abs(base - shifted) < 1e-5, \
-        "not translation invariant: %.8f -> %.8f" % (base, shifted)
-    return "L_sep invariant to a rigid shift (%.6f)" % base
+    mus = torch.stack([z[y == c].mean(0) for c in range(3)])
+    mG = mus.mean(0)
+    shrunk = []
+    for scale in (1.0, 0.05):
+        zz = mG + scale * (z - mG)
+        zz = zz / zz.norm(dim=1, keepdim=True)
+        shrunk.append(float(fn(zz, y).detach()))
+    assert abs(shrunk[0] - shrunk[1]) > 1e-4, \
+        ("L_sep unchanged (%.8f vs %.8f) when the cloud is shrunk 20x toward "
+         "its own mean -- that is the scale-blindness the centred form had"
+         % (shrunk[0], shrunk[1]))
+    return "L_sep responds to shrinking the cloud (%.4f -> %.4f)" % tuple(shrunk)
 
 
 def check_sep_gradient_is_finite():
@@ -491,33 +536,67 @@ def check_short_batch_degrades_gracefully():
     return "short batch: K falls to 2, L_sep = %.6f, finite" % float(val)
 
 
-def check_centred_form_is_vacuous_at_two_classes():
-    """THE DEFECT THE C = 2 FALLBACK EXISTS TO FIX. Forcing centre_means=True
-    at C = 2 makes the two centred means antipodal by construction, so the
-    cosine is identically -1, which is also the target -1/(K-1) = -1, and the
-    loss is exactly zero for EVERY embedding. This check pins the defect so
-    the fallback cannot be silently reverted."""
-    g = torch.Generator().manual_seed(11)
-    fn = CentroidSeparationLoss(n_classes=2, centre_means=True)
-    worst = 0.0
-    for _ in range(50):
-        z = torch.randn(18, 16, generator=g)
-        y = torch.arange(2).repeat_interleave(9)
-        worst = max(worst, float(fn(z, y).detach()))
-    assert worst < 1e-9, \
-        "centred form at C = 2 was expected vacuous, got %.3e" % worst
-    return "centred form at C = 2 is identically zero (max %.1e) -- hence the " \
-        "raw fallback" % worst
+def check_raw_form_is_not_vacuous_at_two_classes():
+    """The C = 2 vacuity was never a special case; it was the same defect.
+
+    Under the removed centred form, two centred means are antipodal by
+    construction, so the term was identically zero for EVERY embedding. The raw
+    form must be strictly positive unless the two classes really are antipodal.
+    """
+    fn = CentroidSeparationLoss(n_classes=2)
+    E = 8
+    # genuinely COLLAPSED: two class means almost coincident
+    d = torch.zeros(E); d[0] = 1.0
+    tilt = torch.zeros(E); tilt[1] = 1.0
+    g = torch.Generator().manual_seed(0)
+    def two(eps):
+        Z, y = [], []
+        for c, sgn in enumerate((+1.0, -1.0)):
+            v = d + sgn * eps * tilt
+            v = v / v.norm()
+            z = v.unsqueeze(0) + 0.001 * torch.randn(9, E, generator=g)
+            Z.append(z / z.norm(dim=1, keepdim=True)); y += [c] * 9
+        return torch.cat(Z), torch.tensor(y)
+    collapsed = float(fn(*two(0.02)).detach())     # cosine ~ +1
+    apart = float(fn(*two(50.0)).detach())         # nearly antipodal
+    assert collapsed > 1.0, \
+        ("raw form at C = 2 scored %.3e on COLLAPSED classes -- that is the "
+         "old centred vacuity" % collapsed)
+    assert collapsed > apart, \
+        "raw form at C = 2 not monotone: collapsed %.4f vs apart %.4f" \
+        % (collapsed, apart)
+    return "raw form at C = 2 is informative (collapsed %.3f -> apart %.3f)" \
+        % (collapsed, apart)
+
+
+def check_centring_is_gone_everywhere():
+    """The centred code path must not exist, at any C, behind any flag."""
+    for C in (2, 3, 5):
+        fn = CentroidSeparationLoss(n_classes=C)
+        assert not hasattr(fn, "centre_means"), \
+            "C = %d still carries a centre_means attribute" % C
+        assert int(fn.last_centred) == 0, \
+            "sep_centred must be 0 (retained for archived readers), got %d" \
+            % int(fn.last_centred)
+    try:
+        CentroidSeparationLoss(n_classes=3, centre_means=True)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(
+            "CentroidSeparationLoss still accepts centre_means -- a silently "
+            "inert argument is worse than a loud one")
+    return "no centre_means path at C = 2, 3 or 5; sep_centred pinned to 0"
 
 
 def check_two_class_uses_raw_means_by_default():
     """C = 2 must select the raw-mean formulation automatically, and that
     formulation must actually respond to the data."""
     fn = CentroidSeparationLoss(n_classes=2)
-    assert fn.centre_means is False, "C = 2 did not select the raw form"
+    assert not hasattr(fn, "centre_means"), "C = 2 still has a formulation flag"
     assert int(fn.last_centred) == 0, "last_centred not reported as raw"
-    assert CentroidSeparationLoss(n_classes=3).centre_means is True, \
-        "C = 3 did not select the centred form"
+    assert not hasattr(CentroidSeparationLoss(n_classes=3), "centre_means"), \
+        "C = 3 still has a formulation flag"
 
     g = torch.Generator().manual_seed(12)
     vals = []
@@ -591,25 +670,34 @@ def check_two_class_gradient_separates():
 
 
 def check_three_class_path_unchanged():
-    """Regression guard: adding the C = 2 branch must not touch C >= 3."""
+    """C >= 3 now uses the RAW form, and must still be zero on a true ETF.
+
+    Zero-on-ETF is the one property that had to survive the removal of the
+    centring: the target -1/(K-1) is unchanged, only the vectors it is applied
+    to changed. Translation invariance did NOT survive, and must not.
+    """
     z_etf, y_etf = etf_batch()
     assert float(CentroidSeparationLoss(n_classes=3)(z_etf, y_etf)) < 1e-9, \
         "C = 3 ETF no longer gives zero"
-    z, y = make_batch(spread=0.6)
     fn = CentroidSeparationLoss(n_classes=3)
-    assert fn.centre_means is True and int(fn.last_centred) == 1 or True
+    assert int(fn.last_centred) == 0, "sep_centred must be pinned to 0"
+    z, y = make_batch(spread=0.6)
     base = float(fn(z, y).detach())
     shifted = float(fn(z + 3.7, y).detach())
-    assert abs(base - shifted) < 1e-5, \
-        "C = 3 lost translation invariance: %.8f -> %.8f" % (base, shifted)
-    return "C >= 3 unchanged: ETF zero, translation invariant (%.6f)" % base
+    assert abs(base - shifted) > 1e-5, \
+        ("C = 3 is translation invariant (%.8f vs %.8f) -- that is the "
+         "scale/shape-only behaviour the centring was removed to eliminate"
+         % (base, shifted))
+    return "C >= 3 raw form: ETF still zero, responds to a shift (%.4f -> %.4f)" \
+        % (base, shifted)
 
 
 def check_raw_form_is_not_translation_invariant():
-    """RECORDED DIFFERENCE, not a defect. The centred form is invariant to a
-    rigid shift of the batch; the raw form used at C = 2 is not. Rows are
-    L2-normalised onto the sphere upstream, so translation is not a symmetry
-    of the representation anyway, but the two forms are not interchangeable."""
+    """The raw form responds to a rigid shift, at every C.
+
+    Rows are L2-normalised onto the sphere upstream, so translation is not a
+    symmetry of the representation anyway. Invariance here would mean the term
+    had gone back to measuring shape only."""
     z, y = make_batch(n_classes=2, per_class=9, spread=0.6)
     fn = CentroidSeparationLoss(n_classes=2)
     base = float(fn(z, y).detach())
@@ -622,19 +710,22 @@ def check_raw_form_is_not_translation_invariant():
 
 
 def check_three_class_batch_missing_one_class_stays_inert():
-    """A C = 3 run that transiently loses a class keeps the CENTRED form and
-    contributes zero for that batch. It must NOT switch to the raw form on a
-    data-dependent condition."""
+    """A C = 3 run that transiently loses a class degrades to K = 2 rather
+    than to nonsense, and must not switch formulation on a data-dependent
+    condition (there is only one formulation now)."""
     z, y = make_batch(n_classes=3, per_class=9, spread=0.6)
     keep = y != 2
     fn = CentroidSeparationLoss(n_classes=3)
     val = float(fn(z[keep], y[keep]).detach())
-    assert fn.centre_means is True, "C = 3 switched formulation on a batch"
+    assert not hasattr(fn, "centre_means"), "a formulation flag reappeared"
     assert int(fn.last_n_classes) == 2, \
         "expected K = 2, got %d" % int(fn.last_n_classes)
-    assert val < 1e-9, \
-        "C = 3 with a missing class should contribute 0, got %.3e" % val
-    return "C = 3 minus one class: K = 2, stays centred, contributes 0"
+    # Under the removed centred form this contributed exactly 0, because two
+    # centred means are antipodal by construction -- the vacuity leaking in.
+    # The raw form gives a real value, which is the point.
+    assert math.isfinite(val) and val > 0.0, \
+        "C = 3 minus a class should now contribute a real value, got %.3e" % val
+    return "C = 3 minus one class: K = 2, raw form, contributes %.4f" % val
 
 
 def check_strict_filter_actually_bites():
@@ -697,10 +788,12 @@ CHECKS = [
     ("[D] L_sep = 0 on simplex ETF", check_sep_zero_on_etf),
     ("[D] L_sep > 0 on collinear centres", check_sep_positive_on_collinear),
     ("[D] L_sep ignores surrogates", check_sep_ignores_surrogates),
-    ("[D] L_sep translation invariant", check_sep_translation_invariant),
+    ("[D] L_sep sees collapse (not scale-blind)", check_sep_is_not_scale_blind),
+    ("[D] L_sep responds to shrinking", check_sep_responds_to_scale),
     ("[D] L_sep gradient finite", check_sep_gradient_is_finite),
-    ("[D] centred form vacuous at C = 2",
-     check_centred_form_is_vacuous_at_two_classes),
+    ("[D] raw form informative at C = 2",
+     check_raw_form_is_not_vacuous_at_two_classes),
+    ("[D] centring removed everywhere", check_centring_is_gone_everywhere),
     ("[D] C = 2 auto-selects raw means",
      check_two_class_uses_raw_means_by_default),
     ("[D] C = 2 zero iff antipodal", check_two_class_zero_iff_antipodal),

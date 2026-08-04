@@ -685,25 +685,13 @@ class TrainConfig:
     # batches that must be seen before the gate may latch. Guards against
     # latching on one lucky early batch at 9 rows per class.
     sep_gate_min_batches: int = 20
-    # which class directions L_sep is built from (loss_type = "joint_sep" only).
-    #   None  -- AUTOMATIC, and the pre-existing behaviour: CENTRED means
-    #            (mu_c - mu_G) at C >= 3, RAW means (mu_c) at C = 2. Every
-    #            archived config leaves this None and is therefore unchanged.
-    #   True  -- force the CENTRED form. Faithful to the NC2 definition of
-    #            Papyan, Han and Donoho, which is a statement about mu_c - mu_G.
-    #            NEAR-VACUOUS at C = 3: centring forces sum_c (mu_c - mu_G) = 0,
-    #            and three unit vectors summing to zero have pairwise cosines
-    #            of exactly -1/2 whenever their norms are equal -- for ANY
-    #            arrangement at ANY scale, a collapsed one included. What the
-    #            term then penalises is norm imbalance, not separation.
-    #   False -- force the RAW form. At C = 3 this is a genuine separation
-    #            requirement (three unit class means 120 degrees apart) and is
-    #            geometrically reachable, since the head L2-normalises without
-    #            confining the embedding to the positive orthant. It is NOT a
-    #            "corrected" NC2 term but a DIFFERENT, stronger one: it also
-    #            imposes mu_G -> 0. Any write-up must say which form ran.
-    # Searched as a binary axis under the joint condition search (decision D6);
-    # sep_centred in the per-epoch history records which form actually ran.
+    # DEPRECATED AND INERT. L_sep is now always built from the RAW normalised
+    # class means. The centred form (mu_c - mu_G) was removed because centring
+    # then normalising is invariant to translation AND scale, so it measures
+    # only the SHAPE of the simplex of class means and never its SIZE: three
+    # classes collapsed to a cap with raw pairwise cosine +0.9994 score
+    # L_sep = 0.000035 centred against 2.248 raw. The field is kept only so
+    # archived configs still parse; setting it to anything but None warns.
     sep_centre_means: Optional[bool] = None
     # tau: the WARM-UP fraction that replaces the latching gate. The weight on
     # the separation term ramps linearly from 0 to lambda_sep over the first
@@ -797,12 +785,13 @@ class TrainConfig:
                 "in [0, 1]: 0 means full lambda_sep from the first step, 1 "
                 "means the ramp finishes exactly at the last planned step; "
                 "got %r" % (self.sep_warmup_frac,))
-        if (self.sep_centre_means is not None
-                and not isinstance(self.sep_centre_means, bool)):
-            raise ValueError(
-                "sep_centre_means must be True, False or None (None = the "
-                "automatic rule: centred at C >= 3, raw at C = 2); got %r"
-                % (self.sep_centre_means,))
+        if self.sep_centre_means is not None:
+            warnings.warn(
+                "sep_centre_means=%r is INERT and ignored: L_sep is now always "
+                "built from the RAW normalised class means. The centred form "
+                "was removed because it is scale-invariant and therefore blind "
+                "to collapse. Remove this field from the config."
+                % (self.sep_centre_means,), RuntimeWarning)
         if (self.loss_type in ("joint", "joint_sep")
                 and self.strict_semihard
                 and self.mining_strategy == "hard"):
@@ -996,9 +985,8 @@ class SearchConfig:
     head_fusion_choices: Tuple[int, ...] = (0, 1)
     # 0 -> head_pool_ops = ("mean",);  1 -> ("mean", "max", "std")
     head_pool_ops_choices: Tuple[int, ...] = (0, 1)
-    # 0 -> sep_centre_means = False (raw class means)
-    # 1 -> sep_centre_means = True  (centred class means)
-    # Active only under loss_type = "joint_sep"; see TrainConfig.
+    # DEPRECATED AND INERT: sep_centre_means is no longer a searched axis, so
+    # this list is read by nothing. Kept only so archived configs still parse.
     sep_centre_means_choices: Tuple[int, ...] = (0, 1)
 
     # [C2] Adaptive lexicographic tie-break. The search objective becomes

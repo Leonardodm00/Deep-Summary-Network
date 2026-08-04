@@ -122,8 +122,10 @@ def _draw(dims, n, seed):
 # --------------------------------------------------------------------------- #
 def test_1a_train_round_trip():
     for centre, tau in ((None, 0.0), (True, 0.3), (False, 1.0)):
-        t = TrainConfig(loss_type="joint_sep", sep_centre_means=centre,
-                        sep_warmup_frac=tau)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # inert-field warning
+            t = TrainConfig(loss_type="joint_sep", sep_centre_means=centre,
+                            sep_warmup_frac=tau)
         cfg = ExperimentConfig()
         cfg.train = t
         back = ExperimentConfig.from_dict(json.loads(json.dumps(cfg.to_dict())))
@@ -220,12 +222,18 @@ def test_1d_validation():
         except ValueError:
             continue
         raise AssertionError("TrainConfig accepted sep_warmup_frac=%r" % (tau,))
-    try:
-        TrainConfig(sep_centre_means="yes")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("TrainConfig accepted a non-bool sep_centre_means")
+    # sep_centre_means is now DEPRECATED AND INERT: setting it to anything but
+    # None must WARN (not raise), because the centred form was removed.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        TrainConfig(sep_centre_means=True)
+    _expect(any("INERT" in str(w.message) for w in rec),
+            "sep_centre_means was accepted SILENTLY; the centred form is gone "
+            "and a config still setting it must say so")
+    with warnings.catch_warnings(record=True) as rec0:
+        warnings.simplefilter("always")
+        TrainConfig()
+    _expect(not rec0, "leaving sep_centre_means at None must be silent")
     print("  [1-D] validation rejects empty / unknown / duplicate / out-of-range OK")
 
 
@@ -349,10 +357,8 @@ def test_3c_inactive_never_reaches_config():
     base_margin = cfg.train.margin
     base_alpha = cfg.train.angular_alpha_deg
     base_lambda = cfg.train.lambda_sep
-    base_centre = cfg.train.sep_centre_means
     # a point carrying EVERY loss HP at values far from the base config's
-    p = {"margin": 0.77, "angular_alpha_deg": 3.5, "lambda_sep": 7.25,
-         "sep_centre_means": 1}
+    p = {"margin": 0.77, "angular_alpha_deg": 3.5, "lambda_sep": 7.25}
     for l in CS.LOSS_TYPES:
         c = ExperimentConfig()
         c.train.loss_type = l
@@ -363,13 +369,12 @@ def test_3c_inactive_never_reaches_config():
         got = {"margin": c.train.margin,
                "angular_alpha_deg": c.train.angular_alpha_deg,
                "lambda_sep": c.train.lambda_sep,
-               "sep_centre_means": c.train.sep_centre_means}
+               }
         base = {"margin": base_margin, "angular_alpha_deg": base_alpha,
-                "lambda_sep": base_lambda, "sep_centre_means": base_centre}
+                "lambda_sep": base_lambda}
         for name in CS.LOSS_HP_SUPERSET:
             if name in active:
-                want = (bool(p[name]) if name == "sep_centre_means"
-                        else float(p[name]))
+                want = float(p[name])
                 _expect(got[name] == want,
                         "%s is ACTIVE under %s but was not written (%r != %r)"
                         % (name, l, got[name], want))
@@ -398,9 +403,7 @@ def test_3d_byte_identical_configs():
         b = list(a)
         for n in inactive:
             j = names.index(n)
-            if n == "sep_centre_means":
-                b[j] = 1 - int(a[j])
-            elif n == "margin":
+            if n == "margin":
                 b[j] = 0.95 if float(a[j]) < 0.9 else 0.15
             elif n == "angular_alpha_deg":
                 b[j] = 19.0 if float(a[j]) < 18.0 else 3.0
@@ -431,17 +434,17 @@ def test_4a_axis_and_column_count():
     cfg = ExperimentConfig()
     space = S.joint_condition_space(cfg.search, cfg.regularization, cfg.train)
     names = S.joint_condition_names()
-    _expect(len(space) == 18, "expected 18 axes, got %d" % len(space))
+    _expect(len(space) == 17, "expected 17 axes, got %d" % len(space))
     _expect(tuple(d.name for d in space) == tuple(names),
             "space axis order != joint_condition_names()")
     # surrogate columns: skopt one-hots Categorical, everything else is 1 column
     cols = sum(len(d.categories) if hasattr(d, "categories") else 1
                for d in space)
-    _expect(cols == 22,
+    _expect(cols == 21,
             "expected 22 surrogate columns, got %d. Column arithmetic: 11 "
             "numeric + 5 Integer binaries + 2 three-level Categorical (6) = 22."
             % cols)
-    print("  [4-A] 18 declared axes, 22 surrogate columns, names in order OK")
+    print("  [4-A] 17 declared axes, 22 surrogate columns, names in order OK")
 
 
 def test_4b_round_trip():
@@ -478,12 +481,8 @@ def test_4b_round_trip():
                 "beta2 = 1 - u round-trip")
         # and the ACTIVE loss HPs specifically
         for n in CS.active_loss_hps(str(p["loss_type"])):
-            if n == "sep_centre_means":
-                _expect(cfg.train.sep_centre_means == bool(int(p[n])),
-                        "sep_centre_means round-trip")
-            else:
-                _expect(abs(getattr(cfg.train, n) - float(p[n])) < 1e-12,
-                        "%s round-trip" % n)
+            _expect(abs(getattr(cfg.train, n) - float(p[n])) < 1e-12,
+                    "%s round-trip" % n)
     print("  [4-B] point -> config -> point round-trips on 40 samples OK")
 
 
@@ -506,7 +505,7 @@ def test_4c_binaries_are_usable_integers():
     space = S.joint_condition_space(cfg.search, cfg.regularization, cfg.train)
     names = S.joint_condition_names()
     binaries = ("block_family", "strict_semihard", "head_fusion",
-                "head_pool_ops", "sep_centre_means")
+                "head_pool_ops")
     for pt in _draw(space, 60, 3):
         for name in binaries:
             k = names.index(name)

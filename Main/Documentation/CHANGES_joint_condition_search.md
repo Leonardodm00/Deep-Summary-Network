@@ -3,7 +3,7 @@
 **Branch:** `feat/composite-dsn-loss`
 **Date:** 3 August 2026
 **Design document:** `HANDOFF_joint_gp_search.md` (stages 1-8)
-**Status:** stages 1-7 implemented and tested; **stage 7's gate has not been
+**Status:** stages 1-7 implemented and tested, plus **Revision 2** (below); **stage 7's gate has not been
 run on the cluster**, and stage 8 (launch) is downstream of it.
 
 ## Abstract
@@ -222,6 +222,51 @@ overrun against walltime minus margin, and on a badly-fitting cost model
 models, where fixed overhead swamps the parameter term and `polyfit` still
 returns a confident-looking hour count. An unreliable estimate used as a
 submission gate is worse than none, because it carries authority.
+
+## 4a. Revision 2 — the centred separation term is removed
+
+**What changed.** `sep_centre_means` is no longer a searched axis, and the
+centred formulation of $\mathcal{L}_{\mathrm{sep}}$ has been deleted from the
+code. The class means are now always RAW: $\hat\mu_c = \mu_c/\lVert\mu_c\rVert_2$
+at every $C$. The space drops from 18 axes / 22 columns to **17 axes / 21
+columns**, and $A(\texttt{joint\_sep})$ becomes
+$\{\alpha, \lambda_{\mathrm{sep}}\}$.
+
+**Why.** Two facts, the second of which is decisive.
+
+1. Equiangularity at the ETF target already implies the class directions sum to
+   zero. For unit vectors with all pairwise inner products $\rho$,
+   $\lVert\sum_c v_c\rVert^2 = K + K(K-1)\rho$, which is exactly $0$ at
+   $\rho = -1/(K-1)$. The raw form therefore imposes **no extra constraint**;
+   Revision 1's claim that it smuggles in $\mu_G \to 0$ was wrong.
+2. Centring then normalising is invariant to translation **and scale**, so the
+   term measured only the *shape* of the simplex of class means and never its
+   *size*. MEASURED on this implementation: three classes collapsed into a cap
+   at raw pairwise cosine $+0.9994$ score $\mathcal{L}_{\mathrm{sep}} =
+   0.000035$ centred against $2.248$ raw. The centred form is structurally
+   blind to collapse — the one failure the term exists to prevent.
+
+This also unifies the $C = 2$ case, previously handled by a special-case
+fallback: at $K = 2$ every configuration is degenerately "equilateral", so the
+centred form was identically zero everywhere. The $K \ge 3$ behaviour is the
+same defect, partial rather than total, and therefore silent instead of obvious.
+
+**Compatibility.** `train.sep_centre_means` and
+`search.sep_centre_means_choices` remain in the schema so archived configs
+parse; both are inert and warn if set. `CentroidSeparationLoss` takes no
+formulation argument and raises `TypeError` if given one. `sep_centred` stays in
+the per-epoch history, pinned to $0$, so archived readers do not break.
+
+**Consequences to weigh.** The raw form is a substantially *stronger*
+constraint, so the searched range of $\lambda_{\mathrm{sep}}$ — chosen against
+the weaker term — may want revisiting. And **every archived `joint_sep` result
+is about the shape-only penalty**, including all 20 `joint_sep` cells of the
+screening factorial; they do not transfer.
+
+**Tests.** `smoke_test_dsn_joint_loss.py` now carries a permanent regression
+guard (`L_sep sees collapse`, `L_sep responds to shrinking`) that would have
+caught this defect originally, plus `centring removed everywhere`. All 11 suites
+pass: 32/32, 14/14, 21/21 and the rest.
 
 ## 5. Where this departs from the design document
 

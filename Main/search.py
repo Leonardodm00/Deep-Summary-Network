@@ -209,7 +209,9 @@ _OPT_NAMES = ("lr", "one_minus_beta1", "one_minus_beta2", "weight_decay")
 # staged run: phase 2 searched (angular_alpha_deg, lambda_sep) under
 # "joint_sep", and sep_centre_means postdates that pipeline entirely (before
 # this design it was not even reachable from a config file).
-_STAGED_EXCLUDED_LOSS_HPS = ("sep_centre_means",)
+# nothing is excluded any more: A(l) and the staged phase-2 list now coincide,
+# because sep_centre_means (the only axis the staged pipeline predated) is gone.
+_STAGED_EXCLUDED_LOSS_HPS = ()
 
 
 def loss_hp_names(train_cfg=None, superset=False):
@@ -296,9 +298,6 @@ def _loss_dims(search_cfg, train_cfg, superset=False):
             lo, hi = search_cfg.lambda_sep_range
             dims.append(Real(float(lo), float(hi), prior="log-uniform",
                              name="lambda_sep"))
-        elif name == "sep_centre_means":
-            dims.append(_binary_dim("sep_centre_means",
-                                    search_cfg.sep_centre_means_choices))
         else:
             raise ValueError("unhandled loss HP %r" % (name,))
     return dims
@@ -337,8 +336,6 @@ def _write_loss_hps(cfg, p, loss_type=None):
         cfg.train.angular_alpha_deg = float(p["angular_alpha_deg"])
     if "lambda_sep" in active and "lambda_sep" in p:
         cfg.train.lambda_sep = float(p["lambda_sep"])
-    if "sep_centre_means" in active and "sep_centre_means" in p:
-        cfg.train.sep_centre_means = bool(int(p["sep_centre_means"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -1108,17 +1105,16 @@ def search_joint(cfg, splits, device, verbose=False, train_verbose=False):
 #   10-12 loss HPs          margin, angular_alpha_deg, lambda_sep
 #   13-15 objective factors mining_strategy, loss_type, strict_semihard
 #   16-17 head geometry     head_fusion, head_pool_ops
-#   18    loss HP           sep_centre_means
 #
-# sep_centre_means sits LAST rather than with the other loss HPs because that is
-# where the design document's table puts it; it is nonetheless a member of A(l)
-# and is written by _write_loss_hps like the rest.
+# sep_centre_means was axis 18 and has been REMOVED: the centred form of L_sep
+# is scale-invariant and so cannot see collapse, leaving nothing to select.
+#
 _JOINT_CONDITION_NAMES = (
     "depth_exponent", "width_multiplier", "block_family", "embedding_size",
     "lr", "one_minus_beta1", "one_minus_beta2", "weight_decay", "dropout",
     "margin", "angular_alpha_deg", "lambda_sep",
     "mining_strategy", "loss_type", "strict_semihard",
-    "head_fusion", "head_pool_ops", "sep_centre_means",
+    "head_fusion", "head_pool_ops",
 )
 
 
@@ -1151,10 +1147,10 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
     because skopt one-hots every Categorical:
 
         11 numeric  (1, 2, 4-12 minus block_family)   -> 11 columns
-         5 binaries as Integer(0, 1)                  ->  5 columns
+         4 binaries as Integer(0, 1)                  ->  4 columns
          2 three-level Categorical (13, 14)           ->  6 columns
                                                         ---------
-                                                          22 columns
+                                                          21 columns
 
     Encoding the five binaries as Integer rather than Categorical is what saves
     5 columns: a two-level one-hot is exactly redundant (x2 = 1 - x1). This
@@ -1164,7 +1160,7 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
     TypeError. Integer yields genuine Python ints. The smoke test ASSERTS the
     int-ness rather than trusting this paragraph.
 
-    Up to 3 of the 22 columns are INACTIVE for any given trial (the loss HPs
+    Up to 2 of the 21 columns are INACTIVE for any given trial (the loss HPs
     outside A(l)). _write_loss_hps clamps them so they never reach the config,
     which turns them into genuinely flat directions for the surrogate rather
     than noise-injecting ones; ARD length-scales absorb flat directions. What
@@ -1204,7 +1200,6 @@ def joint_condition_space(search_cfg, reg_cfg, train_cfg=None):
         _binary_dim("strict_semihard", search_cfg.strict_semihard_choices),
         _binary_dim("head_fusion", search_cfg.head_fusion_choices),
         _binary_dim("head_pool_ops", search_cfg.head_pool_ops_choices),
-        by_name["sep_centre_means"],
     ]
     built = tuple(d.name for d in dims)
     if built != _JOINT_CONDITION_NAMES:

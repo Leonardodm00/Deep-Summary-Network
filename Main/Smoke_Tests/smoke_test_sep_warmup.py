@@ -25,8 +25,9 @@ AND THE CHECKS THAT GUARD THE WIRING AROUND THEM
         a class for the archived analysis tooling
   [5-I] the ramp is auditable: sep_lambda_t and sep_warmup_scale reach .stats()
   [5-J] state_dict round-trip resumes the ramp where it stopped
-  [5-K] end to end through build_loss_and_miner: tau and sep_centre_means both
-        arrive from the config, and an inert gate threshold warns
+  [5-K] end to end through build_loss_and_miner: tau and T arrive from the
+        config; the removed centring is unreachable and an inert
+        sep_centre_means or gate threshold warns
   [5-L] the gradient actually scales with the ramp (the term is not merely
         multiplied by a number that never reaches the graph)
 
@@ -280,7 +281,7 @@ def test_5j_state_dict_resumes():
 def test_5k_end_to_end_from_config():
     t = TrainConfig(loss_type="joint_sep", mining_strategy="easy_pos_semihard_neg",
                     strict_semihard=True, lambda_sep=4.0, sep_warmup_frac=0.3,
-                    sep_centre_means=False, max_epochs=60,
+                     max_epochs=60,
                     batches_per_epoch=100)
     T = int(t.max_epochs) * int(t.batches_per_epoch)
     with warnings.catch_warnings():
@@ -295,20 +296,20 @@ def test_5k_end_to_end_from_config():
             "total_steps did not reach the loss: %r" % loss_fn.warmup.total_steps)
     _expect(abs(loss_fn.warmup.warmup_steps - 0.3 * T) < 1e-9,
             "the ramp length is wrong: %r" % loss_fn.warmup.warmup_steps)
-    _expect(loss_fn.sep.centre_means is False,
-            "sep_centre_means=False did not reach CentroidSeparationLoss "
-            "(got %r) -- the two forms are DIFFERENT objectives"
-            % loss_fn.sep.centre_means)
-    # None must still select the automatic rule
+    _expect(not hasattr(loss_fn.sep, "centre_means"),
+            "CentroidSeparationLoss still carries a centre_means attribute; "
+            "the centred formulation was removed outright")
+    _expect(int(loss_fn.sep.last_centred) == 0,
+            "sep_centred must be pinned to 0 for archived history readers")
+    # a config still setting sep_centre_means must WARN, not be honoured
     t2 = TrainConfig(loss_type="joint_sep",
                      mining_strategy="easy_pos_semihard_neg",
-                     sep_centre_means=None)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        l2, _m = build_loss_and_miner(t2, n_classes=3, total_steps=100)
-    _expect(l2.sep.centre_means is True,
-            "sep_centre_means=None must keep the automatic rule (centred at "
-            "C >= 3); got %r" % l2.sep.centre_means)
+                     sep_centre_means=True)
+    with warnings.catch_warnings(record=True) as rec2:
+        warnings.simplefilter("always")
+        build_loss_and_miner(t2, n_classes=3, total_steps=100)
+    _expect(any("INERT" in str(w.message) for w in rec2),
+            "sep_centre_means=True was honoured, or ignored silently")
     # an inert gate threshold must WARN, not pass silently
     t3 = TrainConfig(loss_type="joint_sep",
                      mining_strategy="easy_pos_semihard_neg",
@@ -319,8 +320,8 @@ def test_5k_end_to_end_from_config():
     _expect(any("INERT" in str(w.message) for w in rec),
             "a config carrying sep_gate_threshold built silently; the 20 "
             "archived joint_sep cells all set it, so this must be loud")
-    print("  [5-K] tau, T and sep_centre_means arrive from the config; an "
-          "inert gate threshold warns OK")
+    print("  [5-K] tau and T arrive from the config; centring is unreachable; "
+          "inert sep_centre_means and gate threshold both warn OK")
 
 
 def test_5l_gradient_scales_with_ramp():

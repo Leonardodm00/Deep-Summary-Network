@@ -58,7 +58,12 @@ them the configured loss actually reads:
 
     A(triplet)   = {margin}
     A(joint)     = {angular_alpha_deg}
-    A(joint_sep) = {angular_alpha_deg, lambda_sep, sep_centre_means}
+    A(joint_sep) = {angular_alpha_deg, lambda_sep}
+
+    sep_centre_means was removed as an axis: the centred formulation of L_sep
+    is invariant to scale and therefore blind to collapse (MEASURED: 0.000035
+    against 2.248 raw on a collapsed batch), so the raw form is now the only
+    one and there is nothing left to select.
 
 margin and angular_alpha_deg are never BOTH active, which is the point: both
 bind on the within/between distance ratio, so a config that searched the pair
@@ -98,13 +103,12 @@ HEAD_POOL_OPS_LEVELS = (("mean",), ("mean", "max", "std"))
 
 # every loss hyper-parameter that ANY loss type reads, in one fixed order. The
 # search space carries all of them in every point; A(l) selects.
-LOSS_HP_SUPERSET = ("margin", "angular_alpha_deg", "lambda_sep",
-                    "sep_centre_means")
+LOSS_HP_SUPERSET = ("margin", "angular_alpha_deg", "lambda_sep")
 
 _ACTIVE = {
     "triplet": ("margin",),
     "joint": ("angular_alpha_deg",),
-    "joint_sep": ("angular_alpha_deg", "lambda_sep", "sep_centre_means"),
+    "joint_sep": ("angular_alpha_deg", "lambda_sep"),
 }
 
 _MINING_TAG = {"hard": "h", "easy_positive": "ep",

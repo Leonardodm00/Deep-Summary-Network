@@ -11,7 +11,7 @@ where
     L_joint    = ( 1 / |T_active| ) * sum_{(a,p,n) in T_strict} (l_trip + l_ang)
     L_sep      = per-batch Gram penalty driving the class means to a simplex
                  equiangular tight frame (ETF). Which class directions it is
-                 built from is selected by centre_means -- see
+                 built from the RAW normalised class means; see
                  CentroidSeparationLoss.
     lambda_sep(t) = lambda_sep * min(1, t / (tau * T)), a DETERMINISTIC linear
                  warm-up over the first tau * T optimiser steps, with
@@ -52,36 +52,44 @@ reached after exactly tau * T batches. The alternative convention (t = 1 on the
 first batch) would start the run with a small but nonzero separation weight,
 which is precisely what a warm-up exists to avoid.
 
-The two-class case
-------------------
-At C = 2 the CENTRED class means are always exactly antipodal, because
-mu_dot_1 = -mu_dot_2 is forced by the centring itself. Their cosine is then
-identically -1, which is also the ETF target -1/(C-1) = -1, so the centred
-form of L_sep is IDENTICALLY ZERO for every embedding, good or bad. It is not
-wrong, it is vacuous: with only two points there is no arrangement to
-constrain, only a separation.
+The class means are never centred
+---------------------------------
+L_sep is built from the RAW normalised class means mu_hat_c = mu_c/||mu_c||_2
+at every C. An earlier version centred them (mu_c - mu_G) at C >= 3, following
+the NC2 literature, and used the raw form only at C = 2 as a special case. Both
+the centring and the special case are gone, for one reason:
 
-The fix is to drop the centring, not to change the target. Two antipodal unit
-vectors ARE the simplex ETF for K = 2, so -1/(K-1) = -1 remains the correct
-target; applied to the RAW normalised class means it is the ordinary statement
-"push the two class means to opposite poles", i.e. maximise the cosine
-distance between them. The functional form is unchanged:
+    centring then normalising is invariant to translation AND scale, so the
+    penalty measures only the SHAPE of the simplex of class means, never its
+    SIZE.
+
+Any equilateral arrangement satisfies it, including an arbitrarily tiny one.
+MEASURED here: three classes collapsed into a cap whose raw pairwise cosine is
++0.9994 -- essentially on top of one another -- score L_sep = 0.000035 centred
+and 2.248 raw. The centred form cannot see collapse, which is the single
+failure mode this term exists to prevent.
+
+The raw form does not impose an extra constraint. For UNIT vectors {v_c} with
+all pairwise inner products rho, || sum_c v_c ||^2 = K + K(K-1) rho, which is
+exactly 0 at rho = -1/(K-1). Equiangularity at the ETF target therefore ALREADY
+implies sum_c v_hat_c = 0; the two are one condition. On a sphere centred at
+the origin, where L2-normalised embeddings live, "the class directions balance
+about the origin" IS maximal spread, not a statement about the cloud's absolute
+position. mu_G is a nuisance parameter only where features carry an arbitrary
+offset -- the NC2 setting, not this one.
+
+The C = 2 vacuity is then not a special case needing a carve-out but the same
+defect at its extreme: with two points every configuration is degenerately
+"equilateral", so the centred form is identically zero everywhere. At K >= 3 the
+collapse is partial rather than total, which is worse, because it is silent.
 
     L_sep = mean over pairs c != c' of ( <mu_hat_c, mu_hat_c'> + 1/(K-1) )^2
 
-with mu_hat_c built from mu_c - mu_G at C >= 3 and from mu_c at C = 2.
+with mu_hat_c = mu_c / ||mu_c||_2 at every C, and -1/(K-1) still the correct
+ETF target. K is recomputed per batch, so a batch that transiently loses a
+class degrades to a smaller ETF rather than to nonsense; watch sep_n_classes.
 
-The switch is keyed on the CONFIGURED n_classes, which is fixed for a run, and
-NOT on the number of classes present in a given batch. A C = 3 run that
-transiently loses a class keeps the centred form and contributes zero for that
-batch, exactly as before; it does not silently switch objectives mid-training
-on a data-dependent condition. Watch sep_n_classes in the census for that case.
-
-One property is lost at C = 2 and is worth knowing: the centred form is
-invariant to a rigid translation of the whole batch, the raw form is not.
-Since the backbone L2-normalises every row onto the sphere, translation is not
-a symmetry of the representation anyway, but the two formulations are not
-interchangeable and the census records which one ran.
+sep_centred remains in the census, always 0, so archived readers do not break.
 
 The ramp is evaluated per batch, so the weight changes MID-EPOCH; history
 records lambda_sep(t) as it stood at the END of each epoch (sep_lambda_t).
@@ -334,7 +342,7 @@ class CentroidSeparationLoss(nn.Module):
 
         mu_c        = mean embedding of the rows of class c IN THIS BATCH
         mu_G        = mean of the mu_c over the classes present
-        mu_dot_c    = mu_c - mu_G      (C >= 3)   or   mu_c      (C = 2)
+        mu_hat_c    = mu_c / ||mu_c||_2      RAW directions, always
         mu_hat_c    = mu_dot_c / ||mu_dot_c||_2
 
         L_sep = mean over pairs c != c' of ( <mu_hat_c, mu_hat_c'> + 1/(K-1) )^2
@@ -344,16 +352,43 @@ class CentroidSeparationLoss(nn.Module):
     otherwise. The target -1/(K-1) is a geometric constant computed from K; it
     is never a hyperparameter.
 
-    Three things this gets right that are easy to get wrong:
+    WHY THE MEANS ARE **NOT** CENTRED
+    ---------------------------------
+    An earlier version subtracted mu_G before normalising, on the grounds that
+    NC2 is defined on globally centred class means. That was imported from a
+    setting this pipeline is not in, and it BROKE the term.
 
-      * At C >= 3 the means are CENTRED. Neural collapse NC2 is a statement
-        about mu_c - mu_G. Penalising the raw class means toward -1/(K-1)
-        would silently impose the extra, unstated constraint mu_G -> 0.
-      * At C = 2 the means are RAW. Centring two means makes them antipodal by
-        construction, so the centred form is identically zero for every
-        embedding. Dropping the centring turns the same expression into
-        "drive the cosine between the two class means to -1", i.e. maximise
-        the cosine distance between them. See the module header.
+    The defect: subtracting mu_G and then normalising makes the result
+    invariant to BOTH translation and scale, so the penalty measures only the
+    SHAPE of the simplex of class means and never its SIZE. Any equilateral
+    arrangement satisfies it, including an arbitrarily tiny one. MEASURED on
+    this implementation: three classes collapsed into a cap so tight that their
+    raw pairwise cosine is +0.9994 -- essentially on top of one another --
+    score L_sep = 0.000035 centred against 2.248 raw. Separation is precisely
+    what centring discards.
+
+    The raw form is NOT "ETF plus an extra constraint". For UNIT vectors {v_c}
+    with all pairwise inner products equal to rho,
+
+        || sum_c v_c ||^2  =  K + K(K-1) rho ,
+
+    which at the ETF target rho = -1/(K-1) is exactly zero. Equiangularity at
+    the target THEREFORE IMPLIES sum_c v_hat_c = 0: the two conditions are one
+    package, and the raw form smuggles nothing in. On a sphere centred at the
+    origin -- where L2-normalised embeddings live -- "the class directions
+    balance about the origin" IS the statement that they are maximally spread,
+    not a claim about where the cloud sits. mu_G is a nuisance parameter only
+    when features carry an arbitrary offset, which is the NC2 literature's
+    setting and not this one.
+
+    This UNIFIES the C = 2 case rather than carving it out. At K = 2 every
+    configuration is a degenerate equilateral one, so the centred form is
+    identically zero everywhere: the same defect at its extreme. At K >= 3 the
+    collapse is partial rather than total, which is worse, because it is silent
+    instead of obvious.
+
+    One thing this gets right that is easy to get wrong:
+
       * The means are SUPERVISED and per-batch. Class membership comes from the
         true condition labels only; destroyed surrogates are excluded by
         construction (see class_onehot). No running centroids are kept across
@@ -366,29 +401,24 @@ class CentroidSeparationLoss(nn.Module):
     Args:
         n_classes     : C, the configured number of true condition classes.
         min_per_class : rows a class needs in a batch to enter the statistic.
-        centre_means  : None (default) selects centring automatically, i.e.
-                        True at C >= 3 and False at C = 2. Pass True or False
-                        to force one formulation, which is useful only for
-                        testing that the two differ.
+
+    There is no centre_means argument. The centred formulation is not a
+    supported option and its code path has been removed; see above.
     """
 
-    def __init__(self, n_classes, min_per_class=2, centre_means=None):
+    def __init__(self, n_classes, min_per_class=2):
         super().__init__()
         n_classes = int(n_classes)
         if n_classes < 2:
             raise ValueError("n_classes must be >= 2; got %r" % (n_classes,))
         self.n_classes = n_classes
         self.min_per_class = int(min_per_class)
-        # keyed on the CONFIGURED class count, so the formulation is fixed for
-        # the whole run and never switches on a data-dependent condition
-        self.centre_means = (n_classes >= 3) if centre_means is None \
-            else bool(centre_means)
         self.register_buffer("last_mean_cos",
                              torch.tensor(float("nan"), dtype=torch.float32))
         self.register_buffer("last_n_classes", torch.zeros((), dtype=torch.long))
-        self.register_buffer(
-            "last_centred",
-            torch.tensor(1 if self.centre_means else 0, dtype=torch.long))
+        # retained and ALWAYS 0, so archived history readers keying on
+        # "sep_centred" keep working; the centred form no longer exists
+        self.register_buffer("last_centred", torch.zeros((), dtype=torch.long))
 
     def forward(self, emb, labels):
         z = emb.float()
@@ -399,14 +429,9 @@ class CentroidSeparationLoss(nn.Module):
         vf = valid.to(z.dtype).reshape(-1, 1)                   # (C, 1)
 
         mu = (oh.t() @ z) / counts.clamp_min(1.0).reshape(-1, 1)   # (C, E)
-        if self.centre_means:
-            mu_g = (mu * vf).sum(dim=0, keepdim=True) \
-                / n_valid.clamp_min(1).to(z.dtype)
-            mu_dot = (mu - mu_g) * vf
-        else:
-            # C = 2: centring would force the pair antipodal and make the term
-            # vacuous, so the RAW class means carry the separation
-            mu_dot = mu * vf
+        # RAW class means, at every C. Centring would make the term invariant
+        # to scale and so blind to collapse; see the class docstring.
+        mu_dot = mu * vf
         mu_hat = mu_dot / mu_dot.norm(dim=1, keepdim=True).clamp_min(_EPS)
         gram = mu_hat @ mu_hat.t()                              # (C, C)
 
@@ -674,16 +699,13 @@ class CompositeDSNLoss(nn.Module):
         total_steps     : T = max_epochs * batches_per_epoch, the planned budget.
         warmup_frac     : tau in [0, 1]. 0 (default) = full weight from step 0,
                           which reproduces the pre-existing ungated behaviour.
-        centre_means    : None (automatic: centred at C >= 3, raw at C = 2),
-                          or True/False to force one formulation. This is the
-                          searched sep_centre_means axis; the two are DIFFERENT
-                          objectives, not one corrected version of the other.
+        There is no centre_means argument: the class means are never centred.
     """
 
     def __init__(self, n_classes, margin, alpha_deg=18.0, lambda_sep=0.1,
                  total_steps=None, warmup_frac=0.0, use_angular=True,
                  strict_semihard=True, swap=True, reduce_nonzero=True,
-                 min_per_class=2, centre_means=None):
+                 min_per_class=2):
         super().__init__()
         lambda_sep = float(lambda_sep)
         if lambda_sep < 0.0:
@@ -694,8 +716,7 @@ class CompositeDSNLoss(nn.Module):
             strict_semihard=strict_semihard, swap=swap,
             reduce_nonzero=reduce_nonzero)
         self.sep = CentroidSeparationLoss(n_classes=n_classes,
-                                          min_per_class=min_per_class,
-                                          centre_means=centre_means)
+                                          min_per_class=min_per_class)
         self.warmup = SepWarmup(total_steps=total_steps,
                                 warmup_frac=warmup_frac)
 

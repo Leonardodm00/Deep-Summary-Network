@@ -279,6 +279,13 @@ def build_loss_and_miner(train_cfg, n_classes=None, total_steps=None):
                 raise ValueError(
                     "loss_type='joint_sep' needs n_classes to build the "
                     "centroid-separation target -1/(C-1)")
+            if getattr(train_cfg, "sep_centre_means", None) is not None:
+                warnings.warn(
+                    "sep_centre_means=%r is INERT: L_sep is always built from "
+                    "the RAW normalised class means now. The centred form was "
+                    "removed because it is invariant to scale and so cannot "
+                    "see collapse."
+                    % (train_cfg.sep_centre_means,), RuntimeWarning)
             if train_cfg.sep_gate_threshold is not None:
                 warnings.warn(
                     "sep_gate_threshold=%r is INERT: the latching silhouette "
@@ -299,9 +306,6 @@ def build_loss_and_miner(train_cfg, n_classes=None, total_steps=None):
                 strict_semihard=bool(train_cfg.strict_semihard),
                 swap=bool(train_cfg.swap),
                 reduce_nonzero=True,
-                # the searched sep_centre_means axis. None = the automatic rule
-                # (centred at C >= 3, raw at C = 2), i.e. prior behaviour.
-                centre_means=train_cfg.sep_centre_means,
             )
     else:
         raise ValueError(

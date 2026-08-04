@@ -121,7 +121,6 @@ def build(base, args):
     s["strict_semihard_choices"] = [0, 1]
     s["head_fusion_choices"] = [0, 1]
     s["head_pool_ops_choices"] = [0, 1]
-    s["sep_centre_means_choices"] = [0, 1]
     s["n_calls_joint"] = int(args.n_calls)
     s["n_initial_points_joint"] = int(args.n_initial_points)
     s["tie_break_gamma"] = 0.0
@@ -137,8 +136,7 @@ def build(base, args):
     t["sep_warmup_frac"] = float(args.warmup_frac)
     # the CLAMP CONSTANT for inactive trials -- must be the TrainConfig default
     t["lambda_sep"] = 0.1
-    # searched, so the written value is only the clamp for non-joint_sep trials
-    t["sep_centre_means"] = None
+    # NOT written: sep_centre_means is inert (the centred form was removed)
     t["selection_primary"] = "silhouette"
     t["min_delta_sil_mode"] = "floor_scale"
     t["min_delta_sil_kappa"] = 2.0

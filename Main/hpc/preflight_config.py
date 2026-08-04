@@ -189,20 +189,12 @@ def preflight(path, verbose=True):
         tau = float(getattr(t, "sep_warmup_frac", 0.0))
         T_planned = int(t.max_epochs) * int(t.batches_per_epoch) \
             if int(t.batches_per_epoch) >= 1 else 0
-        centre = getattr(t, "sep_centre_means", None)
-        lines.append("  lambda_sep = %.4g (asymptotic)  tau = %.4g  "
-                     "-> full weight at step %s of %s"
-                     % (t.lambda_sep, tau,
-                        ("%d" % int(tau * T_planned)) if (tau > 0 and T_planned)
-                        else "0 (constant weight)",
-                        ("%d" % T_planned) if T_planned
-                        else "T unknown (batches_per_epoch=0 -> derived)"))
-        lines.append("  sep_centre_means = %s  ->  %s class means"
-                     % (centre,
-                        "CENTRED (mu_c - mu_G); NEAR-VACUOUS at C = 3"
-                        if (centre is True or (centre is None and n_classes >= 3))
-                        else "RAW (mu_c); a genuine separation requirement, and "
-                             "a DIFFERENT objective from NC2"))
+        if getattr(t, "sep_centre_means", None) is not None:
+            lines.append("  WARNING: sep_centre_means = %r is INERT. L_sep is "
+                         "always built from the RAW normalised class means; "
+                         "the centred form was removed (scale-invariant, so "
+                         "blind to collapse)." % (t.sep_centre_means,))
+        lines.append("  L_sep uses the RAW normalised class means (never centred)")
         if t.sep_gate_threshold is not None:
             lines.append("  WARNING: sep_gate_threshold = %.4g is INERT. The "
                          "latching gate was removed; use sep_warmup_frac."
@@ -248,8 +240,6 @@ def preflight(path, verbose=True):
                      "(0 -> ['mean'], 1 -> ['mean','max','std'])"
                      % (list(sc.head_fusion_choices),
                         list(sc.head_pool_ops_choices)))
-        lines.append("    sep_centre_means in %s  (active only under "
-                     "loss_type='joint_sep')" % (list(sc.sep_centre_means_choices),))
         n_legal = CS.n_legal_conditions()
         lines.append("  legal conditions: %d of the 3 x 3 x 2 = 18 raw triples "
                      "(x 4 head geometries = %d historical cells)"
