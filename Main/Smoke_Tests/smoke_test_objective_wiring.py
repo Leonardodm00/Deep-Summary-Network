@@ -245,24 +245,39 @@ def check_budget():
           "{1,2,3,4,15,20,50,100,753} -- so every pre-C3 config is unaffected OK")
     assert resolve_n_initial_points(50, 10) == 10
     assert resolve_n_initial_points(50, 25) == 25
-    assert resolve_n_initial_points(50, 50) == 50
-    print("  [I] an explicit value is honoured, including n_init == n_calls OK")
+    assert resolve_n_initial_points(50, 49) == 49
+    print("  [I] an explicit value below n_calls is honoured OK")
 
-    for bad in ((50, 51), (1, 2)):
+    # CONTRACT CHANGE. This assertion used to read
+    #     assert resolve_n_initial_points(50, 50) == 50
+    # i.e. n_init == n_calls was accepted. It is now REJECTED, because equality
+    # is not a harmless boundary: it is precisely the configuration produced by
+    # splitting a study of n_calls trials into lanes or segments of
+    # n_initial_points each. Every trial is then part of the random initial
+    # design, the surrogate is never fitted, and the result is a study that
+    # looks like Bayesian optimisation and is uniform random search -- with no
+    # error and no warning. The guard is therefore >=, not >.
+    #
+    # n_calls == 1 is exempt: a one-trial study is one random draw whichever
+    # way the guard is written, so rejecting it would be pedantry.
+    for bad in ((50, 50), (50, 51), (1, 2), (300, 300), (100, 100)):
         try:
             resolve_n_initial_points(*bad)
         except ValueError:
             pass
         else:
-            raise AssertionError("n_initial_points > n_calls did not raise: %r" % (bad,))
+            raise AssertionError(
+                "n_initial_points >= n_calls did not raise: %r" % (bad,))
+    assert resolve_n_initial_points(1, 1) == 1
     try:
         resolve_n_initial_points(0, None)
     except ValueError:
         pass
     else:
         raise AssertionError("n_calls < 1 did not raise")
-    print("  [I] n_initial_points > n_calls raises (it would leave the surrogate "
-          "no trials and silently degrade the study to random search) OK")
+    print("  [I] n_initial_points >= n_calls raises, INCLUDING equality (it "
+          "would leave the surrogate no trials and silently degrade the study "
+          "to random search); n_calls == 1 is exempt OK")
 
     # the archived run's numbers, for the record
     assert resolve_n_initial_points(50, None) == 10

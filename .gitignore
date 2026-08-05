@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# run artifacts -- never versioned
+out/
+outputs/
+runs/
+trials.jsonl
+search_state.json
+config_best.json
+config_top*.json
+checkpoints/
+*.pt
+*.pth
+figures/
+*.o[0-9]*
+*.e[0-9]*
+
+.DS_Store
