@@ -397,9 +397,15 @@ def resolve_n_initial_points(n_calls: int,
     if n_initial_points is None or int(n_initial_points) <= 0:
         return int(min(10, max(1, n_calls // 2)))
     n_init = int(n_initial_points)
-    if n_init > n_calls:
+    if n_init > n_calls or (n_init == n_calls and n_calls > 1):
         raise ValueError(
-            "n_initial_points (%d) exceeds n_calls (%d): the surrogate would "
-            "never be fitted and the study would be pure random search."
-            % (n_init, n_calls))
+            "n_initial_points (%d) is not less than n_calls (%d): the surrogate "
+            "would never be fitted and the study would be pure random search. "
+            "The guard is >=, not >, because EQUALITY is the dangerous case: it "
+            "arises exactly when a study of n_calls trials is split into lanes "
+            "or segments of n_initial_points each, which looks like a search and "
+            "is not one. A resumed segment must NOT reach this function -- it "
+            "calls search_persistence.resolve_resume_budget instead, which is "
+            "allowed to return 0 because the initial design was already paid "
+            "for in an earlier segment." % (n_init, n_calls))
     return n_init

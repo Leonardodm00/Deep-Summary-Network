@@ -1193,7 +1193,8 @@ def build_splits(cfg, traces, conditions, fs, verbose=False):
 
 
 def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
-                      verbose=False, on_stage_complete=None, trial_verbose=False):
+                      verbose=False, on_stage_complete=None, trial_verbose=False,
+                      out_dir=None, resume_search=False):
     """Phase 1 (architecture) -> Phase 2 (training HPs) -> [re-tune] ->
     [regularization], each handing its winner to the next.
 
@@ -1252,8 +1253,16 @@ def run_search_phases(cfg, splits, device, fig_dir, skip_regularization=False,
     # experimental factors included. Replaces the 52-cell factorial outright,
     # so there are no staged phases at all and no per-cell config files.
     if getattr(cfg.search, "search_mode", "staged") == "joint_conditions":
+        # out_dir turns on per-trial persistence: every completed trial is
+        # flushed to <out_dir>/trials.jsonl before the next one starts, so a
+        # job killed at the walltime leaves k usable trials instead of
+        # nothing. resume_search reads that log back as the gp_minimize
+        # warm start. Passing out_dir=None restores the old behaviour
+        # exactly (no files, no resume).
         res_c = S.search_joint_conditions(work, splits, device, verbose=verbose,
-                                          train_verbose=trial_verbose)
+                                          train_verbose=trial_verbose,
+                                          out_dir=out_dir,
+                                          resume_search=bool(resume_search))
         best_c = S.best_joint_condition_dict(res_c)
         work = S.config_from_joint_condition_point(work, res_c.x)
         n_proj = sum(1 for r in res_c.trial_log if r.get("projected"))
@@ -1701,7 +1710,9 @@ def run(cfg, args, on_stage_complete=None):
             cfg, splits, device, fig_dir,
             skip_regularization=skip_reg, verbose=verbose,
             on_stage_complete=on_stage_complete,
-            trial_verbose=bool(getattr(args, "trial_verbose", False)))
+            trial_verbose=bool(getattr(args, "trial_verbose", False)),
+            out_dir=out_dir,
+            resume_search=bool(getattr(args, "resume_search", False)))
 
     cfg_best.to_json(out_dir / "config_best.json")
 
@@ -1780,8 +1791,15 @@ def build_parser():
                    help="resolve the config, run the pre-flights, print the "
                         "budget, and train NOTHING")
     g.add_argument("--resume", action="store_true",
-                   help="resume the FINAL training from its last.pt (search "
-                        "phases are not resumable)")
+                   help="resume the FINAL training from its last.pt (this does "
+                        "NOT resume the search; see --resume-search)")
+    g.add_argument("--resume-search", action="store_true",
+                   help="resume the JOINT CONDITION search from "
+                        "<out_dir>/<experiment_name>/trials.jsonl, warm-starting "
+                        "gp_minimize with every trial already completed. Only "
+                        "search_mode=joint_conditions is resumable. Without this "
+                        "flag a run that finds an existing trials.jsonl REFUSES "
+                        "to start rather than append a second study to it.")
 
     g = p.add_argument_group("overrides")
     g.add_argument("--device", choices=("cpu", "cuda", "auto"), default=None)

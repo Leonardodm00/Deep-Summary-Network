@@ -124,6 +124,8 @@ HPC note (hpc-python-compat): pure ASCII. Figures (the optional PDP) use the Agg
 backend forced by evaluate.py's import; search.py never calls plt.show().
 """
 
+import json
+import os
 import warnings
 from dataclasses import replace
 
@@ -152,6 +154,11 @@ from objective_utils import (
     tie_break_applicable,       # [C3] the dispatch policy, testable without torch
 )
 from dsn_joint_loss import sep_warmup_scale
+from search_persistence import (
+    STATE_FILENAME, TRIALS_FILENAME, ResumeError, TrialWriter,
+    build_warm_start, point_to_named, read_trials,
+    resolve_resume_budget, space_signature,
+)
 from train import train
 
 __all__ = [
@@ -798,7 +805,8 @@ def evaluate_candidate(cfg, splits, device, trial_number, log=None, epsilon=None
 
 def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
             verbose=False, tag="", n_initial_points=None, epsilon=None,
-            train_verbose=False, annotate=None):
+            train_verbose=False, annotate=None, persist=None, axis_names=None,
+            warm_start=None):
     """Shared gp_minimize driver: wires the objective, keeps a trial counter (so the
     seed blocks stay disjoint), and collects the per-trial log.
 
@@ -812,9 +820,62 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
         a different config than its coordinates suggest. It must be pure and
         cheap; if it raises, the trial still runs and the error is recorded
         instead, because a logging fault must never cost a training run.
+    persist : optional search_persistence.TrialWriter. When given, every
+        completed trial record is appended to trials.jsonl and FLUSHED before
+        the next trial starts, and search_state.json is rewritten with the
+        running best. A study killed at the walltime then leaves k usable
+        records instead of nothing. A fault in the writer is warned about and
+        swallowed, for the same reason annotate's is: logging must never cost a
+        training run that has already been paid for.
+    axis_names : the names of the coordinates of space, in order. Required
+        whenever persist is given, because the RAW sampled point is recorded BY
+        NAME rather than positionally -- a later reordering of the space would
+        otherwise silently reinterpret every stored coordinate. See
+        search_persistence for why the raw point and not the projected one.
+    warm_start : optional search_persistence.WarmStart from earlier segments.
+        Supplying it makes this call a CONTINUATION rather than a fresh study:
+        the k completed observations are handed to gp_minimize as x0/y0, the
+        trial counter starts at k so the disjoint seed blocks continue instead
+        of being reused, and the budget is recomputed by resolve_resume_budget.
+
+    THE TRIAL COUNTER IS THE SEED. evaluate_candidate derives
+    seed = base_seed + t * n_seeds + n from the counter, so trials own disjoint
+    seed blocks. A resumed segment that restarted the counter at 0 would hand
+    trials k, k+1, ... the seed blocks of trials 0, 1, ..., which is not a
+    crash and not visible in any output -- it just quietly re-runs the same
+    initialisations under different coordinates. Hence trial_offset.
     """
     trial_log = []
-    counter = {"t": 0}
+    trial_offset = 0 if warm_start is None else int(warm_start.k)
+    counter = {"t": int(trial_offset)}
+
+    def _persist(rec):
+        """Append one completed record, then refresh the running state file."""
+        if persist is None:
+            return
+        try:
+            persist.write_trial(rec)
+            best = None
+            for r in trial_log:
+                o = r.get("objective", None)
+                if o is not None and o == o and (best is None or o < best[0]):
+                    best = (float(o), r)
+            state = {"tag": str(tag),
+                     "n_trials_this_segment": len(trial_log),
+                     "n_trials_total": int(trial_offset) + len(trial_log),
+                     "trial_offset": int(trial_offset),
+                     "n_calls_total": int(n_calls),
+                     "epsilon": epsilon}
+            if best is not None:
+                state["best_objective"] = best[0]
+                state["best_trial"] = best[1].get("trial")
+                state["best_point_raw"] = best[1].get("point_raw")
+                state["best_cell"] = best[1].get("cell")
+            persist.write_state(state)
+        except Exception as ex:
+            warnings.warn("%s: trial persistence raised %s: %s -> the trial "
+                          "still counts, but this record was not written."
+                          % (tag, type(ex).__name__, ex), RuntimeWarning)
 
     def _note(point):
         if annotate is None:
@@ -830,6 +891,18 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
         t = counter["t"]
         counter["t"] += 1
         note = _note(point)
+        # The RAW point, before build_cfg applies the legality projection Pi.
+        # This is the only coordinate vector gp_minimize ever sees, so it is
+        # the only one a warm start may be built from.
+        point_raw = None
+        if axis_names is not None:
+            try:
+                point_raw = point_to_named(point, axis_names)
+            except Exception as ex:
+                warnings.warn("%s trial %d: point_to_named raised %s: %s -> "
+                              "the trial still runs, but it will not be "
+                              "resumable." % (tag, t, type(ex).__name__, ex),
+                              RuntimeWarning)
         try:
             cfg = build_cfg(base_cfg, point)
         except Exception as ex:                   # an INVALID config (failed validate)
@@ -838,9 +911,13 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
                 % (tag, t, point, ex), RuntimeWarning)
             rec = {"trial": t, "scores": [], "mean": float("nan"),
                    "std": float("nan"), "objective": FAILED_OBJECTIVE,
-                   "eff_rank": float("nan"), "failed": True}
+                   "eff_rank": float("nan"), "failed": True,
+                   "epsilon": epsilon}
             rec.update(note)
+            if point_raw is not None:
+                rec["point_raw"] = point_raw
             trial_log.append(rec)
+            _persist(rec)
             return FAILED_OBJECTIVE
         if train_verbose:
             print("[%s] trial %3d starting (%d seed(s)) ..." % (tag, t, int(base_cfg.train.n_seeds)),
@@ -849,6 +926,9 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
                                       epsilon=epsilon,
                                       train_verbose=train_verbose)
         rec.update(note)          # rec IS the object already in trial_log
+        if point_raw is not None:
+            rec["point_raw"] = point_raw
+        _persist(rec)
         if verbose:
             print("[%s] trial %3d  obj %+.4f  (val %s = %.4f +/- %.4f, eff_rank %.2f)"
                   % (tag, t, obj, base_cfg.train.selection_primary,
@@ -858,21 +938,52 @@ def _run_gp(space, base_cfg, splits, device, n_calls, random_state, build_cfg,
     # [C3] n_initial_points must not exceed n_calls, or skopt never fits the
     # surrogate; resolve_n_initial_points enforces that and raises rather than
     # silently degrading the study to random search.
-    n_initial = resolve_n_initial_points(n_calls, n_initial_points)
+    n_initial_cold = resolve_n_initial_points(n_calls, n_initial_points)
+    gp_kwargs = {}
+    if warm_start is None:
+        n_calls_segment, n_initial = int(n_calls), int(n_initial_cold)
+    else:
+        # MEASURED against skopt 0.10.2, not assumed: n_calls EXCLUDES x0/y0,
+        # and n_initial_points is NOT satisfied by x0/y0 -- skopt draws that
+        # many FRESH random points in every segment. Passing the cold values
+        # through would both overrun the walltime and, at n_initial = 100 over
+        # three segments, turn the entire 300-trial study into random search
+        # with no error and no warning. resolve_resume_budget is the whole
+        # defence; see search_persistence for the measurements.
+        #
+        # Its n_initial may legitimately be 0. It is therefore passed STRAIGHT
+        # to gp_minimize and must NOT be routed back through
+        # resolve_n_initial_points, which reads 0 as "unset" and would silently
+        # substitute the legacy rule.
+        n_calls_segment, n_initial = resolve_resume_budget(
+            n_calls, n_initial_cold, warm_start.k)
+        gp_kwargs["x0"] = [list(x) for x in warm_start.X0]
+        gp_kwargs["y0"] = [float(y) for y in warm_start.Y0]
     if verbose:
-        print("[%s] budget: n_calls=%d, n_initial_points=%d (%s)"
-              % (tag, int(n_calls), n_initial,
-                 "explicit" if (n_initial_points or 0) > 0 else "legacy rule"))
+        if warm_start is None:
+            print("[%s] budget: n_calls=%d, n_initial_points=%d (%s)"
+                  % (tag, int(n_calls_segment), n_initial,
+                     "explicit" if (n_initial_points or 0) > 0 else "legacy rule"))
+        else:
+            print("[%s] RESUMING after %d completed trial(s): this segment runs "
+                  "n_calls=%d of %d total, n_initial_points=%d (cold value was "
+                  "%d; the initial design is not re-paid)"
+                  % (tag, warm_start.k, int(n_calls_segment), int(n_calls),
+                     n_initial, int(n_initial_cold)))
     res = gp_minimize(
         func=objective,
         dimensions=space,
-        n_calls=int(n_calls),
-        n_initial_points=n_initial,
+        n_calls=int(n_calls_segment),
+        n_initial_points=int(n_initial),
         random_state=int(random_state),           # reproducible trial sequence
         acq_func="EI",
+        **gp_kwargs
     )
     res.trial_log = trial_log
     res.n_initial_points_used = int(n_initial)
+    res.n_calls_segment = int(n_calls_segment)
+    res.trial_offset = int(trial_offset)
+    res.warm_start_k = 0 if warm_start is None else int(warm_start.k)
     return res
 
 
@@ -1484,7 +1595,8 @@ def annotate_joint_condition_point(point, train_cfg=None):
 
 
 def search_joint_conditions(cfg, splits, device, verbose=False,
-                            train_verbose=False):
+                            train_verbose=False, out_dir=None,
+                            resume_search=False):
     """THE search: one GP over the 18 axes, replacing the 52-cell factorial.
 
     Scored by the SAME evaluate_candidate, the same tie-break epsilon and the
@@ -1514,19 +1626,111 @@ def search_joint_conditions(cfg, splits, device, verbose=False,
               "seed(s) = %d training runs"
               % (len(space), cols, n_calls, int(cfg.train.n_seeds),
                  n_calls * int(cfg.train.n_seeds)))
-    return _run_gp(
-        space=space,
-        base_cfg=cfg, splits=splits, device=device,
-        n_calls=n_calls,
-        random_state=int(cfg.search.gp_random_state),
-        build_cfg=config_from_joint_condition_point,
-        verbose=verbose, tag="joint_cond",
-        n_initial_points=n_init,
-        epsilon=epsilon,
-        # bound so the dose / terminal-weight decomposition can be
-        # computed; the callback itself takes one argument
-        annotate=lambda pt: annotate_joint_condition_point(pt, cfg.train),
-        train_verbose=train_verbose)
+    persist, warm = open_joint_search_persistence(
+        out_dir, space, epsilon, n_calls, n_init, cfg,
+        resume_search=resume_search, verbose=verbose)
+    try:
+        return _run_gp(
+            space=space,
+            base_cfg=cfg, splits=splits, device=device,
+            n_calls=n_calls,
+            random_state=int(cfg.search.gp_random_state),
+            build_cfg=config_from_joint_condition_point,
+            verbose=verbose, tag="joint_cond",
+            n_initial_points=n_init,
+            epsilon=epsilon,
+            # bound so the dose / terminal-weight decomposition can be
+            # computed; the callback itself takes one argument
+            annotate=lambda pt: annotate_joint_condition_point(pt, cfg.train),
+            train_verbose=train_verbose,
+            persist=persist,
+            axis_names=list(_JOINT_CONDITION_NAMES),
+            warm_start=warm)
+    finally:
+        if persist is not None:
+            persist.close()
+
+
+def open_joint_search_persistence(out_dir, space, epsilon, n_calls, n_init,
+                                  cfg, resume_search=False, verbose=False):
+    """(TrialWriter, WarmStart or None) for a joint search rooted at out_dir.
+
+    out_dir None disables persistence entirely and returns (None, None), so
+    every existing caller and every smoke test keeps working unchanged.
+
+    THREE SAFETY REFUSALS, all raising rather than warning. Each is a way to
+    end up with a trials.jsonl that describes a study nobody ran:
+
+      1. A trial log already exists and resume_search is False. Appending to it
+         would interleave a fresh study with an old one under one filename, and
+         the resulting log would warm-start a later segment with observations
+         from two different studies.
+      2. The recorded space signature differs from the current one. Enforced
+         inside build_warm_start.
+      3. The recorded epsilon differs from the one resolved for this segment.
+         Also inside build_warm_start: J_eps = -(ARI + epsilon * sbar), so a
+         different epsilon is a different objective and the recorded Y0 is not
+         commensurable with the trials about to be run.
+
+    resume_search with no log present is NOT an error: it is the first segment
+    of a segmented study, and it starts cold. It is announced, because "I asked
+    for a resume and got a cold start" must never be silent.
+    """
+    if out_dir is None:
+        return None, None
+    out_dir = str(out_dir)
+    names = list(_JOINT_CONDITION_NAMES)
+    trials_path = os.path.join(out_dir, TRIALS_FILENAME)
+    state_path = os.path.join(out_dir, STATE_FILENAME)
+    signature = space_signature(space, names)
+
+    warm = None
+    if resume_search:
+        records, n_torn = read_trials(trials_path)
+        if records:
+            expected_sig = None
+            if os.path.exists(state_path):
+                try:
+                    with open(state_path, "r", encoding="ascii",
+                              errors="replace") as fh:
+                        prev = json.load(fh)
+                    expected_sig = (prev.get("study") or {}).get(
+                        "space_signature")
+                except Exception as ex:
+                    warnings.warn(
+                        "could not read %s (%s: %s) -> the space-signature "
+                        "check is SKIPPED for this resume."
+                        % (state_path, type(ex).__name__, ex), RuntimeWarning)
+            warm = build_warm_start(
+                records, space, names, expected_epsilon=epsilon,
+                expected_space_signature=expected_sig, n_torn=n_torn)
+            if verbose:
+                print("[joint_cond] resume: %d completed trial(s) recovered "
+                      "from %s (%d failed, %d torn line(s)); best objective so "
+                      "far %+.4f"
+                      % (warm.k, trials_path, warm.n_failed, warm.n_torn,
+                         float("nan") if warm.best_objective is None
+                         else warm.best_objective), flush=True)
+        elif verbose:
+            print("[joint_cond] resume requested but no completed trials found "
+                  "at %s -> starting COLD. This is the first segment."
+                  % trials_path, flush=True)
+    elif os.path.exists(trials_path) and os.path.getsize(trials_path) > 0:
+        raise ResumeError(
+            "a trial log already exists at %s and resume_search is False. "
+            "Appending would mix two studies under one filename. Pass "
+            "--resume-search to continue it, or move it aside to start over."
+            % trials_path)
+
+    header = {"space_signature": signature,
+              "axis_names": names,
+              "n_calls_total": int(n_calls),
+              "n_initial_points_cold": int(n_init),
+              "gp_random_state": int(cfg.search.gp_random_state),
+              "epsilon": epsilon,
+              "n_seeds": int(cfg.train.n_seeds),
+              "search_mode": "joint_conditions"}
+    return TrialWriter(out_dir, header=header), warm
 
 
 def search_regularization(cfg, splits, device, verbose=False,
