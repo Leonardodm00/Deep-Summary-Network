@@ -1,0 +1,179 @@
+#!/bin/bash
+#PBS -N dsn_mea
+#PBS -l select=1:ncpus=48
+#PBS -l walltime=300:00:00
+#PBS -j oe
+
+# ======================================================================
+# run_mea_joint_search.pbs -- one LANE of the joint search, REAL MEA data
+# ======================================================================
+#
+# USAGE
+#   qsub -v CFG=hpc/Config/config_mea_joint_full_lane0.json \
+#        -o dsn_mea_lane0.out Main/hpc/run_mea_joint_search.pbs
+#
+#   CFG     config for this lane                (required)
+#   RESUME  auto | yes | no                     (default auto)
+#
+# RESUME=auto is the point of this script. It looks for the lane's
+# trials.jsonl and passes --resume-search only if one exists. So the SAME
+# qsub line both starts a lane and continues it: resubmit after a walltime
+# kill and it picks up where it stopped, with no edit and no decision.
+#
+# ONE LANE IS ONE COMPLETE STUDY. Do NOT split n_calls across lanes -- see
+# LANES below.
+#
+# Pure ASCII (hpc-python-compat).
+# ======================================================================
+
+set -uo pipefail
+
+# ---- resolve Main/ ---------------------------------------------------
+cd "${PBS_O_WORKDIR:-$PWD}"
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+cd "$MAIN"
+export PYTHONPATH="$MAIN"
+
+# ---- arguments -------------------------------------------------------
+CFG="${CFG:-}"
+if [ -z "$CFG" ]; then
+    echo "ABORT: set CFG, e.g."
+    echo "  qsub -v CFG=hpc/Config/config_mea_joint_full_lane0.json run_mea_joint_search.pbs"
+    exit 2
+fi
+if [ ! -f "$CFG" ]; then echo "ABORT: config not found: $CFG"; exit 2; fi
+
+RESUME="${RESUME:-auto}"
+NCPUS=48                     # MUST match '#PBS -l select=' above
+
+# ---- environment -----------------------------------------------------
+CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"
+if command -v module >/dev/null 2>&1; then
+    module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV" || echo "WARN: could not activate $CONDA_ENV"
+fi
+
+export OMP_NUM_THREADS="$NCPUS"
+export MKL_NUM_THREADS="$NCPUS"
+export OPENBLAS_NUM_THREADS="$NCPUS"
+export NUMEXPR_NUM_THREADS="$NCPUS"
+
+python3 -c "import torch, pytorch_metric_learning, skopt, sklearn" || {
+    echo "ABORT: dependencies not importable in env '$CONDA_ENV'."; exit 2; }
+
+# ---- guard: ncpus must equal runtime.torch_threads -------------------
+CFG_THREADS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['runtime']['torch_threads'])" "$CFG")
+if [ "$CFG_THREADS" != "$NCPUS" ]; then
+    echo "ABORT: runtime.torch_threads=$CFG_THREADS but the job has ncpus=$NCPUS."
+    exit 2
+fi
+
+# ---- guard: this lane must be a COMPLETE study -----------------------
+# n_initial_points_joint >= n_calls_joint means every trial is part of the
+# random initial design and the surrogate is never fitted. That is what
+# splitting a study across lanes produces, and it looks like a search.
+python3 - "$CFG" <<'EOF' || exit 2
+import json, sys
+s = json.load(open(sys.argv[1]))["search"]
+nc, ni = int(s["n_calls_joint"]), int(s["n_initial_points_joint"])
+if ni >= nc:
+    print("ABORT: n_initial_points_joint (%d) >= n_calls_joint (%d): this lane "
+          "would be pure random search, not Bayesian optimisation." % (ni, nc))
+    sys.exit(1)
+print("budget OK: %d trials, %d of them the random initial design (%.0f%%)"
+      % (nc, ni, 100.0 * ni / nc))
+EOF
+
+# ---- guard: the specs file must exist BEFORE the lane starts ---------
+# data_mode='numpy' reads data.npz_specs. Generating it is a separate step
+# (make_mea_specs.py) that walks the cohort and tags every record with its
+# culture. A lane that starts without it dies minutes in, after the queue
+# wait, with a FileNotFoundError -- so fail here instead, immediately.
+python3 - "$CFG" <<'EOF' || exit 2
+import json, os, sys
+c = json.load(open(sys.argv[1]))
+d = c["data"]
+if d.get("data_mode") != "numpy":
+    print("data_mode=%r: no specs file needed." % d.get("data_mode")); sys.exit(0)
+p = d.get("npz_specs", "")
+if not p:
+    print("ABORT: data_mode='numpy' but data.npz_specs is empty."); sys.exit(1)
+if not os.path.isfile(p):
+    print("ABORT: specs file not found: %s" % p)
+    print("       generate it first, on the login node:")
+    print("         python3 make_mea_specs.py --config %s" % sys.argv[1])
+    sys.exit(1)
+recs = json.load(open(p))
+if not recs:
+    print("ABORT: specs file %s is empty." % p); sys.exit(1)
+n_cult = len(set(str(r.get("culture", r.get("name"))) for r in recs))
+per_class = {}
+for r in recs:
+    per_class.setdefault(int(r["condition"]), set()).add(
+        str(r.get("culture", r.get("name"))))
+print("specs OK: %d record(s), %d culture(s)" % (len(recs), n_cult))
+for k in sorted(per_class):
+    print("  class %d: %d culture(s)" % (k, len(per_class[k])))
+# K3: per-subregion records MUST carry a culture, or siblings become
+# independent cultures and can straddle a split.
+if n_cult == len(recs) and len(recs) > 0:
+    miss = [r for r in recs if "culture" not in r]
+    if miss:
+        print("ABORT: no record carries a 'culture' field. If these are "
+              "per-subregion archives, siblings would be treated as "
+              "independent cultures. Regenerate with make_mea_specs.py.")
+        sys.exit(1)
+need = int(c["data"].get("min_train_cultures_per_class", 2)) + 2
+for k in sorted(per_class):
+    if len(per_class[k]) < need:
+        print("ABORT: class %d has %d culture(s); the split needs >= %d."
+              % (k, len(per_class[k]), need))
+        sys.exit(1)
+EOF
+
+# ---- resolve the run directory and decide on resume ------------------
+RUN_DIR=$(python3 -c "
+import json, os, sys
+r = json.load(open(sys.argv[1]))['runtime']
+print(os.path.join(r['out_dir'], r['experiment_name']))" "$CFG")
+
+RESUME_FLAG=""
+case "$RESUME" in
+    yes)  RESUME_FLAG="--resume-search" ;;
+    no)   RESUME_FLAG="" ;;
+    auto)
+        if [ -s "$RUN_DIR/trials.jsonl" ]; then
+            N_DONE=$(wc -l < "$RUN_DIR/trials.jsonl")
+            echo "RESUME=auto: found $N_DONE completed trial(s) in $RUN_DIR"
+            echo "             -> continuing this study with --resume-search"
+            RESUME_FLAG="--resume-search"
+        else
+            echo "RESUME=auto: no trial log in $RUN_DIR -> starting COLD"
+        fi
+        ;;
+    *) echo "ABORT: RESUME must be auto|yes|no, got '$RESUME'"; exit 2 ;;
+esac
+
+echo "======================================================================"
+echo "config    : $CFG"
+echo "run dir   : $RUN_DIR"
+echo "conda env : $CONDA_ENV"
+echo "started   : $(date)"
+echo "======================================================================"
+
+python3 run_optimization.py --config "$CFG" --verbose $RESUME_FLAG
+RC=$?
+
+echo "======================================================================"
+echo "finished  : $(date)   exit=$RC"
+if [ -s "$RUN_DIR/trials.jsonl" ]; then
+    echo "trials completed: $(wc -l < "$RUN_DIR/trials.jsonl")"
+    echo "resubmit the SAME qsub line to continue this lane."
+fi
+echo "======================================================================"
+exit $RC

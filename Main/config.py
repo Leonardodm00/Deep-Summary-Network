@@ -42,7 +42,8 @@ import json
 import warnings
 from dataclasses import dataclass, field, fields, is_dataclass, asdict, replace
 from pathlib import Path
-from typing import Optional, Tuple, get_type_hints, get_origin, get_args
+from typing import (Dict, List, Optional, Tuple, get_type_hints,
+                    get_origin, get_args)
 
 from backbone import BackboneConfig
 from augmentation import AugmentationConfig
@@ -58,6 +59,7 @@ __all__ = [
     "RegularizationConfig",
     "EvalConfig",
     "RuntimeConfig",
+    "CohortConfig",
     "ExperimentConfig",
     "config_from_dict",
     # re-exported for downstream convenience
@@ -1247,6 +1249,164 @@ class RuntimeConfig:
 # Top-level experiment config: the single object every stage reads from
 # --------------------------------------------------------------------------- #
 @dataclass
+class CohortConfig:
+    """Declares WHERE the real MEA cohort lives on disk, per class.
+
+    This block is DECLARATIVE. `run_optimization.py` never reads it: the search
+    consumes `data.npz_specs`, a flat list of .npz records. What this block does
+    is let ONE file describe both the cohort and the search, so the well list
+    used to generate the specs cannot drift from the experiment that consumes
+    them. `make_mea_specs.py` reads it and writes the specs file.
+
+    Directory model (three levels, all real on disk):
+
+        <root>/                      one ENTRY of class_roots[c]; a plate/batch
+            ptrain_A1/               a WELL == a recording == a CULTURE
+                ptrain_10.mat        one electrode's spike raster
+                ...
+            ptrain_A2/  ...  ptrain_B3/
+
+    and, produced by run_channel_subset_extraction.py, the extraction outputs:
+
+        <extract_root>/<extract_layout>/
+            trace_subregion_00.npz   mode per_region_single: N_SUB traces,
+            ...                      one CULTURE, K3 groups them
+            trace_subregion_08.npz
+        or
+            traces.npz               mode multichannel: ONE (N_SUB, K) trace
+
+    Both output shapes are recognised. Which one is present decides how many
+    trace records a well contributes, so it is reported rather than assumed.
+
+    Fields
+    ------
+    class_roots : {class index as a STRING : [root paths]}. JSON object keys are
+        always strings, hence "0" / "1" rather than 0 / 1. Several roots per
+        class is the expected case (one per plate/batch). Class indices must be
+        contiguous from 0.
+    class_names : optional human labels, parallel to the sorted class indices;
+        used for directory naming and log lines, never for the label itself.
+    well_glob   : pattern matched against the immediate children of each root.
+    extract_root: where run_channel_subset_extraction.py wrote its outputs.
+    extract_layout : path template BELOW extract_root, expanded per well with
+        {class_index} {class_name} {root_name} {well}. Change this rather than
+        editing code if the extraction outputs were laid out differently.
+    culture_template : how a culture id is built. It MUST be unique per well
+        across the whole cohort -- {root_name}__{well} is unique whenever two
+        roots do not share a basename, which is why root_name is included.
+
+    The extraction parameters are recorded so the specs file, the extraction
+    array job, and this config cannot disagree about how the traces were made.
+    They are metadata here; the extractor takes them as CLI flags.
+    """
+
+    class_roots: Dict[str, List[str]] = field(default_factory=dict)
+    class_names: List[str] = field(default_factory=list)
+    well_glob: str = "ptrain_*"
+
+    extract_root: str = ""
+    extract_layout: str = "{class_name}/{root_name}/{well}"
+    culture_template: str = "{root_name}__{well}"
+
+    # extraction parameters, mirroring run_channel_subset_extraction.py defaults
+    n_subsets: int = 9
+    electrodes_per_subset: int = 9
+    fs_raw: float = 10110.09
+    grid_width: int = 48
+    index_base: int = 0
+    mfr_threshold: float = 0.1
+    w_size: float = 0.02
+
+    def __post_init__(self):
+        if not self.class_roots:
+            return                      # empty cohort: synthetic/latent configs
+
+        keys = []
+        for k in self.class_roots.keys():
+            try:
+                keys.append(int(k))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "CohortConfig.class_roots: key %r is not an integer class "
+                    "index. JSON object keys are strings, so write \"0\" / "
+                    "\"1\"." % (k,))
+        keys = sorted(keys)
+        if keys != list(range(len(keys))):
+            raise ValueError(
+                "CohortConfig.class_roots: class indices must be contiguous "
+                "from 0; got %r. The pipeline builds C = number of distinct "
+                "conditions and indexes classes 0..C-1." % (keys,))
+
+        for k, roots in self.class_roots.items():
+            if isinstance(roots, str) or not isinstance(roots, (list, tuple)):
+                raise ValueError(
+                    "CohortConfig.class_roots[%r] must be a LIST of root paths, "
+                    "got %r. A single root still goes in a list." % (k, roots))
+            if len(roots) == 0:
+                raise ValueError(
+                    "CohortConfig.class_roots[%r] is empty; every class needs "
+                    "at least one root folder." % (k,))
+            seen = set()
+            for r in roots:
+                rs = str(r)
+                if rs in seen:
+                    raise ValueError(
+                        "CohortConfig.class_roots[%r]: duplicate root %r. The "
+                        "same folder listed twice would double-count its wells."
+                        % (k, rs))
+                seen.add(rs)
+
+        # a root may not appear under two classes: that is a phenotype conflict
+        owner = {}
+        for k, roots in self.class_roots.items():
+            for r in roots:
+                rs = str(r)
+                if rs in owner and owner[rs] != str(k):
+                    raise ValueError(
+                        "CohortConfig: root %r is listed under BOTH class %s "
+                        "and class %s. A plate has one phenotype."
+                        % (rs, owner[rs], k))
+                owner[rs] = str(k)
+
+        if self.class_names and len(self.class_names) != len(keys):
+            raise ValueError(
+                "CohortConfig.class_names has %d entry/entries but there are "
+                "%d class(es); they must be parallel to the sorted class "
+                "indices %r." % (len(self.class_names), len(keys), keys))
+
+        if int(self.n_subsets) < 1:
+            raise ValueError("CohortConfig.n_subsets must be >= 1")
+        if int(self.electrodes_per_subset) < 1:
+            raise ValueError("CohortConfig.electrodes_per_subset must be >= 1")
+        if float(self.fs_raw) <= 0.0:
+            raise ValueError("CohortConfig.fs_raw must be > 0")
+        if int(self.grid_width) < 1:
+            raise ValueError("CohortConfig.grid_width must be >= 1")
+        if int(self.index_base) not in (0, 1):
+            raise ValueError(
+                "CohortConfig.index_base must be 0 or 1 (see REAL_DATA_FINDINGS "
+                "O1: both fit the 48x48 grid, so this is an assumption)")
+        if float(self.mfr_threshold) < 0.0:
+            raise ValueError("CohortConfig.mfr_threshold must be >= 0")
+        if float(self.w_size) <= 0.0:
+            raise ValueError("CohortConfig.w_size must be > 0")
+
+    # ----- convenience, used by make_mea_specs.py -----
+    def n_classes(self):
+        return len(self.class_roots)
+
+    def name_of_class(self, c):
+        """Human label for class index c; falls back to 'class<c>'."""
+        if self.class_names and 0 <= int(c) < len(self.class_names):
+            return str(self.class_names[int(c)])
+        return "class%d" % int(c)
+
+    def fs_ifr(self):
+        """IFR rate implied by the smoothing window: f_s^IFR = 1 / w_size."""
+        return 1.0 / float(self.w_size)
+
+
+@dataclass
 class ExperimentConfig:
     """Top-level configuration aggregating every sub-config."""
 
@@ -1257,6 +1417,11 @@ class ExperimentConfig:
     regularization: RegularizationConfig = field(default_factory=RegularizationConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    # [K3/cohort] Declarative: WHERE the real MEA cohort lives on disk.
+    # run_optimization.py never reads this -- make_mea_specs.py does, to
+    # generate data.npz_specs. It lives here so one file describes both
+    # the cohort and the search, and the two cannot drift apart.
+    cohort: CohortConfig = field(default_factory=CohortConfig)
 
     def __post_init__(self):
         # Single source of truth for the trace channel axis: data.n_channels

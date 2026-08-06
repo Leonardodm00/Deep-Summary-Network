@@ -40,3 +40,9 @@
 *.npy   binary
 *.zip   binary
 *.pkl   binary
+
+# PBS/SLURM job scripts: same fatal CRLF-in-shebang failure as .sh above.
+# The `* text=auto eol=lf` catch-all covers these via heuristic detection;
+# declaring them explicitly does not rely on that heuristic.
+*.pbs    text eol=lf
+*.slurm  text eol=lf
