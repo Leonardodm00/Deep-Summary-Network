@@ -651,7 +651,8 @@ def make_trace_splits(traces: Sequence[np.ndarray],
                       split_seed: int = 0,
                       min_train_cultures_per_class: int = 2,
                       fractions: Optional[Sequence[float]] = None,
-                      alloc_rule: str = "largest_remainder") -> SplitBundle:
+                      alloc_rule: str = "largest_remainder",
+                      cultures: Optional[Sequence] = None) -> SplitBundle:
     """Whole-culture train / val / test split: a culture belongs to ONE split.
 
     Replaces the time-segment split for the deployment question "classify a
@@ -685,6 +686,22 @@ def make_trace_splits(traces: Sequence[np.ndarray],
                   least one same-class partner from a DIFFERENT culture.
     fractions   : (train, val, test); defaults to data_cfg.split_fractions
     alloc_rule  : "largest_remainder" (default) or "floor"; see apportion()
+    cultures    : [K3] culture id per TRACE, parallel to traces. Several traces
+                  MAY share an id -- that is the point. None (the default) means
+                  the identity grouping gamma(u) = u, one trace == one culture,
+                  which reproduces the pre-K3 assignment index-for-index under
+                  the same seed. When given, assignment happens at CULTURE
+                  granularity: the split is computed over cultures and then
+                  expanded to their member traces, so sibling traces of one well
+                  can never land on opposite sides of a split boundary.
+                  Every trace of a culture must carry the SAME condition; a
+                  culture with more than one distinct label raises, since it can
+                  only mean the specs file was generated wrongly.
+                  NOTE on mode="leave_one_out": `fold` indexes CULTURES, so the
+                  held-out unit is one whole recording per class (every sibling
+                  trace of it leaves together), not one trace record. Under the
+                  identity grouping the two coincide, so no existing fold index
+                  changes meaning.
 
     Windowing. Windows tile the WHOLE trace -- there is no time cut -- using
     exactly MEAWindowDataset's rule via window_starts(), with train_stride for
@@ -715,8 +732,56 @@ def make_trace_splits(traces: Sequence[np.ndarray],
     stride_by_split = {"train": train_stride, "val": eval_stride,
                        "test": eval_stride}
 
-    assignment = assign_cultures(
-        conditions=conditions,
+    # ---- [K3] trace -> culture grouping ---------------------------------- #
+    # gamma : {0..U_tot-1} -> {0..U_cult-1}, the map from trace record index to
+    # culture index. Pre-K3 the code hardcoded gamma = identity; everything
+    # below is written so that `cultures is None` reproduces that EXACTLY,
+    # index for index, under the same seed.
+    n_traces = len(traces)
+    if cultures is None:
+        culture_of_trace = list(range(n_traces))
+        n_cultures = n_traces
+    else:
+        if len(cultures) != n_traces:
+            raise ValueError(
+                "cultures has %d entries but traces has %d; they must be "
+                "parallel (one culture id per trace record)."
+                % (len(cultures), n_traces))
+        # sorted() rather than first-appearance or set iteration: the culture
+        # INDEX feeds assign_cultures' per-class RNG stream, so the ordering
+        # must not depend on hash order or on the order records happen to
+        # appear in the specs file.
+        uniq = sorted(set(str(c) for c in cultures))
+        code_of = {cid: k for k, cid in enumerate(uniq)}
+        culture_of_trace = [code_of[str(c)] for c in cultures]
+        n_cultures = len(uniq)
+
+    # Every trace of a culture must agree on the phenotype. A culture with two
+    # distinct labels has no well-defined class to stratify on, and there is no
+    # safe recovery: majority-vote would paper over what can only be a
+    # specs-generation bug, since the phenotype is a property of the WELL.
+    # Grouping is completed BEFORE validating so the error can name every
+    # conflicting label, not merely the first two encountered.
+    traces_of_culture = [[] for _ in range(n_cultures)]
+    for u in range(n_traces):
+        traces_of_culture[culture_of_trace[u]].append(u)
+
+    culture_conditions = [None] * n_cultures
+    for k in range(n_cultures):
+        labels = sorted(set(int(conditions[u]) for u in traces_of_culture[k]))
+        if len(labels) != 1:
+            cid = uniq[k] if cultures is not None else str(k)
+            raise ValueError(
+                "culture %r carries more than one condition: %r (over %d trace "
+                "record(s)). Every trace of one culture must share its "
+                "phenotype label -- the label belongs to the recording, not to "
+                "a trace of it. Check the folder-to-phenotype mapping used to "
+                "generate the specs file."
+                % (cid, labels, len(traces_of_culture[k])))
+        culture_conditions[k] = labels[0]
+
+    assignment_c = assign_cultures(
+        conditions=culture_conditions,
         fractions=frac,
         seed=split_seed,
         mode=mode,
@@ -729,11 +794,18 @@ def make_trace_splits(traces: Sequence[np.ndarray],
     for a in range(len(_SPLIT_NAMES)):
         for b in range(a + 1, len(_SPLIT_NAMES)):
             na, nb = _SPLIT_NAMES[a], _SPLIT_NAMES[b]
-            shared = sorted(set(assignment[na]) & set(assignment[nb]))
+            shared = sorted(set(assignment_c[na]) & set(assignment_c[nb]))
             if shared:
                 raise AssertionError(
                     "internal error: culture(s) %s assigned to both '%s' and "
                     "'%s'" % (shared, na, nb))
+
+    # Expand the culture-level assignment down to trace records. Sorted so that
+    # the per-split trace order stays deterministic and, under the identity
+    # grouping, identical to what the pre-K3 code produced.
+    assignment = {name: sorted(u for k in assignment_c[name]
+                               for u in traces_of_culture[k])
+                  for name in _SPLIT_NAMES}
 
     aug_cfg = data_cfg.resolved_augmentation(fs)
     arrays = [np.ascontiguousarray(t, dtype=np.float32) for t in traces]
@@ -769,6 +841,9 @@ def make_trace_splits(traces: Sequence[np.ndarray],
             stride=stride,
             aug_cfg=aug_cfg,
             base_seed=base_seed,
+            # [K3] the dataset carries its own local-trace -> culture map, so
+            # train.py can build the sampler's g without needing the bundle.
+            cultures=[culture_of_trace[u] for u in globals_here],
         )
         datasets[name] = ds
 
@@ -777,8 +852,13 @@ def make_trace_splits(traces: Sequence[np.ndarray],
         # ds.index holds (local_trace_idx, start, condition); local -> global is
         # positional because sub_traces was built in globals_here order.
         g_of_local = {i: u for i, u in enumerate(globals_here)}
+        # [K3] g[i] is the CULTURE of window i, not its trace record. Under the
+        # identity grouping the two coincide, which is why this array was
+        # correct before; under a non-trivial grouping the culture is what the
+        # sampler, exclude_same_culture_positives and culture_census all need.
         trace_of_window[name] = np.array(
-            [g_of_local[ti] for (ti, _s, _c) in ds.index], dtype=int)
+            [culture_of_trace[g_of_local[ti]] for (ti, _s, _c) in ds.index],
+            dtype=int)
         coverage[name] = [(g_of_local[ti], int(s), int(s) + W, int(c))
                           for (ti, s, c) in ds.index]
 
@@ -800,8 +880,14 @@ def make_trace_splits(traces: Sequence[np.ndarray],
                 "metrics (ARI, silhouette) are undefined there." % (name, missing),
                 RuntimeWarning)
 
-    cultures = {name: np.array(assignment[name], dtype=int)
-                for name in _SPLIT_NAMES}
+    # [K3] CULTURE indices, not trace indices. Under the identity grouping the
+    # two coincide (which is why this was correct before); under a non-trivial
+    # grouping this is what makes len(bundle.cultures["train"]) report U_avail,
+    # the quantity that actually caps U_eff and the cross-culture positives,
+    # rather than the inflated trace count. Named apart from the `cultures`
+    # PARAMETER so the two are never confused at a glance.
+    cultures_by_split = {name: np.array(assignment_c[name], dtype=int)
+                         for name in _SPLIT_NAMES}
 
     return SplitBundle(
         train=datasets["train"],
@@ -813,7 +899,7 @@ def make_trace_splits(traces: Sequence[np.ndarray],
         coverage=coverage,
         seg_bounds=[],                             # no time cut is made
         trace_of_window=trace_of_window,
-        cultures=cultures,
+        cultures=cultures_by_split,
         split_kind="trace",
         fold=(None if mode != "leave_one_out" else int(fold)),
     )

@@ -148,7 +148,8 @@ import torch
 
 from config import ExperimentConfig
 from backbone import build_backbone
-from preprocessing_cache import TraceSpec, cache_traces, load_cached_traces
+from preprocessing_cache import (TraceSpec, cache_traces,
+                                 load_cached_cultures, load_cached_traces)
 from data_pipeline import NumpyTraceProvider, NeuronalTracesProvider
 from data_splits import (
     MultiClassSyntheticProvider,
@@ -424,7 +425,13 @@ def _data_fingerprint(cfg, specs):
         "npz_specs": str(cfg.data.npz_specs),
         "specs_json": str(cfg.data.specs_json),
         "seed": int(cfg.runtime.seed),
+        # [K3] `culture` is fingerprinted alongside name/condition: regrouping
+        # traces into different cultures changes the split, the batch geometry
+        # and therefore the experiment, while leaving every cached .npz byte
+        # identical. Without this, re-pointing at a regrouped cohort with the
+        # same cache_dir would silently reuse the old grouping.
         "specs": [{"name": s["name"], "condition": int(s["condition"]),
+                   "culture": str(s.get("culture", s["name"])),
                    "args": [str(a) for a in s["args"]]} for s in specs],
     }
     # [C1] The latent parameters MUST enter the fingerprint. The spec list for
@@ -517,12 +524,18 @@ def _read_specs_json(path, required_keys, what):
 # own stem when neither name nor tag is present.
 _NPZ_PATH_KEYS = ("path", "npz_path")
 _NPZ_NAME_KEYS = ("name", "tag")
+# [K3] Optional grouping key. Several records MAY share a culture; that is what
+# marks them as traces of one recording. Absent -> culture = name, one trace ==
+# one culture, the pre-K3 behaviour.
+_NPZ_CULTURE_KEYS = ("culture", "culture_id")
 
 
 def _npz_record_fields(rec, i):
-    """(name, condition, raw_path) from an npz spec record under EITHER schema."""
+    """(name, condition, raw_path, culture) from an npz spec record under EITHER
+    schema. `culture` is None when the record does not carry one."""
     path_key = next((k for k in _NPZ_PATH_KEYS if k in rec), None)
     name_key = next((k for k in _NPZ_NAME_KEYS if k in rec), None)
+    cult_key = next((k for k in _NPZ_CULTURE_KEYS if k in rec), None)
     if path_key is None or "condition" not in rec:
         raise ValueError(
             "npz_specs record %d is not a valid spec. It must carry a phenotype "
@@ -533,7 +546,48 @@ def _npz_record_fields(rec, i):
             % (i, sorted(rec.keys())))
     raw_path = str(rec[path_key])
     name = str(rec[name_key]) if name_key else Path(raw_path).stem
-    return name, int(rec["condition"]), raw_path
+    culture = str(rec[cult_key]) if cult_key else None
+    return name, int(rec["condition"]), raw_path, culture
+
+
+def _guard_orphan_subregion(path, name, i):
+    """[K3] Refuse a per-subregion archive whose spec record has no culture.
+
+    run_channel_subset_extraction.py --mode per_region_single writes one .npz
+    per subregion, each carrying `culture_id` (the well) and `subregion_index`.
+    Those C archives are traces of ONE recording. If the specs file omits the
+    culture field, the grouping silently degrades to the identity map: the C
+    siblings become C independent 'cultures', they can be split across train and
+    test, and the miner can pick a window's near-duplicate sibling as its
+    positive. Nothing downstream raises, and the reported geometry looks better
+    than it is -- which is precisely why this has to be caught here.
+
+    Reading .files only touches the archive's zip directory, not its arrays, so
+    the cost is negligible even over a few hundred records.
+    """
+    try:
+        with np.load(path, allow_pickle=True) as data:
+            keys = set(data.files)
+    except Exception:
+        return                       # not our business; the provider will report
+    if "subregion_index" not in keys and "culture_id" not in keys:
+        return
+    hint = ""
+    if "culture_id" in keys:
+        try:
+            with np.load(path, allow_pickle=True) as data:
+                hint = (" The archive names its own recording as %r; use that, "
+                        "or any id shared by exactly the traces of one well."
+                        % str(data["culture_id"]))
+        except Exception:
+            hint = ""
+    raise ValueError(
+        "npz_specs record %d (%r) points at a per-subregion archive (%s) but "
+        "carries no 'culture' field. Subregion traces of one well MUST declare "
+        "the well they came from, or they are treated as independent cultures: "
+        "siblings would be split across train/test and could become each "
+        "other's positive pairs, with no error raised anywhere.%s"
+        % (i, name, path, hint))
 
 
 def build_traces(cfg, overwrite_cache=False, engine_module=None,
@@ -624,7 +678,7 @@ def build_traces(cfg, overwrite_cache=False, engine_module=None,
         provider = NumpyTraceProvider()
         specs = []
         for i, rec in enumerate(recs):
-            name, condition, raw_path = _npz_record_fields(rec, i)
+            name, condition, raw_path, culture = _npz_record_fields(rec, i)
             path = Path(raw_path)
             if not path.is_absolute():
                 path = base_dir / path          # relative to the specs file
@@ -632,7 +686,10 @@ def build_traces(cfg, overwrite_cache=False, engine_module=None,
                 raise FileNotFoundError(
                     "npz_specs record %r points at a missing file: %s"
                     % (name, path))
-            specs.append(TraceSpec(name, condition, (str(path),)))
+            if culture is None:
+                _guard_orphan_subregion(path, name, i)
+            specs.append(TraceSpec(name, condition, (str(path),),
+                                   culture=culture))
 
     elif mode == "real":
         # [ADDED 8] the branch 02_TECHNICAL.md 15 lists as a known gap.
@@ -663,7 +720,8 @@ def build_traces(cfg, overwrite_cache=False, engine_module=None,
                                           **(engine_kwargs or {}))
         specs = [
             TraceSpec(rec.get("name", rec["base"].rstrip("_")),
-                      rec["condition"], (rec["folder"], rec["base"]))
+                      rec["condition"], (rec["folder"], rec["base"]),
+                      culture=rec.get("culture", rec.get("culture_id")))  # [K3]
             for rec in recs
         ]
 
@@ -1153,7 +1211,16 @@ def _agg(values):
 # --------------------------------------------------------------------------- #
 # the search phases
 # --------------------------------------------------------------------------- #
-def build_splits(cfg, traces, conditions, fs, verbose=False):
+def build_cultures(cfg):
+    """[K3] Culture id per trace, in the SAME order build_traces returns traces.
+
+    Kept separate from build_traces so that function's 3-tuple return -- unpacked
+    at every existing call site and in every existing suite -- is untouched.
+    """
+    return load_cached_cultures(cfg.runtime.cache_dir)
+
+
+def build_splits(cfg, traces, conditions, fs, verbose=False, cultures=None):
     """The train/val/test splits, from loaded traces. THE single split path.
 
     Extracted from the driver's main flow so that anything which must be
@@ -1176,8 +1243,13 @@ def build_splits(cfg, traces, conditions, fs, verbose=False):
             min_train_cultures_per_class=int(
                 cfg.data.min_train_cultures_per_class),
             alloc_rule=cfg.data.trace_alloc_rule,
+            cultures=cultures,                                       # [K3]
         )
         if verbose:
+            if cultures is not None:
+                n_cult = len(set(str(c) for c in cultures))
+                print("[run] [K3] %d trace record(s) grouped into %d culture(s)"
+                      % (len(traces), n_cult))
             print("[run] WHOLE-CULTURE split (%s): %d / %d / %d cultures, "
                   "%d / %d / %d windows"
                   % (cfg.data.trace_split_mode,
@@ -1696,7 +1768,10 @@ def run(cfg, args, on_stage_complete=None):
         }
 
     # ---- splits (fs is injected into the augmentation config HERE) ---------
-    splits = build_splits(cfg, traces, conditions, fs, verbose=verbose)
+    # [K3] the grouping is read from the cache manifest, which build_traces
+    # has just written, so it is aligned with `traces` by construction.
+    splits = build_splits(cfg, traces, conditions, fs, verbose=verbose,
+                          cultures=build_cultures(cfg))
 
     # ---- search ------------------------------------------------------------
     report = {}

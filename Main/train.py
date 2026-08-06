@@ -550,8 +550,21 @@ def train(cfg, train_ds, val_ds, device, seed, ckpt_dir=None, verbose=False):
         # augmentation.n_negatives. The geometry (Eq. (3) clamp + the caps) is
         # resolved and CHECKED once inside the sampler, which raises on any
         # inadmissible combination.
-        trace_of_window = np.asarray(
-            [int(ti) for (ti, _s, _c) in train_ds.index], dtype=int)
+        # [K3] g[i] is the CULTURE of window i. This used to be the local trace
+        # index outright, which silently assumed one trace == one culture. That
+        # assumption is false for sibling subregion traces of a single well, and
+        # under it the miner would happily pair a window with a near-duplicate
+        # from the same recording. The dataset carries its own local-trace ->
+        # culture map (identity unless a grouping was supplied), so the fix is
+        # to compose with it; getattr keeps datasets built by older code or
+        # restored from a checkpoint working.
+        _cult = getattr(train_ds, "cultures", None)
+        if _cult is None:
+            trace_of_window = np.asarray(
+                [int(ti) for (ti, _s, _c) in train_ds.index], dtype=int)
+        else:
+            trace_of_window = np.asarray(
+                [int(_cult[ti]) for (ti, _s, _c) in train_ds.index], dtype=int)
         sampler = ConditionBalancedBatchSampler(
             conditions=conditions,
             per_condition=int(tcfg.windows_per_condition),  # unused in this mode

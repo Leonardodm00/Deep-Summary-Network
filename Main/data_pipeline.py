@@ -194,9 +194,24 @@ class MEAWindowDataset(Dataset):
         stride: int,
         aug_cfg: AugmentationConfig,
         base_seed: int = 0,
+        cultures: Optional[Sequence[int]] = None,
     ):
         if len(traces) != len(conditions):
             raise ValueError("traces and conditions must have equal length.")
+        # [K3] culture id per LOCAL trace. gamma(u) = u (identity) when not
+        # given, i.e. one trace == one culture -- the pre-K3 behaviour, which is
+        # what keeps every existing caller and every existing suite unchanged.
+        # Non-identity values arrive when sibling subregion traces of one well
+        # must be grouped; train.py maps the dataset's local trace index through
+        # this vector to build the sampler's culture array g.
+        if cultures is None:
+            self.cultures = list(range(len(traces)))
+        else:
+            if len(cultures) != len(traces):
+                raise ValueError(
+                    "cultures has %d entries but traces has %d; they must be "
+                    "parallel." % (len(cultures), len(traces)))
+            self.cultures = [int(c) for c in cultures]
         self.traces = [np.ascontiguousarray(t, dtype=np.float32) for t in traces]
         self.window_length = int(window_length)
         self.stride = int(stride)

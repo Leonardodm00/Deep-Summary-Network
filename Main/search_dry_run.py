@@ -428,7 +428,10 @@ def _splits_for(cfg):
     """
     import run_optimization as RO
     traces, conditions, fs = RO.build_traces(cfg)
-    return RO.build_splits(cfg, traces, conditions, fs)
+    # [K3] same grouping the real run uses, so the dry run's reported batch
+    # geometry is the geometry that will actually be trained on.
+    return RO.build_splits(cfg, traces, conditions, fs,
+                           cultures=RO.build_cultures(cfg))
 
 
 def main(argv=None):
