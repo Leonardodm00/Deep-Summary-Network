@@ -1,0 +1,91 @@
+#!/bin/bash
+# =============================================================================
+# run_extractor_array_mea.pbs -- one array task per well, per_region_single
+# =============================================================================
+#
+# Reads extraction_manifest.tsv (one well per line: folder, out_dir, culture)
+# and extraction_flags.sh (the cohort's --fs-raw/--base/... as EXTRA_FLAGS),
+# both written by list_extraction_jobs.py from the SAME config make_mea_specs
+# reads. That is deliberate: this script never invents a path or a flag value
+# itself, so it cannot drift from what the specs generator expects.
+#
+# MODE IS HARDCODED to per_region_single. That is not the mode used for the
+# single ptrain_A3 probe well in REAL_DATA_FINDINGS.md (which used
+# multichannel) -- per_region_single is what K3 culture grouping in this repo
+# consumes: 9 single-channel traces per well, sharing one culture. Do not
+# change this to multichannel unless you are deliberately switching the whole
+# cohort's data.n_channels away from 1.
+#
+# --no-plots is DELIBERATELY NOT passed: both figures (subregion_map.png,
+# subregion_ifrs.png, the latter now with the burst close-up) are wanted for
+# every well, per your standing instruction.
+#
+# SETUP (run ONCE, on the login node, before the first qsub):
+#   cd Main/hpc/MultiChannel
+#   python3 list_extraction_jobs.py --config ../Config/config_mea_joint_full.json
+#   # prints the well count N; size the array to it:
+#   qsub -J 0-$(($(wc -l < extraction_manifest.tsv) - 1)) run_extractor_array_mea.pbs
+#
+# Do NOT rely on the #PBS -J default below -- it is a placeholder. The count
+# depends on your actual cohort (folders x wells found on disk), which this
+# script cannot know until list_extraction_jobs.py has run. Always pass -J
+# explicitly at qsub time as shown above; it overrides the line in this file.
+#
+# CONDA ENV: brian_env, matching the environment already used for the
+# REAL_DATA_FINDINGS probe extraction (scipy.io.loadmat, no torch needed).
+# If that is not the actual env that worked for you, change ENV_NAME below --
+# this is the one placeholder value in this script that could not be
+# discovered from the config, since extraction and the ML environment
+# (meacnn_cpu) are deliberately separate envs.
+#
+# HPC note (hpc-python-compat): pure ASCII, LF only.
+# =============================================================================
+#PBS -N chsub_mea_array
+#PBS -l select=1:ncpus=2:mem=8gb
+#PBS -l walltime=00:30:00
+#PBS -J 0-0
+#PBS -j oe
+#PBS -o chsub_mea_array_^array_index^.log
+
+set -euo pipefail
+
+ENV_NAME="brian_env"          # CONFIRM: adjust if this is not your extraction env
+
+source ~/.bashrc
+conda activate "$ENV_NAME"
+
+# ---- resolve Main/, the same way run_mea_joint_search.pbs does ------------
+cd "${PBS_O_WORKDIR:-$PWD}"
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+
+VIZ_DIR="$MAIN/hpc/MultiChannel"
+MANIFEST="$VIZ_DIR/extraction_manifest.tsv"
+FLAGS_FILE="$VIZ_DIR/extraction_flags.sh"
+
+[ -f "$MANIFEST" ]   || { echo "ABORT: $MANIFEST not found. Run list_extraction_jobs.py first."; exit 2; }
+[ -f "$FLAGS_FILE" ] || { echo "ABORT: $FLAGS_FILE not found. Run list_extraction_jobs.py first."; exit 2; }
+# shellcheck source=/dev/null
+source "$FLAGS_FILE"        # sets EXTRA_FLAGS="..."
+
+LINE=$(sed -n "$((PBS_ARRAY_INDEX + 1))p" "$MANIFEST")
+[ -n "$LINE" ] || { echo "ABORT: manifest has no line for array index $PBS_ARRAY_INDEX (manifest has $(wc -l < "$MANIFEST") line(s))."; exit 2; }
+
+IFS=$'\t' read -r FOLDER OUT_DIR CULTURE <<< "$LINE"
+
+echo "[array $PBS_ARRAY_INDEX] culture = $CULTURE"
+echo "[array $PBS_ARRAY_INDEX] folder  = $FOLDER"
+echo "[array $PBS_ARRAY_INDEX] out_dir = $OUT_DIR"
+echo "[array $PBS_ARRAY_INDEX] flags   = $EXTRA_FLAGS"
+
+[ -d "$FOLDER" ] || { echo "ABORT: folder does not exist: $FOLDER"; exit 2; }
+mkdir -p "$OUT_DIR"
+
+# EXTRA_FLAGS is an intentionally unquoted word-split (it is several distinct
+# CLI flags built by list_extraction_jobs.py, not one string with spaces in a
+# single value).
+python3 "$VIZ_DIR/run_channel_subset_extraction.py" "$FOLDER" \
+    --out-dir "$OUT_DIR" --mode per_region_single $EXTRA_FLAGS
+
+echo "[array $PBS_ARRAY_INDEX] done -> $OUT_DIR"
