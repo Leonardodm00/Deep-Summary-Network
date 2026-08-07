@@ -135,8 +135,16 @@ def plot_subregion_map(diag, out_path: str, title: Optional[str] = None,
 
 def plot_subregion_ifrs(traces, fs_ifr: float, out_path: str,
                         centers: Optional[Sequence[int]] = None,
-                        title: Optional[str] = None, dpi: int = 130) -> str:
+                        title: Optional[str] = None, dpi: int = 130,
+                        zoom_s: Optional[float] = 2.0,
+                        zoom_ref_channel: Optional[int] = None,
+                        zoom_center_s: Optional[float] = None) -> str:
     """Stack per-subregion IFR traces, one panel per channel.
+
+    With `zoom_s` set (the default), each row gains a second panel: a close-up
+    of one network burst, so the shape of the event and the participation of
+    each subregion in it are visible at all. At 1200 s per recording the
+    full-trace panel compresses a ~0.5 s burst into well under a pixel.
 
     Parameters
     ----------
@@ -149,10 +157,30 @@ def plot_subregion_ifrs(traces, fs_ifr: float, out_path: str,
         Centre electrode index per channel (annotated in the panel labels).
     title : str, optional
     dpi : int
+    zoom_s : float or None
+        TOTAL width [s] of the close-up window, centred on the burst. None
+        disables the close-up and restores the single-column figure exactly.
+        Ignored (with the full trace still drawn) if the window would cover the
+        whole recording.
+    zoom_ref_channel : int or None
+        Which channel's IFR locates the burst. None (default) uses the MEAN
+        across channels, which is the right reference for a NETWORK burst: the
+        event is defined by subregions rising together, and a single channel's
+        argmax may sit on a local, non-network transient. Pass an index to
+        centre on one subregion's own maximum instead.
+    zoom_center_s : float or None
+        Centre the window at this time [s] instead of at the detected peak.
+        Use it to inspect a specific burst rather than the largest one.
 
     Returns
     -------
     out_path : str
+
+    Notes
+    -----
+    The same window is used for EVERY channel: a network burst is one event, so
+    a shared window is what makes the panels comparable. Per-channel windows
+    would put nine different moments side by side.
     """
     if isinstance(traces, np.ndarray):
         arr = traces if traces.ndim == 2 else traces[None, :]
@@ -161,17 +189,63 @@ def plot_subregion_ifrs(traces, fs_ifr: float, out_path: str,
     n_ch, K = arr.shape
     t = np.arange(K, dtype=np.float64) / float(fs_ifr)
 
-    fig, axes = plt.subplots(n_ch, 1, figsize=(9.0, 1.35 * n_ch + 0.6),
-                             sharex=True, squeeze=False)
-    axes = axes[:, 0]
+    # ---- locate the burst window -------------------------------------------
+    i0 = i1 = None
+    if zoom_s is not None and float(zoom_s) > 0.0:
+        w = max(1, int(round(float(zoom_s) * float(fs_ifr))))
+        if w < K:                       # a window covering everything is no zoom
+            if zoom_center_s is not None:
+                i_c = int(round(float(zoom_center_s) * float(fs_ifr)))
+            elif zoom_ref_channel is not None:
+                i_c = int(np.argmax(arr[int(zoom_ref_channel)]))
+            else:
+                i_c = int(np.argmax(arr.mean(axis=0)))
+            i_c = int(np.clip(i_c, 0, K - 1))
+            # centre the window, then SHIFT (not truncate) at the edges so the
+            # close-up keeps its requested width wherever the peak lands
+            i0 = i_c - w // 2
+            if i0 < 0:
+                i0 = 0
+            elif i0 + w > K:
+                i0 = K - w
+            i1 = i0 + w
+
+    zoomed = i0 is not None
+    n_col = 2 if zoomed else 1
+    fig, axes = plt.subplots(n_ch, n_col,
+                             figsize=(9.0 if not zoomed else 13.0,
+                                      1.35 * n_ch + 0.6),
+                             sharex="col", sharey="row", squeeze=False)
+
     for ch in range(n_ch):
-        axes[ch].plot(t, arr[ch], lw=0.7, color="C%d" % (ch % 10))
+        ax_full = axes[ch, 0]
+        ax_full.plot(t, arr[ch], lw=0.7, color="C%d" % (ch % 10))
         lbl = "ch %d" % ch
         if centers is not None and ch < len(centers):
             lbl += "\n(c=%d)" % int(centers[ch])
-        axes[ch].set_ylabel(lbl, fontsize=8)
-        axes[ch].margins(x=0)
-    axes[-1].set_xlabel("time [s]")
+        ax_full.set_ylabel(lbl, fontsize=8)
+        ax_full.margins(x=0)
+
+        if zoomed:
+            # Mark where the close-up came from. The span alone is not enough:
+            # 2 s inside 1200 s is ~2 px, so it reads as nothing. The line is
+            # always visible; the span becomes meaningful for wide windows.
+            ax_full.axvspan(t[i0], t[i1 - 1], color="0.6", alpha=0.35, lw=0)
+            ax_full.axvline(t[i0] + 0.5 * (t[i1 - 1] - t[i0]),
+                            color="0.25", lw=0.8, ls="--", alpha=0.9)
+            ax_zoom = axes[ch, 1]
+            ax_zoom.plot(t[i0:i1], arr[ch, i0:i1], lw=0.9,
+                         color="C%d" % (ch % 10))
+            ax_zoom.margins(x=0)
+
+    axes[-1, 0].set_xlabel("time [s]")
+    if zoomed:
+        axes[-1, 1].set_xlabel("time [s]")
+        axes[0, 0].set_title("full recording", fontsize=9)
+        axes[0, 1].set_title("burst close-up  (%.3g s window @ %.2f s)"
+                             % (float(zoom_s), t[i0] + 0.5 * (t[i1 - 1] - t[i0])),
+                             fontsize=9)
+
     fig.suptitle(title or ("Per-subregion IFR  (C=%d, fs_ifr=%.1f Hz)" % (n_ch, fs_ifr)))
     fig.tight_layout()
     fig.savefig(out_path, dpi=dpi)
