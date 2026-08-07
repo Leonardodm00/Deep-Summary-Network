@@ -47,18 +47,57 @@
 #PBS -j oe
 #PBS -o chsub_mea_array_^array_index^.log
 
-set -euo pipefail
+set -eo pipefail
 
 ENV_NAME="brian_env"          # CONFIRM: adjust if this is not your extraction env
+# Known-good fallback for davinci-1 specifically (from `conda env list`'s own
+# "base" row) -- used only if neither an already-loaded conda nor a module
+# load gets us there. The module name varies by site; this path does not.
+KNOWN_CONDA_BASE="/archive/apps/miniconda/miniconda3/py312_2"
 
-source ~/.bashrc
-conda activate "$ENV_NAME"
-
-# ---- resolve Main/, the same way run_mea_joint_search.pbs does ------------
+if ! command -v conda >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
+    module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+if ! command -v conda >/dev/null 2>&1 && [ -f "$KNOWN_CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$KNOWN_CONDA_BASE/etc/profile.d/conda.sh"
+fi
+if ! command -v conda >/dev/null 2>&1; then
+    echo "ABORT: conda not found on PATH, module load did not provide it, and"
+    echo "       $KNOWN_CONDA_BASE does not exist either."
+    echo "       Run 'module avail' on the login node to find the right module,"
+    echo "       or hardcode its conda.sh path above."
+    exit 2
+fi
+# Source conda's OWN profile.d hook directly rather than ~/.bashrc: many
+# systems guard interactive-only setup at the top of .bashrc (e.g.
+# `[[ $- != *i* ]] && return`), which silently no-ops for a PBS batch shell --
+# exactly the failure mode this replaces.
+# shellcheck disable=SC1091
+source "$(conda info --base)/etc/profile.d/conda.sh"
+if ! conda activate "$ENV_NAME"; then
+    echo "ABORT: conda found, but 'conda activate $ENV_NAME' failed."
+    echo "       conda env list:"
+    conda env list | sed 's/^/         /'
+    exit 2
+fi
+set -u
+# ---- resolve Main/. Three submission points are all real workflows here:
+#   repo root            (matches run_mea_joint_search.pbs's convention)
+#   Main/                (same)
+#   Main/hpc/MultiChannel (this script's OWN documented SETUP above: you cd
+#                          here to run list_extraction_jobs.py, so qsub is
+#                          naturally invoked from the same directory) --------
 cd "${PBS_O_WORKDIR:-$PWD}"
 if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
 elif [ -f "config.py" ];      then MAIN="$PWD"
-else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+elif [ -f "../../config.py" ] && [ "$(basename "$PWD")" = "MultiChannel" ]; then
+    MAIN="$(cd ../.. && pwd)"
+else
+    echo "ABORT: run from the repo root, from Main/, or from Main/hpc/MultiChannel"
+    echo "       (PBS_O_WORKDIR=${PBS_O_WORKDIR:-<unset>}, PWD=$PWD)"
+    exit 2
+fi
 
 VIZ_DIR="$MAIN/hpc/MultiChannel"
 MANIFEST="$VIZ_DIR/extraction_manifest.tsv"

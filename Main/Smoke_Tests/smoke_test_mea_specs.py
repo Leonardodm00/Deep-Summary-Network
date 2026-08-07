@@ -72,11 +72,15 @@ def build_fixture(base, mode="per_region_single", skip_wells=(),
             rn = "plate_%s_%d" % (CLASS_NAMES[c][:4], p)
             root = os.path.join(raw, rn)
             roots[str(c)].append(root)
+            # [root_name_for] the SAME function build_records() calls, so this
+            # fixture cannot silently diverge from where production code
+            # actually looks the moment that function's convention changes.
+            layout_rn = MMS.root_name_for(root)
             for w in WELLS:
                 os.makedirs(os.path.join(root, w), exist_ok=True)
                 if (rn, w) in skip_wells:
                     continue           # raw well exists, extraction output not
-                od = os.path.join(ext, CLASS_NAMES[c], rn, w)
+                od = os.path.join(ext, CLASS_NAMES[c], layout_rn, w)
                 os.makedirs(od, exist_ok=True)
                 this = "multichannel" if (rn, w) == mixed_well else mode
                 if this == "per_region_single":

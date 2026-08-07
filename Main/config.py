@@ -1316,6 +1316,7 @@ class CohortConfig:
     index_base: int = 0
     mfr_threshold: float = 0.1
     w_size: float = 0.02
+    gaussian_window: float = 0.04
 
     def __post_init__(self):
         if not self.class_roots:
@@ -1390,6 +1391,24 @@ class CohortConfig:
             raise ValueError("CohortConfig.mfr_threshold must be >= 0")
         if float(self.w_size) <= 0.0:
             raise ValueError("CohortConfig.w_size must be > 0")
+        if float(self.gaussian_window) < 0.0:
+            raise ValueError("CohortConfig.gaussian_window must be >= 0 "
+                             "(0 disables smoothing)")
+        # sigma is in SECONDS but the filter runs on BINS, so the effective
+        # smoothing is sigma/w_size bins. Below ~1 bin the Gaussian is
+        # narrower than the sampling grid and does essentially nothing --
+        # easy to cause accidentally by shrinking w_size and leaving sigma
+        # alone, or vice versa, since the two are set independently.
+        if float(self.gaussian_window) > 0.0:
+            sigma_bins = float(self.gaussian_window) / float(self.w_size)
+            if sigma_bins < 1.0:
+                warnings.warn(
+                    "CohortConfig: gaussian_window=%.4g s is only %.2f bin(s) "
+                    "at w_size=%.4g s, so smoothing is close to a no-op. "
+                    "sigma is specified in seconds and applied over bins; if "
+                    "you changed one, check the other."
+                    % (float(self.gaussian_window), sigma_bins,
+                       float(self.w_size)), RuntimeWarning)
 
     # ----- convenience, used by make_mea_specs.py -----
     def n_classes(self):
@@ -1404,6 +1423,25 @@ class CohortConfig:
     def fs_ifr(self):
         """IFR rate implied by the smoothing window: f_s^IFR = 1 / w_size."""
         return 1.0 / float(self.w_size)
+
+    def sigma_bins(self):
+        """Effective Gaussian smoothing width in BINS: sigma / w_size.
+
+        The two IFR knobs are easy to confuse, so stating them apart:
+
+          w_size          the DOWNSAMPLING BIN, Delta_t [s]. Sets the output
+                          rate, f_s^IFR = 1 / w_size, and hence K and the
+                          window length in samples (T = window_s * f_s^IFR).
+          gaussian_window sigma of the gaussian_filter1d applied AFTER
+                          binning [s]. Does not change the rate, only how
+                          much the binned counts are smoothed.
+
+        They interact because sigma is given in seconds but the filter runs
+        over bins: halving w_size doubles the smoothing measured in bins
+        while leaving sigma nominally unchanged. This is the number to look
+        at when deciding whether a change to either knob did what you meant.
+        """
+        return float(self.gaussian_window) / float(self.w_size)
 
 
 @dataclass

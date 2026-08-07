@@ -50,12 +50,36 @@ NCPUS=48                     # MUST match '#PBS -l select=' above
 
 # ---- environment -----------------------------------------------------
 CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"
-if command -v module >/dev/null 2>&1; then
+# Known-good fallback for davinci-1 specifically (from `conda env list`'s own
+# "base" row) -- used only if neither an already-loaded conda nor a module
+# load gets us there. The module name varies by site; this path does not.
+KNOWN_CONDA_BASE="/archive/apps/miniconda/miniconda3/py312_2"
+
+if ! command -v conda >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
     module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
 fi
-if command -v conda >/dev/null 2>&1; then
-    eval "$(conda shell.bash hook)"
-    conda activate "$CONDA_ENV" || echo "WARN: could not activate $CONDA_ENV"
+if ! command -v conda >/dev/null 2>&1 && [ -f "$KNOWN_CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$KNOWN_CONDA_BASE/etc/profile.d/conda.sh"
+fi
+if ! command -v conda >/dev/null 2>&1; then
+    echo "ABORT: conda not found on PATH, module load did not provide it, and"
+    echo "       $KNOWN_CONDA_BASE does not exist either."
+    echo "       Run 'module avail' on the login node to find the right module,"
+    echo "       or hardcode its conda.sh path above."
+    exit 2
+fi
+# Source conda's OWN profile.d hook directly rather than ~/.bashrc: many
+# systems guard interactive-only setup at the top of .bashrc (e.g.
+# `[[ $- != *i* ]] && return`), which silently no-ops for a PBS batch shell.
+# This bypasses that guard entirely, matching hpc/setup_env_davinci.sh.
+# shellcheck disable=SC1091
+source "$(conda info --base)/etc/profile.d/conda.sh"
+if ! conda activate "$CONDA_ENV"; then
+    echo "ABORT: conda found, but 'conda activate $CONDA_ENV' failed."
+    echo "       conda env list:"
+    conda env list | sed 's/^/         /'
+    exit 2
 fi
 
 export OMP_NUM_THREADS="$NCPUS"

@@ -80,6 +80,34 @@ MULTICHANNEL_NAME = "traces.npz"
 # --------------------------------------------------------------------------- #
 # discovery
 # --------------------------------------------------------------------------- #
+def root_name_for(root):
+    """The {root_name} value substituted into extract_layout/culture_template.
+
+    THE single place this is computed -- both build_records() below and
+    list_extraction_jobs.py's manifest builder call this, so the two can
+    never disagree about a well's culture id or output path.
+
+    Two path COMPONENTS (parent + leaf), not one. A bare basename collides
+    the moment two batches reuse a leaf name -- e.g. a "SubBatch1" folder
+    that exists under both a control batch and a pathological batch is a
+    real, observed layout, not a hypothetical: DATA_C/Batch4/SubBatch1 and
+    DATA_P/Batch3/SubBatch1 are two different cultures that a bare basename
+    would fold into one, silently pointing both wells' extraction at the
+    same output directory.
+
+    This is a best-effort disambiguator, not a uniqueness proof: two roots
+    that ALSO share their parent's name would still collide. That is exactly
+    why the collision check at the call site (build_records here;
+    list_extraction_jobs.py's own check) is a hard abort rather than a
+    warning -- silent data loss is not an acceptable failure mode for either
+    caller, so an unresolved collision must stop the run, not print past it.
+    """
+    root = os.path.normpath(str(root))
+    leaf = os.path.basename(root)
+    parent = os.path.basename(os.path.dirname(root))
+    return "%s_%s" % (parent, leaf) if parent else leaf
+
+
 def find_wells(root, well_glob):
     """Immediate child directories of `root` matching `well_glob`, sorted.
 
@@ -141,7 +169,7 @@ def build_records(cohort, verbose=True):
 
         for root in roots:
             root = str(root)
-            root_name = os.path.basename(os.path.normpath(root))
+            root_name = root_name_for(root)
             wells = find_wells(root, cohort.well_glob)
 
             if wells is None:
@@ -342,6 +370,9 @@ def main(argv=None):
     t_win = float(cfg.data.window_s)
     print("  f_s^IFR = 1/w_size = %.6g Hz -> window T = %.6g * %.6g = %d samples"
           % (fs_ifr, t_win, fs_ifr, int(round(t_win * fs_ifr))))
+    print("  smoothing sigma = %.6g s = %.2f bin(s) at w_size = %.6g s"
+          % (float(cohort.gaussian_window), cohort.sigma_bins(),
+             float(cohort.w_size)))
 
     if args.strict and (report["missing_output"] or report["missing_roots"]
                         or report["empty_roots"]):

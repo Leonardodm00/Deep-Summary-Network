@@ -92,7 +92,7 @@ def main(argv=None):
         cname = cohort.name_of_class(c)
         for root in cohort.class_roots[str(c)]:
             root = str(root)
-            root_name = os.path.basename(os.path.normpath(root))
+            root_name = MMS.root_name_for(root)
             wells = MMS.find_wells(root, cohort.well_glob)
             if wells is None:
                 missing_roots.append(root)
@@ -118,6 +118,32 @@ def main(argv=None):
               "well_glob in the config.")
         return 1
 
+    n_uniq_culture = len(set(c for _f, _o, c in rows))
+    if n_uniq_culture != len(rows):
+        # A collision here means at least two wells share BOTH culture id and
+        # out_dir (both come from the same root_name). Writing the manifest
+        # anyway would let extraction quietly overwrite one well's output
+        # with another well's -- data loss with no error message anywhere.
+        # This must stop the run, not warn past it.
+        seen, dupes = {}, {}
+        for folder, out_dir, culture in rows:
+            seen.setdefault(culture, []).append(folder)
+        for culture, folders in seen.items():
+            if len(folders) > 1:
+                dupes[culture] = folders
+        print("ABORT: %d well(s) but only %d distinct culture id(s) -- "
+              "culture_template collides for these:" % (len(rows), n_uniq_culture))
+        for culture, folders in dupes.items():
+            print("  %s" % culture)
+            for f in folders:
+                print("    %s" % f)
+        print("No manifest written. root_name_for() already disambiguates by "
+              "parent+leaf, not leaf alone; a collision surviving that means "
+              "two wells share BOTH their parent AND leaf directory names. "
+              "Fix the colliding paths, or tell me the exact folders above "
+              "and I will extend the disambiguator.")
+        return 1
+
     parent = os.path.dirname(os.path.abspath(args.out_manifest))
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -130,10 +156,11 @@ def main(argv=None):
         "# re-run the generator if cohort.* changes in the config.\n"
         "EXTRA_FLAGS=\"--fs-raw %.10g --base %d --grid-width %d "
         "--n-subsets %d --electrodes-per-subset %d "
-        "--mfr-threshold %.10g --w-size %.10g\"\n"
+        "--mfr-threshold %.10g --w-size %.10g --gaussian-window %.10g\"\n"
         % (float(cohort.fs_raw), int(cohort.index_base), int(cohort.grid_width),
            int(cohort.n_subsets), int(cohort.electrodes_per_subset),
-           float(cohort.mfr_threshold), float(cohort.w_size))
+           float(cohort.mfr_threshold), float(cohort.w_size),
+           float(cohort.gaussian_window))
     )
     parent = os.path.dirname(os.path.abspath(args.out_flags))
     if parent:
@@ -141,15 +168,9 @@ def main(argv=None):
     with open(args.out_flags, "w", encoding="ascii", newline="\n") as fh:
         fh.write(flags)
 
-    n_uniq_culture = len(set(c for _f, _o, c in rows))
     print("")
     print("wrote %d well(s) -> %s" % (len(rows), args.out_manifest))
     print("wrote extraction flags -> %s" % args.out_flags)
-    if n_uniq_culture != len(rows):
-        print("WARNING: %d well(s) but only %d distinct culture id(s) -- "
-              "culture_template is not unique per well; check it before "
-              "extracting, or two wells' outputs will collide."
-              % (len(rows), n_uniq_culture))
     print("")
     print("size the PBS array to this count, e.g.:")
     print("  qsub -J 0-%d run_extractor_array_mea.pbs" % (len(rows) - 1))
