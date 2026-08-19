@@ -1,0 +1,113 @@
+#!/bin/bash
+#PBS -N dsn_embed
+#PBS -l select=1:ncpus=8
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+# ======================================================================
+# run_plot_embeddings.pbs -- embedding figures from trained checkpoints
+# ======================================================================
+#
+# USAGE
+#   qsub -v RUNDIR=out/refit_lane0_top1,OUT=$HOME/emb_lane0_top1 \
+#        -o dsn_embed.out hpc/run_plot_embeddings.pbs
+#
+#   RUNDIR  directory to search for checkpoints        (required)
+#   OUT     output directory for the figures           (required)
+#   TOOLS   directory holding plot_embeddings.py etc.  (default $HOME/dsn_tools)
+#   SPLITS  comma-separated subset of train,val,test   (default all three)
+#
+# THIS IS NOT A TRAINING JOB. Embedding is forward-pass only: no optimizer,
+# no augmentation, no metric-learning loss. 8 cpus and 2 hours are generous.
+# What it does need is the trace cache (runtime.cache_dir) that the search
+# already built, which it reads rather than regenerating.
+#
+# IF THERE ARE NO CHECKPOINTS YET, this job exits 2 and prints the recipe.
+# The search writes checkpoints only during the FINAL training, so a lane
+# killed at the walltime has trials.jsonl and no checkpoints/.
+#
+# Pure ASCII, LF only (hpc-python-compat).
+# ======================================================================
+
+set -uo pipefail
+
+cd "${PBS_O_WORKDIR:-$PWD}"
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+cd "$MAIN"
+export PYTHONPATH="$MAIN"
+
+RUNDIR="${RUNDIR:-}"
+OUT="${OUT:-}"
+TOOLS="${TOOLS:-$HOME/dsn_tools}"
+SPLITS="${SPLITS:-train,val,test}"
+NCPUS=8
+
+if [ -z "$RUNDIR" ] || [ -z "$OUT" ]; then
+    echo "ABORT: set RUNDIR and OUT, e.g."
+    echo "  qsub -v RUNDIR=out/refit_lane0_top1,OUT=\$HOME/emb_lane0_top1 \\"
+    echo "       hpc/run_plot_embeddings.pbs"
+    exit 2
+fi
+if [ ! -d "$RUNDIR" ]; then echo "ABORT: no such run dir: $RUNDIR"; exit 2; fi
+if [ ! -f "$TOOLS/plot_embeddings.py" ]; then
+    echo "ABORT: plot_embeddings.py not found in TOOLS=$TOOLS"
+    echo "       untar dsn_report_tools.tar.gz there first."
+    exit 2
+fi
+
+# ---- environment -----------------------------------------------------
+# conda's activate/deactivate hooks read unset variables (e.g.
+# _CONDA_SET_GEOTIFF_CSV in base's geotiff-deactivate.sh). Under 'set -u'
+# that is a FATAL expansion error which kills the job before it starts,
+# and '|| echo' does NOT catch it. Disable -u for the conda block only.
+CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"
+set +u
+if command -v module >/dev/null 2>&1; then
+    module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV" || echo "WARN: could not activate $CONDA_ENV"
+fi
+set -u
+
+export OMP_NUM_THREADS="$NCPUS"
+export MKL_NUM_THREADS="$NCPUS"
+export OPENBLAS_NUM_THREADS="$NCPUS"
+export NUMEXPR_NUM_THREADS="$NCPUS"
+export MPLBACKEND=Agg
+
+python3 -c "import torch, sklearn, matplotlib, pandas" || {
+    echo "ABORT: dependencies not importable in env '$CONDA_ENV'."; exit 2; }
+
+# ---- list what will be used, before loading any data -----------------
+echo "======================================================================"
+echo "main dir  : $MAIN"
+echo "run dir   : $RUNDIR"
+echo "out dir   : $OUT"
+echo "splits    : $SPLITS"
+echo "started   : $(date)"
+echo "======================================================================"
+
+python3 "$TOOLS/plot_embeddings.py" \
+    --main-dir "$MAIN" --discover "$RUNDIR" --dry-run || exit $?
+
+# ---- the real run ----------------------------------------------------
+python3 "$TOOLS/plot_embeddings.py" \
+    --main-dir "$MAIN" \
+    --discover "$RUNDIR" \
+    --out "$OUT" \
+    --splits "$SPLITS" \
+    --device cpu
+RC=$?
+
+echo "======================================================================"
+echo "finished  : $(date)   exit=$RC"
+if [ -f "$OUT/EMBEDDING_SUMMARY.csv" ]; then
+    echo "summary:"
+    cat "$OUT/EMBEDDING_SUMMARY.csv"
+fi
+echo "======================================================================"
+exit $RC

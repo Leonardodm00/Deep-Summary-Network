@@ -46,3 +46,5 @@
 # declaring them explicitly does not rely on that heuristic.
 *.pbs    text eol=lf
 *.slurm  text eol=lf
+*.sh     text eol=lf
+*.pbs    text eol=lf
