@@ -1,0 +1,88 @@
+#!/bin/bash
+#PBS -N dsn_traces
+#PBS -l select=1:ncpus=4
+#PBS -l walltime=00:30:00
+#PBS -j oe
+
+# ======================================================================
+# run_plot_traces.pbs -- figures of the SYNTHETIC input traces
+# ======================================================================
+#
+#   qsub -v CFG=hpc/Config/config_l3c_joint_full_lane0.json,OUT=$HOME/trace_figs \
+#        -o dsn_traces.out hpc/run_plot_traces.pbs
+#
+#   CFG     any config with data.data_mode = latent   (required)
+#   OUT     output directory                          (required)
+#   TOOLS   dir holding plot_traces.py                (default: analysis)
+#   NPC     cultures synthesised per class            (default 5)
+#
+# NO TRAINING, NO CHECKPOINT. This only needs the config's data block, so it
+# works before any model exists. 4 cpus / 30 min is generous; it is cheap
+# enough to run interactively on a login node if the queue is busy:
+#
+#   python3 analysis/plot_traces.py --main-dir "$PWD" \
+#       --config hpc/Config/config_l3c_joint_full_lane0.json --out ~/trace_figs
+#
+# Pure ASCII, LF only (hpc-python-compat).
+# ======================================================================
+
+set -uo pipefail
+
+cd "${PBS_O_WORKDIR:-$PWD}"
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+cd "$MAIN"
+export PYTHONPATH="$MAIN"
+
+CFG="${CFG:-}"
+OUT="${OUT:-}"
+TOOLS="${TOOLS:-analysis}"
+NPC="${NPC:-5}"
+
+if [ -z "$CFG" ] || [ -z "$OUT" ]; then
+    echo "ABORT: set CFG and OUT, e.g."
+    echo "  qsub -v CFG=hpc/Config/config_l3c_joint_full_lane0.json,OUT=\$HOME/trace_figs \\"
+    echo "       hpc/run_plot_traces.pbs"
+    exit 2
+fi
+if [ ! -f "$CFG" ]; then echo "ABORT: config not found: $CFG"; exit 2; fi
+if [ ! -f "$TOOLS/plot_traces.py" ]; then
+    echo "ABORT: plot_traces.py not found in TOOLS=$TOOLS"; exit 2; fi
+
+# conda's activate/deactivate hooks read unset variables; under 'set -u' that
+# is FATAL and kills the job before it starts. Disable -u for this block only.
+CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"
+set +u
+if command -v module >/dev/null 2>&1; then
+    module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV" || echo "WARN: could not activate $CONDA_ENV"
+fi
+set -u
+
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export MPLBACKEND=Agg
+
+python3 -c "import numpy, scipy, matplotlib" || {
+    echo "ABORT: dependencies not importable in env '$CONDA_ENV'."; exit 2; }
+
+echo "======================================================================"
+echo "config  : $CFG"
+echo "out     : $OUT"
+echo "per cls : $NPC"
+echo "started : $(date)"
+echo "======================================================================"
+
+python3 "$TOOLS/plot_traces.py" \
+    --main-dir "$MAIN" --config "$CFG" --out "$OUT" --n-per-class "$NPC"
+RC=$?
+
+echo "======================================================================"
+echo "finished: $(date)   exit=$RC"
+[ -d "$OUT" ] && ls -1 "$OUT"
+echo "======================================================================"
+exit $RC

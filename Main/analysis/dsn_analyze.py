@@ -69,8 +69,16 @@ def objective_vs_ari(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------ lane summary ---
-def lane_summary(df: pd.DataFrame, states: dict) -> pd.DataFrame:
-    """Eq. (1), Eq. (6), Eq. (7) per lane, plus resume status and timing."""
+def lane_summary(df: pd.DataFrame, states: dict, e_max: int = E_MAX,
+                 n_calls: int = N_CALLS) -> pd.DataFrame:
+    """Eq. (1), Eq. (6), Eq. (7) per lane, plus resume status and timing.
+
+    e_max and n_calls are PARAMETERS, not module constants, because they differ
+    between studies (the synthetic l3c study and the MEA study do not share
+    train.max_epochs). The caller reads them from the study's own
+    config_input.json; defaulting to the module constants silently mis-scales
+    eta_bar and mis-reports `completed` on any study that differs.
+    """
     rows = []
     for lane, g in df.groupby("lane"):
         st = states.get(lane, {})
@@ -80,10 +88,24 @@ def lane_summary(df: pd.DataFrame, states: dict) -> pd.DataFrame:
         idx = g["trial"].to_numpy()
         contiguous = bool(np.array_equal(idx, np.arange(idx.min(), idx.max() + 1)))
         wall = g["wall_elapsed_s"].to_numpy()
+        # wall_elapsed_s restarts near 0 every time a TrialWriter opens, i.e.
+        # at every resume. A blind diff() across that boundary yields one large
+        # NEGATIVE step that cancels the real ones and drives the mean to ~0.
+        # A negative step MARKS a segment boundary, and the trial at that
+        # boundary took its OWN wall value (the clock restarted at zero), so
+        # the step is SUBSTITUTED there rather than dropped -- dropping it
+        # would silently lose the first trial of every segment after the first.
+        steps = np.diff(np.r_[0.0, wall])
+        boundaries = np.flatnonzero(steps < 0)
+        steps[boundaries] = wall[boundaries]
+        seg_ends = list(boundaries - 1) + [len(wall) - 1]
+        wall_total_h = float(sum(wall[i] for i in seg_ends if i >= 0)) / 3600.0
+        mean_h_per_trial = float(steps.mean()) / 3600.0 if steps.size else float("nan")
+        n_segments = 1 + int(boundaries.size)
         rows.append({
             "lane": lane,
             "k_j": k,
-            "completed": k >= N_CALLS,
+            "completed": k >= n_calls,
             "trial_offset": st.get("trial_offset"),
             "n_trials_total(state)": st.get("n_trials_total"),
             "n_this_segment(state)": st.get("n_trials_this_segment"),
@@ -94,12 +116,13 @@ def lane_summary(df: pd.DataFrame, states: dict) -> pd.DataFrame:
             "best_obj(state)": st.get("best_objective"),
             "best_trial(state)": st.get("best_trial"),
             "best_cell(state)": st.get("best_cell"),
-            "eta_bar": float(ok["sel_epoch"].mean() / E_MAX),
+            "eta_bar": float(ok["sel_epoch"].mean() / e_max),
             "mean_sel_epoch": float(ok["sel_epoch"].mean()),
             "median_sel_epoch": float(ok["sel_epoch"].median()),
-            "frac_at_E_max": float((ok["sel_epoch"] >= E_MAX).mean()),
-            "wall_total_h": float(wall.max() / 3600.0),
-            "mean_h_per_trial": float(np.diff(np.r_[0.0, wall]).mean() / 3600.0),
+            "frac_at_E_max": float((ok["sel_epoch"] >= e_max).mean()),
+            "n_segments": n_segments,
+            "wall_total_h": wall_total_h,
+            "mean_h_per_trial": mean_h_per_trial,
             "projected_frac": float(g["projected"].astype(bool).mean()),
         })
     return pd.DataFrame(rows)

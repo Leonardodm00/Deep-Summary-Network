@@ -1,0 +1,206 @@
+#!/bin/bash
+#PBS -N dsn_pipeline
+#PBS -l select=1:ncpus=48
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+# ======================================================================
+# run_full_pipeline.pbs -- interim report -> re-fit the best -> embeddings
+# ======================================================================
+#
+#   qsub -v EXP=mea_joint_full,OUT=$HOME/mea_pipeline \
+#        -o dsn_pipeline_mea.out hpc/run_full_pipeline.pbs
+#
+#   EXP     lane-name prefix, e.g. mea_joint_full        (required)
+#   OUT     output root for everything this job writes   (required)
+#   PICK    objective | agreed                           (default agreed)
+#   SEEDS   train.n_seeds for the re-fit                 (default 1)
+#   TOOLS   dir holding the analysis scripts             (default analysis)
+#   RUNROOT where the lane dirs live                     (default out)
+#
+# THREE STAGES, in one job so there is no dependency juggling:
+#   1. make_report.py      the interim analysis + 8 figures + 14 tables
+#   2. run_optimization.py --skip-search   re-fit the chosen configuration
+#   3. plot_embeddings.py  E1-E6 embedding figures from the new checkpoint
+#
+# Stage 1 is minutes. Stage 2 dominates (one training per seed). Stage 3 is
+# minutes. If stage 2 is killed by walltime, stages 1 and 3's inputs survive:
+# re-running with the same OUT skips nothing but costs only stage 2 again.
+#
+# PICK=agreed (default) takes the candidate that ranks well on BOTH the pooled
+# and the random-design-only cell views. PICK=objective takes the raw argmin.
+# They can disagree: the GP over-samples cells that already look good, so the
+# raw argmin may sit in an over-sampled cell. See BEST.json's own note.
+#
+# Pure ASCII, LF only (hpc-python-compat).
+# ======================================================================
+
+set -uo pipefail
+
+cd "${PBS_O_WORKDIR:-$PWD}"
+if   [ -f "Main/config.py" ]; then MAIN="$PWD/Main"
+elif [ -f "config.py" ];      then MAIN="$PWD"
+else echo "ABORT: run from the repo root or from Main/"; exit 2; fi
+cd "$MAIN"
+export PYTHONPATH="$MAIN"
+
+EXP="${EXP:-}"
+OUT="${OUT:-}"
+PICK="${PICK:-agreed}"
+SEEDS="${SEEDS:-1}"
+TOOLS="${TOOLS:-analysis}"
+RUNROOT="${RUNROOT:-out}"
+
+if [ -z "$EXP" ] || [ -z "$OUT" ]; then
+    echo "ABORT: set EXP and OUT, e.g."
+    echo "  qsub -v EXP=mea_joint_full,OUT=\$HOME/mea_pipeline hpc/run_full_pipeline.pbs"
+    exit 2
+fi
+case "$PICK" in objective|agreed) ;; *)
+    echo "ABORT: PICK must be 'objective' or 'agreed', got '$PICK'"; exit 2 ;;
+esac
+if [ ! -f "$TOOLS/make_report.py" ]; then
+    echo "ABORT: make_report.py not found in TOOLS=$TOOLS"; exit 2; fi
+if [ ! -d "$RUNROOT" ]; then echo "ABORT: no such run root: $RUNROOT"; exit 2; fi
+
+# conda's activate/deactivate hooks read unset variables; under 'set -u' that
+# is a FATAL expansion error that kills the job before it starts, and
+# '|| echo' does NOT catch it. Disable -u across the conda block only.
+CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"
+set +u
+if command -v module >/dev/null 2>&1; then
+    module load miniconda3 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV" || echo "WARN: could not activate $CONDA_ENV"
+fi
+set -u
+
+export OMP_NUM_THREADS=48
+export MKL_NUM_THREADS=48
+export OPENBLAS_NUM_THREADS=48
+export NUMEXPR_NUM_THREADS=48
+export MPLBACKEND=Agg
+
+python3 -c "import torch, pytorch_metric_learning, skopt, sklearn, matplotlib, pandas" || {
+    echo "ABORT: dependencies not importable in env '$CONDA_ENV'."; exit 2; }
+
+mkdir -p "$OUT"
+REPORT="$OUT/report"
+REFIT_TAG="refit_${EXP}_${PICK}"
+REFIT_CFG="hpc/Config/${REFIT_TAG}.json"
+
+echo "======================================================================"
+echo "experiment : $EXP"
+echo "run root   : $RUNROOT"
+echo "output     : $OUT"
+echo "pick rule  : $PICK      n_seeds: $SEEDS"
+echo "started    : $(date)"
+echo "======================================================================"
+
+# ---- STAGE 1: interim report ----------------------------------------
+echo; echo "### STAGE 1/3  interim report"
+python3 "$TOOLS/make_report.py" \
+    --run-root "$RUNROOT" --experiment "$EXP" \
+    --out "$REPORT" --snapshot || {
+    echo "ABORT: stage 1 failed"; exit 3; }
+
+# ---- pick the candidate and build its config ------------------------
+echo; echo "### building the re-fit config from BEST.json (rule: $PICK)"
+python3 - "$REPORT/BEST.json" "$RUNROOT" "$EXP" "$PICK" "$SEEDS" \
+         "$REFIT_TAG" "$REFIT_CFG" <<'EOF' || exit 3
+import json, os, re, subprocess, sys
+best_p, runroot, exp, pick, seeds, tag, dst = sys.argv[1:8]
+best = json.load(open(best_p))
+
+if pick == "objective":
+    if not best["by_objective"]:
+        print("ABORT: BEST.json has no by_objective entries"); sys.exit(1)
+    e = best["by_objective"][0]
+    lane, trial = e["lane"], e["trial"]
+    print("picked RAW ARGMIN: lane %d trial %d J=%+.4f cell=%s"
+          % (lane, trial, e["objective"], e["cell"]))
+else:
+    if not best["by_cross_lane_cell"]:
+        print("ABORT: BEST.json has no by_cross_lane_cell entries; "
+              "re-run with PICK=objective"); sys.exit(1)
+    e = best["by_cross_lane_cell"][0]
+    lane, trial = e["best_lane"], e["best_trial"]
+    print("picked BOTH-VIEWS BEST: lane %d trial %d J=%+.4f cell=%s "
+          "(pooled #%d, random-design #%d)"
+          % (lane, trial, e["best_objective"], e["cell"],
+             e["rank_pooled"], e["rank_random_only"]))
+
+lane_dir = os.path.join(runroot, "%s_lane%d" % (exp, lane))
+if not os.path.isdir(lane_dir):
+    print("ABORT: lane dir not found: %s" % lane_dir); sys.exit(1)
+
+# best_from_trials.py owns the trial -> config reconstruction; do not
+# reimplement its ranking here. It PRINTS which file holds which trial
+# ("wrote <path>  (trial N, objective ...)"), and that printed mapping is
+# authoritative -- the config files themselves carry no provenance key, so
+# matching by rank would silently pick the wrong file if the tool's filter
+# ever differs from ours. --top-k 20 so a candidate ranked outside the top 5
+# (which the "agreed" rule can legitimately choose) is still written.
+r = subprocess.run([sys.executable, "best_from_trials.py",
+                    "--run-dir", lane_dir, "--top-k", "20"],
+                   capture_output=True, text=True)
+sys.stdout.write(r.stdout)
+sys.stderr.write(r.stderr)
+if r.returncode != 0:
+    print("ABORT: best_from_trials.py failed"); sys.exit(1)
+
+src = None
+pat = re.compile(r"wrote\s+(\S+config_top\d+\.json)\s+\(trial\s+(\d+)")
+for line in r.stdout.splitlines():
+    m = pat.search(line)
+    if m and int(m.group(2)) == int(trial):
+        src = m.group(1)
+        break
+if src is None:
+    print("ABORT: trial %d was not among the configs best_from_trials wrote "
+          "for %s. It may be a failed trial, or ranked beyond --top-k 20. "
+          "Re-run with PICK=objective, or widen --top-k." % (trial, lane_dir))
+    sys.exit(1)
+print("source config: %s  (matched to trial %d from the tool's own output)"
+      % (src, trial))
+
+c = json.load(open(src))
+c.setdefault("train", {})["n_seeds"] = int(seeds)
+c.setdefault("runtime", {})["experiment_name"] = tag
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+json.dump(c, open(dst, "w"), indent=2)
+print("wrote %s  (experiment_name=%s, n_seeds=%s)" % (dst, tag, seeds))
+EOF
+
+# ---- STAGE 2: re-fit -------------------------------------------------
+echo; echo "### STAGE 2/3  re-fit  ->  out/$REFIT_TAG"
+if [ -f "out/$REFIT_TAG/results.json" ]; then
+    echo "results.json already exists for $REFIT_TAG -- skipping the re-fit."
+    echo "Delete out/$REFIT_TAG to force a retrain."
+else
+    python3 run_optimization.py --config "$REFIT_CFG" --skip-search --verbose || {
+        echo "WARN: stage 2 failed or was killed; stage 3 will be skipped."
+        echo "The stage-1 report in $REPORT is complete and unaffected."
+        exit 4; }
+fi
+
+# ---- STAGE 3: embeddings --------------------------------------------
+echo; echo "### STAGE 3/3  embedding figures"
+python3 "$TOOLS/plot_embeddings.py" \
+    --main-dir "$MAIN" \
+    --discover "out/$REFIT_TAG" \
+    --out "$OUT/embeddings" \
+    --splits train,val,test || {
+    echo "WARN: stage 3 failed. Checkpoints are in out/$REFIT_TAG."; exit 5; }
+
+echo
+echo "======================================================================"
+echo "finished : $(date)"
+echo "report     : $REPORT/RESULTS.md   (+ figures/, tables/, BEST.json)"
+echo "re-fit     : out/$REFIT_TAG/results.json"
+echo "embeddings : $OUT/embeddings/EMBEDDING_SUMMARY.csv"
+echo "======================================================================"
+[ -f "$OUT/embeddings/EMBEDDING_SUMMARY.csv" ] && cat "$OUT/embeddings/EMBEDDING_SUMMARY.csv"
+exit 0
