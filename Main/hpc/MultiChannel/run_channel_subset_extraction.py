@@ -31,6 +31,7 @@ not training.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from typing import List, Optional
@@ -38,6 +39,39 @@ from typing import List, Optional
 import numpy as np
 
 from channel_subset_extraction import DEFAULT_FS_RAW, extract_channel_subsets
+
+EXTRACTOR_VERSION = "run_channel_subset_extraction/2"   # 1 = pre-2026-09-11, no metadata
+
+
+def extraction_metadata(args, fs_ifr, argv=None):
+    """Every parameter that decides what the trace IS, as one dict.
+
+    [CORRECTION 2026-09-11] Until this version the archives recorded fs_ifr
+    and T_rec but NOT gaussian_window (sigma_sm), electrodes_per_subset (the
+    n_e each pooled trace is a mean over), n_subsets, mfr_threshold or
+    fs_raw. The consumer (Sbi-extractor) stamps its sidecars with the encoder
+    checkpoint's sigma_sm instead, so an archive smoothed at one value and an
+    export declaring another could never be told apart from the files. This
+    dict is merged into `meta`, so it lands in traces.npz AND in every
+    trace_subregion_XX.npz (both spread **meta), and is also written to
+    traces_meta.json beside them.
+
+    Pure: no I/O, so it is testable without a ptrain folder.
+    """
+    w = float(args.w_size)
+    g = float(args.gaussian_window)
+    return {
+        "extractor_version": EXTRACTOR_VERSION,
+        "w_size": w,                        # Delta_t [s]
+        "gaussian_window": g,               # sigma_sm [s]
+        "sigma_sm_bins": g / w,             # sigma_sm / Delta_t
+        "fs_raw": float(args.fs_raw),
+        "n_subsets": int(args.n_subsets),
+        "electrodes_per_subset": int(args.electrodes_per_subset),
+        "mfr_threshold": float(args.mfr_threshold),
+        "source_folder": os.path.abspath(str(args.folder)),
+        "argv": " ".join(argv if argv is not None else sys.argv),
+    }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -83,9 +117,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     center_mfr = np.array([s.center_mfr for s in diag.subregions], dtype=np.float64)
     discarded = np.array(diag.discarded, dtype=np.int64)
 
+    pre = extraction_metadata(args, fs_ifr)
+    if abs(float(fs_ifr) * pre["w_size"] - 1.0) > 1e-6:
+        raise RuntimeError(
+            "fs_ifr = %r from the extractor is not 1 / w_size = 1 / %r; refusing "
+            "to write archives whose declared bin width disagrees with their "
+            "sampling rate" % (float(fs_ifr), pre["w_size"]))
     meta = dict(
         fs_ifr=float(fs_ifr), mode=args.mode, index_base=int(diag.index_base),
         grid_width=int(diag.grid_width), T_rec=float(diag.T_rec),
+        **pre,
         n_samples_raw=int(diag.n_samples), n_present=int(diag.n_present),
         centers=centers, center_mfr=center_mfr, discarded=discarded)
 
@@ -97,6 +138,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         npz_path, X=X, ifr_trace=X, row_meaning=row_meaning,
         in_channels=in_channels, n_samples=n_samples, **meta)
     written = [npz_path]
+    meta_path = os.path.join(args.out_dir, "traces_meta.json")
+    with open(meta_path, "w") as fh:
+        json.dump({k: (v.tolist() if hasattr(v, "tolist") else v)
+                   for k, v in meta.items()}, fh, indent=2, sort_keys=True)
+    written.append(meta_path)
 
     # mode == "per_region_single": the C rows are INDEPENDENT single-channel
     # samples, not channels of one sample. Each becomes its own trace record,
