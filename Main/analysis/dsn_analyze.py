@@ -102,9 +102,28 @@ def lane_summary(df: pd.DataFrame, states: dict, e_max: int = E_MAX,
         wall_total_h = float(sum(wall[i] for i in seg_ends if i >= 0)) / 3600.0
         mean_h_per_trial = float(steps.mean()) / 3600.0 if steps.size else float("nan")
         n_segments = 1 + int(boundaries.size)
+        # An all-failed lane, or one whose records carry no selected_epochs,
+        # makes every epoch statistic undefined. Report NaN and a reason rather
+        # than letting numpy emit a bare "Mean of empty slice" warning that
+        # tells the reader nothing about WHICH lane or WHY.
+        sel = ok["sel_epoch"].dropna()
+        if len(ok) == 0:
+            note = "no non-failed trials"
+        elif len(sel) == 0:
+            note = "no selected_epochs recorded"
+        elif len(sel) < len(ok):
+            note = "selected_epochs missing in %d of %d trials" % (
+                len(ok) - len(sel), len(ok))
+        else:
+            note = ""
+        mean_e = float(sel.mean()) if len(sel) else float("nan")
+        med_e = float(sel.median()) if len(sel) else float("nan")
+        frac_max = float((sel >= e_max).mean()) if len(sel) else float("nan")
+
         rows.append({
             "lane": lane,
             "k_j": k,
+            "data_note": note,
             "completed": k >= n_calls,
             "trial_offset": st.get("trial_offset"),
             "n_trials_total(state)": st.get("n_trials_total"),
@@ -112,14 +131,14 @@ def lane_summary(df: pd.DataFrame, states: dict, e_max: int = E_MAX,
             "idx_contiguous": contiguous,
             "n_failed": int(failed.sum()),
             "failure_rate": float(failed.mean()),
-            "best_obj(log)": float(ok["objective"].min()),
+            "best_obj(log)": float(ok["objective"].min()) if len(ok) else float("nan"),
             "best_obj(state)": st.get("best_objective"),
             "best_trial(state)": st.get("best_trial"),
             "best_cell(state)": st.get("best_cell"),
-            "eta_bar": float(ok["sel_epoch"].mean() / e_max),
-            "mean_sel_epoch": float(ok["sel_epoch"].mean()),
-            "median_sel_epoch": float(ok["sel_epoch"].median()),
-            "frac_at_E_max": float((ok["sel_epoch"] >= e_max).mean()),
+            "eta_bar": mean_e / e_max,
+            "mean_sel_epoch": mean_e,
+            "median_sel_epoch": med_e,
+            "frac_at_E_max": frac_max,
             "n_segments": n_segments,
             "wall_total_h": wall_total_h,
             "mean_h_per_trial": mean_h_per_trial,

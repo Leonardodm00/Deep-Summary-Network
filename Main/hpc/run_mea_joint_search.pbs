@@ -26,7 +26,7 @@
 # Pure ASCII (hpc-python-compat).
 # ======================================================================
 
-set -uo pipefail
+set -eo pipefail
 
 # ---- resolve Main/ ---------------------------------------------------
 cd "${PBS_O_WORKDIR:-$PWD}"
@@ -46,7 +46,15 @@ fi
 if [ ! -f "$CFG" ]; then echo "ABORT: config not found: $CFG"; exit 2; fi
 
 RESUME="${RESUME:-auto}"
-NCPUS=48                     # MUST match '#PBS -l select=' above
+# Thread count. Resolution order, most specific first:
+#   1. DSN_NCPUS passed via qsub -v   (explicit, use for a non-default lane)
+#   2. NCPUS set by PBS itself from '-l select=...:ncpus=N'
+#   3. 48, matching the '#PBS -l select=' default at the top of this file
+# Overriding at submit time means one script serves lanes of any width; the
+# guard below still refuses to run if this disagrees with the config, so a
+# mismatch is caught before any compute is spent rather than silently
+# oversubscribing the node.
+NCPUS="${DSN_NCPUS:-${NCPUS:-48}}"
 
 # ---- environment -----------------------------------------------------
 CONDA_ENV="${DSN_CONDA_ENV:-meacnn_cpu}"

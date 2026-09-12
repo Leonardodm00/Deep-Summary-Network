@@ -31,6 +31,7 @@ cd "$MAIN"
 export PYTHONPATH="$MAIN"
 
 CFG="${CFG:-}"
+RESUME="${RESUME:-auto}"
 if [ -z "$CFG" ]; then echo "ABORT: set CFG=hpc/Config/<file>.json"; exit 2; fi
 if [ ! -f "$CFG" ]; then echo "ABORT: config not found: $CFG"; exit 2; fi
 NCPUS=48
@@ -63,6 +64,35 @@ if [ "$CFG_THREADS" != "$NCPUS" ]; then
     exit 2
 fi
 
+# ---- resume decision -------------------------------------------------
+# run_final writes checkpoints/final_seed_<n>.pt after EACH seed finishes, so a
+# walltime kill loses only the seed in flight. --resume tells train() to pick up
+# from the in-progress seed's last.pt instead of clearing it. RESUME=auto turns
+# it on exactly when a previous attempt left checkpoints behind, so the SAME
+# qsub line both starts a re-fit and continues it.
+RUN_DIR=$(python3 -c "
+import json, os, sys
+r = json.load(open(sys.argv[1]))['runtime']
+print(os.path.join(r['out_dir'], r['experiment_name']))" "$CFG")
+
+RESUME_FLAG=""
+case "$RESUME" in
+    yes) RESUME_FLAG="--resume" ;;
+    no)  RESUME_FLAG="" ;;
+    auto)
+        if ls "$RUN_DIR"/checkpoints/seed_*/last.pt >/dev/null 2>&1 \
+           || ls "$RUN_DIR"/checkpoints/final_seed_*.pt >/dev/null 2>&1; then
+            N_DONE=$(ls "$RUN_DIR"/checkpoints/final_seed_*.pt 2>/dev/null | wc -l)
+            echo "RESUME=auto: $RUN_DIR has $N_DONE completed seed(s)"
+            echo "             -> continuing with --resume"
+            RESUME_FLAG="--resume"
+        else
+            echo "RESUME=auto: no prior checkpoints -> starting fresh"
+        fi
+        ;;
+    *) echo "ABORT: RESUME must be auto|yes|no, got '$RESUME'"; exit 2 ;;
+esac
+
 # Refuse to clobber a search run directory: experiment_name MUST be new.
 python3 - "$CFG" <<'EOF' || exit 2
 import json, os, sys
@@ -80,8 +110,17 @@ echo "config  : $CFG"
 echo "started : $(date)"
 echo "======================================================================"
 
-python3 run_optimization.py --config "$CFG" --skip-search --verbose
+python3 run_optimization.py --config "$CFG" --skip-search --verbose $RESUME_FLAG
 RC=$?
+
+# If the job was killed mid-run, results.json will be absent but completed
+# seeds are still on disk. Rebuild an honest partial aggregate from them.
+if [ ! -f "$RUN_DIR/results.json" ] && \
+   ls "$RUN_DIR"/checkpoints/final_seed_*.pt >/dev/null 2>&1; then
+    echo "results.json absent but seed checkpoints exist -> recovering"
+    python3 analysis/recover_results.py --run-dir "$RUN_DIR" --main-dir "$MAIN" \
+        || echo "WARN: recovery failed; the checkpoints are still intact."
+fi
 
 echo "======================================================================"
 echo "finished: $(date)   exit=$RC"

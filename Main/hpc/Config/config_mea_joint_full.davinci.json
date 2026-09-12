@@ -258,22 +258,23 @@
   "cohort": {
     "class_roots": {
       "0": [
-        "/davinci-1/home/ldellamea/REPLACE/ME/ctrl_plate_1",
-        "/davinci-1/home/ldellamea/REPLACE/ME/ctrl_plate_2",
-        "/davinci-1/home/ldellamea/REPLACE/ME/ctrl_plate_3"
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_C/Batch3/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_C/Batch4/SubBatch1/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_C/Batch4/SubBatch2/"
       ],
       "1": [
-        "/davinci-1/home/ldellamea/REPLACE/ME/path_plate_1",
-        "/davinci-1/home/ldellamea/REPLACE/ME/path_plate_2",
-        "/davinci-1/home/ldellamea/REPLACE/ME/path_plate_3"
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_P/Batch4/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_P/Batch3/SubBatch1/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_P/Batch3/SubBatch2/"
       ]
     },
+
     "class_names": [
       "control",
       "pathological"
     ],
     "well_glob": "ptrain_*",
-    "extract_root": "/davinci-1/home/ldellamea/REPLACE/ME/extracted",
+    "extract_root": "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/extracted",
     "extract_layout": "{class_name}/{root_name}/{well}",
     "culture_template": "{root_name}__{well}",
     "n_subsets": 9,

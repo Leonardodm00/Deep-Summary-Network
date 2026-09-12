@@ -360,8 +360,16 @@ def fig_phase_comparison(df_ok, n_init=150, figsize=(10, 4.5)):
 
     for ph, col in (("random", "#bdbdbd"), ("gp", "#4292c6")):
         v = d[d["phase"] == ph]["objective"].to_numpy()
+        if v.size == 0:
+            # A study can legitimately have no GP-phase trials at all (every
+            # lane truncated before N_init). Skip the series rather than let
+            # np.median emit a bare "Mean of empty slice" and plot a NaN label.
+            continue
         ax1.hist(v, bins=30, alpha=0.65, color=col, edgecolor="none",
                  label="%s (n=%d, median %+.3f)" % (ph, v.size, np.median(v)))
+    if not ax1.patches:
+        ax1.text(0.5, 0.5, "no non-failed trials to plot", ha="center",
+                 va="center", transform=ax1.transAxes, fontsize=10, color="0.4")
     ax1.set_xlabel(J_LABEL, fontsize=8)
     ax1.set_ylabel("trials")
     ax1.set_title("D2b  pooled over lanes", fontsize=9)

@@ -88,12 +88,13 @@
     }
   },
   "backbone": {
-    "depth_exponent": 4,
-    "width_multiplier": 2.0,
+    "depth_exponent": 3,
+    "width_multiplier": 2.5269938004361796,
     "stem_width": 16,
+    "in_channels": 1,
     "block_family": 0,
     "group_width": 16,
-    "embedding_size": 16,
+    "embedding_size": 10,
     "l2_normalize": true,
     "head_fusion": true,
     "head_pool_ops": [
@@ -106,40 +107,41 @@
     "stem_stride": 4,
     "stage_kernel": 3,
     "downsampling_rate": 2,
-    "dropout": 0.0
+    "dropout": 0.19685439871380292
   },
   "train": {
+    "loss_type": "joint_sep",
     "margin": 0.3,
     "swap": true,
-    "mining_strategy": "hard",
+    "mining_strategy": "easy_positive",
+    "angular_alpha_deg": 3.1958621088444916,
+    "strict_semihard": false,
+    "lambda_sep": 1.9494043310683027,
+    "sep_gate_threshold": 0.2,
+    "sep_gate_momentum": 0.05,
+    "sep_gate_min_batches": 20,
+    "sep_centre_means": null,
+    "sep_warmup_frac": 0.22962477435637593,
     "windows_per_condition": 4,
     "batches_per_epoch": 100,
-    "lr": 0.0003,
-    "beta1": 0.9,
-    "beta2": 0.999,
-    "weight_decay": 0.0001,
-    "max_epochs": 100,
+    "lr": 0.003310057414421564,
+    "beta1": 0.9521989138058242,
+    "beta2": 0.996594161549917,
+    "weight_decay": 0.0028150193556560612,
+    "max_epochs": 200,
     "patience": 40,
     "min_delta_ari": 0.0,
     "min_delta_sil": 0.0,
     "selection_primary": "silhouette",
+    "n_seeds": 5,
     "min_delta_sil_mode": "floor_scale",
     "min_delta_sil_kappa": 2.0,
     "sil_floor_permutations": 200,
-    "n_seeds": 1,
     "use_scheduler": false,
     "scheduler_type": "cosine",
     "use_amp": false,
     "log_every_epochs": 1,
-    "checkpoint_every_epochs": 5,
-    "loss_type": "joint_sep",
-    "strict_semihard": false,
-    "angular_alpha_deg": 12.0,
-    "lambda_sep": 0.1,
-    "sep_gate_threshold": 0.2,
-    "sep_gate_momentum": 0.05,
-    "sep_gate_min_batches": 20,
-    "sep_warmup_frac": 0.0
+    "checkpoint_every_epochs": 5
   },
   "search": {
     "depth_exponent_range": [
@@ -162,6 +164,18 @@
       0.1,
       1.0
     ],
+    "angular_alpha_deg_range": [
+      2.0,
+      20.0
+    ],
+    "lambda_sep_range": [
+      0.01,
+      20.0
+    ],
+    "sep_warmup_frac_range": [
+      0.0,
+      0.5
+    ],
     "lr_range": [
       0.0001,
       0.2
@@ -180,27 +194,11 @@
     ],
     "n_calls_arch": 60,
     "n_calls_train": 60,
-    "gp_random_state": 0,
-    "do_refine": false,
-    "refine_top_fraction": 0.1,
-    "do_retune_arch": false,
+    "gp_random_state": 2,
     "n_initial_points": 20,
-    "tie_break_gamma": 0.0,
-    "tie_break_sil_lo": -1.0,
-    "tie_break_sil_hi": 1.0,
-    "angular_alpha_deg_range": [
-      2.0,
-      20.0
-    ],
-    "lambda_sep_range": [
-      0.01,
-      20.0
-    ],
     "search_mode": "joint_conditions",
-    "sep_warmup_frac_range": [
-      0.0,
-      0.5
-    ],
+    "n_calls_joint": 300,
+    "n_initial_points_joint": 150,
     "mining_strategy_choices": [
       "hard",
       "easy_positive",
@@ -223,8 +221,16 @@
       0,
       1
     ],
-    "n_calls_joint": 300,
-    "n_initial_points_joint": 150
+    "sep_centre_means_choices": [
+      0,
+      1
+    ],
+    "tie_break_gamma": 0.0,
+    "tie_break_sil_lo": -1.0,
+    "tie_break_sil_hi": 1.0,
+    "do_refine": false,
+    "refine_top_fraction": 0.1,
+    "do_retune_arch": false
   },
   "regularization": {
     "dropout_range": [
@@ -253,19 +259,19 @@
     "pin_memory": false,
     "out_dir": "out",
     "cache_dir": "cache_mea_joint_full",
-    "experiment_name": "mea_joint_full_lane0"
+    "experiment_name": "refit_mea_joint_full_r5_l2_t118"
   },
   "cohort": {
     "class_roots": {
       "0": [
-        "/davinci-1/home/ldellamea/REPLACE/ME/ctrl_plate_1",
-        "/davinci-1/home/ldellamea/REPLACE/ME/ctrl_plate_2",
-        "/davinci-1/home/ldellamea/REPLACE/ME/ctrl_plate_3"
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_C/Batch3/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_C/Batch4/SubBatch1/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_C/Batch4/SubBatch2/"
       ],
       "1": [
-        "/davinci-1/home/ldellamea/REPLACE/ME/path_plate_1",
-        "/davinci-1/home/ldellamea/REPLACE/ME/path_plate_2",
-        "/davinci-1/home/ldellamea/REPLACE/ME/path_plate_3"
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_P/Batch4/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_P/Batch3/SubBatch1/",
+        "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/DATA_P/Batch3/SubBatch2/"
       ]
     },
     "class_names": [
@@ -273,7 +279,7 @@
       "pathological"
     ],
     "well_glob": "ptrain_*",
-    "extract_root": "/davinci-1/home/ldellamea/REPLACE/ME/extracted",
+    "extract_root": "/davinci-1/home/ldellamea/Deep Summary Network/Deep_bio/extracted",
     "extract_layout": "{class_name}/{root_name}/{well}",
     "culture_template": "{root_name}__{well}",
     "n_subsets": 9,
@@ -284,5 +290,17 @@
     "mfr_threshold": 0.1,
     "w_size": 0.01,
     "gaussian_window": 0.02
+  },
+  "_provenance": {
+    "run_dir": "out/mea_joint_full_lane2",
+    "lane": 2,
+    "trial": 118,
+    "search_objective": -0.9967780436988747,
+    "search_ari": 1.0,
+    "search_eff_rank": 1.0923137548987727,
+    "cell": "ep_jsep_filtOFF_multimean",
+    "rank_in_batch": 5,
+    "predicted_walltime_h": 14.81,
+    "s_per_epoch_observed": 31.37
   }
 }
