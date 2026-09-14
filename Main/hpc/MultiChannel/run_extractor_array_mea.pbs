@@ -31,12 +31,11 @@
 # script cannot know until list_extraction_jobs.py has run. Always pass -J
 # explicitly at qsub time as shown above; it overrides the line in this file.
 #
-# CONDA ENV: brian_env, matching the environment already used for the
-# REAL_DATA_FINDINGS probe extraction (scipy.io.loadmat, no torch needed).
-# If that is not the actual env that worked for you, change ENV_NAME below --
-# this is the one placeholder value in this script that could not be
-# discovered from the config, since extraction and the ML environment
-# (meacnn_cpu) are deliberately separate envs.
+# CONDA ENV: meacnn_cpu -- the single environment for this repo from
+# 2026-09-14 on (extraction AND training). The 8/8 extractor e2e and the 315
+# cohort archives were produced under it; brian_env is no longer used here.
+# If a dependency is missing at run time, install it INTO meacnn_cpu rather
+# than switching env.
 #
 # HPC note (hpc-python-compat): pure ASCII, LF only.
 # =============================================================================
@@ -49,7 +48,7 @@
 
 set -eo pipefail
 
-ENV_NAME="brian_env"          # CONFIRM: adjust if this is not your extraction env
+ENV_NAME="meacnn_cpu"         # the one env for this repo; see header
 # Known-good fallback for davinci-1 specifically (from `conda env list`'s own
 # "base" row) -- used only if neither an already-loaded conda nor a module
 # load gets us there. The module name varies by site; this path does not.
